@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Logs
+logs/
+
+# Runtime files
+*.pid
+.ctp_daemon.pid
+
+# Environment & secrets
+.env
+.env.*
+credentials*
+*.key
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

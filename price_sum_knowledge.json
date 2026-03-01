@@ -1,0 +1,381 @@
+{
+  "meta": {
+    "version": "1.4",
+    "created": "2026-02-28",
+    "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、市场结构、到期日历等，贝叶斯持续更新",
+    "product": "全市场商品期权(起源于ag白银)",
+    "update_count": 4
+  },
+  "beliefs": [
+    {
+      "id": "B001",
+      "category": "方向性",
+      "statement": "价格之和跟随期货同方向运动（宽跨式净Delta为正，因期货价格离Call行权价更近）",
+      "confidence": 0.75,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28夜盘: 期货+836(+3.6%), 三个配对价格和全部上涨(+18%~+30%)"
+      ]
+    },
+    {
+      "id": "B002",
+      "category": "不对称性",
+      "statement": "价格之和对期货下跌的敏感度约是上涨的2倍（跌1点→和-0.016, 涨1点→和+0.008）",
+      "confidence": 0.55,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28夜盘逐分钟回归(C37600+P17000): 涨→+0.008/点, 跌→-0.016/点"
+      ],
+      "note": "仅基于一个交易日一个配对，置信度低"
+    },
+    {
+      "id": "B003",
+      "category": "虚值程度",
+      "statement": "越深度虚值的配对，价格之和对期货的绝对敏感度越低，但百分比波动越大（杠杆效应）",
+      "confidence": 0.70,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: 近端(C25000+P22000)绝对涨+445但涨幅18%, 远端(C37600+P17000)绝对涨+63但涨幅28%"
+      ]
+    },
+    {
+      "id": "B004",
+      "category": "Delta结构",
+      "statement": "深度虚值配对(C37600+P17000)的净Delta约0.076，中端(C33200+P18000)约0.156，近端(C25000+P22000)约0.533",
+      "confidence": 0.60,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: 基于期货变动和期权价格变动的回归估算"
+      ],
+      "note": "Delta会随期货价格和时间变化，这只是快照值"
+    },
+    {
+      "id": "B005",
+      "category": "驱动因素",
+      "statement": "价格之和有三个驱动：①方向性(Delta残余,分钟级) ②波动率(Vega,小时~天级) ③时间衰减(Theta,天级持续向下)",
+      "confidence": 0.80,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "理论推导+2026-02-28实测确认方向性和时间衰减存在"
+      ],
+      "note": "波动率驱动尚未有独立数据验证"
+    },
+    {
+      "id": "B006",
+      "category": "交易策略",
+      "statement": "深度虚值价格之和像弹簧——被Theta压缩到低位后，大行情会使其弹起，适合低位买入宽跨",
+      "confidence": 0.55,
+      "evidence_for": 2,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: C37600+P17000 Sum=227.5→291(+28%)，在期货大涨时弹起",
+        "2026-02-28: Put钉死现象使弹簧效应更强——23:26~00:15期间Sum从259.5→294.5，全部来自Call贡献"
+      ],
+      "note": "需要观察多次Theta压缩→弹起的完整周期才能提高置信度"
+    },
+    {
+      "id": "B007",
+      "category": "交易信号",
+      "statement": "深度虚值Put在期货持续上涨时会出现'钉死'现象——Put价格几乎不变（波动<3点），形成价格地板。此时买入宽跨的下行风险极小，因为Put损失接近零，价格之和的涨幅≈Call涨幅",
+      "confidence": 0.70,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28 23:26~00:15(50分钟): 期货+355点, P17000=145→145(0变化), P15000=80→78.5(-1.5), Call单边贡献全部价格和涨幅"
+      ],
+      "conditions": "Put已深度虚值(>25%OTM), 权利金已低到接近纯时间价值, 期货处于单边上涨趋势",
+      "note": "需要验证: 反向情况(期货持续下跌时Call是否也会钉死)"
+    },
+    {
+      "id": "B008",
+      "category": "交易信号",
+      "statement": "Put钉死现象出现后，如果期货继续上涨，Call的delta会因gamma效应加速增大，导致价格之和加速上涨（凸性收益）",
+      "confidence": 0.60,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28 C37400+P15000: 23:29时Call=125,每分钟涨幅约0~2; 00:10~00:15时Call=143→175,分钟涨幅加速到6~18(gamma加速)"
+      ],
+      "note": "需要更多数据验证加速是否稳定出现"
+    },
+    {
+      "id": "B009",
+      "category": "市场微观结构",
+      "statement": "极深度虚值Put(P15000, >35%OTM)全天价格几乎不变(78~81范围)，对期货波动完全免疫，本质上已退化为纯时间价值衰减工具",
+      "confidence": 0.65,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28整夜盘: 期货23091→23997(+906,+3.9%), P15000全程78~81, 波动范围仅3点"
+      ],
+      "note": "对于宽跨式买方而言，极深度虚值Put是'免费保险'——几乎不亏也几乎不赚，但万一暴跌它会突然激活"
+    },
+    {
+      "id": "B010",
+      "category": "交易策略",
+      "statement": "识别Put钉死的实时信号: 连续10+分钟期货累计涨>80点，但Put价格变化在[-3,+3]范围内。此时是做多价格之和(买入宽跨)的入场窗口",
+      "confidence": 0.50,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: 所有4个配对都在多个时段触发此信号，最早出现在21:15~21:27(中端配对)"
+      ],
+      "open_questions": [
+        "阈值80点是否适用于不同波动率环境？可能需要用百分比(如0.3%)代替绝对值",
+        "信号触发后最佳持有时间是多长？",
+        "反向信号(Call钉死+期货下跌)是否同样有效？"
+      ]
+    },
+    {
+      "id": "B011",
+      "category": "交易信号",
+      "statement": "Put钉死→Put暴涨 是一个两阶段信号。第一阶段Put钉死(价格不动)是入场窗口；第二阶段期货稍微回调时Put爆发性反弹(可达+36%)，此时Call还未大幅下跌，价格之和两头赚，出现最大利润",
+      "confidence": 0.70,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: P17000在23:26~00:19(53分钟)钉死在145; 00:19期货从24000回落到23850, P17000在5分钟内从149暴涨到184.5(+24%); 峰值197(00:28), 期间Sum从294.5涨到337(+14%), 而期货反而跌了122点"
+      ],
+      "mechanism": "Put长期被压制在地板价，卖方挂单稀薄；一旦期货回调触发买盘进场，薄弱的卖盘被瞬间吃穿，价格跳升。类似弹簧被压到极致后释放",
+      "trading_implication": "最佳策略: Put钉死阶段入场买入宽跨 → 等待期货回调触发Put暴涨 → 价格之和在期货回调时反而上涨(Call小亏+Put大赚=净赚)"
+    },
+    {
+      "id": "B012",
+      "category": "市场微观结构",
+      "statement": "Put暴涨后价格不会完全回落，会稳定在一个更高的平台。P17000从145钉死→197暴涨→最终稳定在155-165区间，说明市场对Put重新定价了",
+      "confidence": 0.55,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-28: P17000暴涨到197后回落，但未回到145的钉死价位，而是在155-185间高位震荡，收盘161。新平台比钉死价高约15点(+10%)"
+      ],
+      "note": "这意味着即使错过暴涨峰值，价格之和仍然比钉死期间高"
+    },
+    {
+      "id": "B013",
+      "category": "交易策略",
+      "statement": "DTE≤14天的期权，夜盘开盘10分钟后卖出平衡宽跨(C/P比值接近1)，夜盘收盘前平仓，大概率可以赚到theta衰减",
+      "confidence": 0.30,
+      "evidence_for": 0,
+      "evidence_against": 1,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-27夜盘郑商所604(DTE=11天)6品种回测,选对逻辑:总权金刚过10+尽量远虚值+C/P平衡. 胜率0/6,平均亏7.1%. 远虚值配对权金薄,gamma/vega冲击占比大,2小时theta(≈1.5%)根本扛不住. 当晚5/6品种下跌属单边市",
+        "akshare日线回测(ag单品种多日): 5个配对胜率57%~83%, 累计多数盈利, 越临近到期胜率越高"
+      ],
+      "open_questions": [
+        "需要更多震荡市的夜盘数据验证——单边市天然不利于卖方",
+        "夜盘时长差异大(2h~5.5h)是否影响theta收割效果?",
+        "是否应该加入止损条件(如亏损>15%立即平仓)?",
+        "akshare日线(含日盘)胜率高于纯夜盘,说明日盘theta衰减可能更显著?",
+        "最低总权金门槛应≥10(太低的配对价差吃掉theta利润)"
+      ],
+      "selection_rule": "总权金刚过10(不贪多)+尽量远虚值(安全边际)+C/P比≤0.4偏差",
+      "note": "当前仅1个夜盘的分钟级数据,且该夜盘多数品种单边下跌,不利于公平验证。需积累20+个夜盘数据后重新评估。2小时夜盘theta理论值≈1/(DTE×6),DTE=11时仅1.5%"
+    },
+    {
+      "id": "B014",
+      "category": "基础知识",
+      "statement": "每个交易日有6小时交易时间(上午2.5h+下午1.5h+夜盘2h)。夜盘theta理论衰减值=夜盘时长/(DTE×6)。例: DTE=11天的2小时夜盘theta≈1/(11×6)=1.5%",
+      "confidence": 0.90,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "理论推导: 6小时/天×DTE天=总剩余交易时间, 夜盘占比=夜盘时长/6"
+      ],
+      "note": "不同交易所夜盘时长不同(2h~5.5h), theta占比也不同。实际theta非线性(越近到期衰减越快), 此为线性近似"
+    },
+    {
+      "id": "B015",
+      "category": "交易规则",
+      "statement": "卖出宽跨选对时,总权金必须≥10(太低的配对bid-ask价差会吃掉theta利润)。选对逻辑: 总权金刚过门槛即可,不要选太近平值——权金越大意味着离平值越近,安全边际越小",
+      "confidence": 0.85,
+      "evidence_for": 1,
+      "evidence_against": 0,
+      "first_observed": "2026-02-28",
+      "last_updated": "2026-02-28",
+      "data_points": [
+        "2026-02-27郑商所604回测: 总权金<10的配对(SA3.0/FG3.0/SH4.0/PF4.0)无实战价值; 总权金刚过10(10~13.5)的远虚值配对平均亏7.1%; 总权金29.5的近平值纯碱虽盈利但安全边际仅1.8%OTM太危险"
+      ]
+    }
+  ],
+  "expiration_calendar": {
+    "description": "商品期权到期日规则与日历，用于准确计算DTE",
+    "rules": {
+      "CZCE_major": {
+        "exchange": "郑商所",
+        "applies_to": "SA,FG,TA,MA,SR,CF,OI,RM,SM,SF,SH,PF,PK,UR等大多数品种",
+        "rule": "标的期货合约交割月份前一个月第15个日历日之前(含该日)的倒数第3个交易日",
+        "effective_from": "2401合约起"
+      },
+      "CZCE_special": {
+        "exchange": "郑商所",
+        "applies_to": "AP(苹果),CJ(红枣),PX(对二甲苯)",
+        "rule": "标的期货合约交割月份前两个月最后一个日历日之前(含该日)的倒数第3个交易日",
+        "note": "比大多数品种早约2周到期"
+      },
+      "DCE": {
+        "exchange": "大商所",
+        "applies_to": "m,y,p,i,rb,jm,jd,lh,pp,l,v,eb,eg等",
+        "rule": "标的期货合约交割月份前一个月的第12个交易日",
+        "effective_from": "2501合约起(旧规则为第5个交易日)"
+      },
+      "SHFE": {
+        "exchange": "上期所",
+        "applies_to": "au,ag,cu,al,zn,pb,ni,sn,ru,fu,bu,sp,ao等",
+        "rule": "标的期货合约交割月前第一月的倒数第5个交易日"
+      },
+      "INE": {
+        "exchange": "能源中心",
+        "applies_to": "sc(原油)",
+        "rule": "标的期货合约交割月前第一月的倒数第13个交易日"
+      },
+      "GFEX": {
+        "exchange": "广期所",
+        "applies_to": "si(工硅),lc(碳酸锂)",
+        "rule": "标的期货合约交割月份前1个月的第5个交易日"
+      }
+    },
+    "computed_dates": {
+      "as_of": "2026-02-28",
+      "contract_604": {
+        "CZCE_major":  {"expiry": "2026-03-11", "DTE": 11, "calc": "3月15日前10个交易日的倒数第3个"},
+        "CZCE_special": {"expiry": "2026-02-25", "DTE": -3, "calc": "已到期(2月28日前交易日倒数第3个)"},
+        "DCE":          {"expiry": "2026-03-17", "DTE": 17, "calc": "3月第12个交易日"},
+        "SHFE":         {"expiry": "2026-03-25", "DTE": 25, "calc": "3月倒数第5个交易日"},
+        "INE":          {"expiry": "2026-03-13", "DTE": 13, "calc": "3月倒数第13个交易日"},
+        "GFEX":         {"expiry": "2026-03-06", "DTE": 6,  "calc": "3月第5个交易日"}
+      },
+      "contract_605": {
+        "CZCE_major":  {"expiry": "2026-04-13", "DTE": 44, "calc": "4月15日前10个交易日的倒数第3个"},
+        "DCE":          {"expiry": "2026-04-17", "DTE": 48, "calc": "4月第12个交易日"},
+        "SHFE":         {"expiry": "2026-04-24", "DTE": 55, "calc": "4月倒数第5个交易日"}
+      },
+      "dte_lte_14_on_20260228": ["CZCE_major(604)=11天", "INE(604)=13天", "GFEX(604)=6天"],
+      "note": "DTE按日历天计算(含周末)。实际到期日可能因节假日微调，以交易所官方公告为准"
+    },
+    "night_session_hours": {
+      "SHFE_precious": {"products": "au,ag", "hours": "21:00-02:30", "duration_h": 5.5},
+      "SHFE_base_metal": {"products": "cu,al,zn,pb,ni,sn", "hours": "21:00-01:00", "duration_h": 4.0},
+      "SHFE_other": {"products": "ru,fu,bu,sp,ao,rb", "hours": "21:00-23:00", "duration_h": 2.0},
+      "CZCE": {"products": "SA,FG,TA,MA,SR,CF,OI,RM,SM,SF,SH,PF,PK,UR等", "hours": "21:00-23:30", "duration_h": 2.5},
+      "DCE": {"products": "m,y,p,i,jm,pp,l,v,eb,eg,jd,lh等", "hours": "21:00-23:00", "duration_h": 2.0},
+      "INE": {"products": "sc(原油)", "hours": "21:00-02:30", "duration_h": 5.5},
+      "note": "郑商所期权夜盘实际数据到22:59(提前1分钟)"
+    }
+  },
+  "parameters": {
+    "ag_far_otm_net_delta": {
+      "value": 0.076,
+      "std": null,
+      "samples": 1,
+      "description": "远端虚值(C37600+P17000)净Delta"
+    },
+    "ag_mid_otm_net_delta": {
+      "value": 0.156,
+      "std": null,
+      "samples": 1,
+      "description": "中端虚值(C33200+P18000)净Delta"
+    },
+    "ag_near_otm_net_delta": {
+      "value": 0.533,
+      "std": null,
+      "samples": 1,
+      "description": "近端虚值(C25000+P22000)净Delta"
+    },
+    "down_up_sensitivity_ratio": {
+      "value": 2.0,
+      "std": null,
+      "samples": 1,
+      "description": "价格之和对期货下跌vs上涨的敏感度比值"
+    },
+    "minute_sum_change_per_futures_up": {
+      "value": 0.008,
+      "std": null,
+      "samples": 1,
+      "description": "期货涨1点时价格之和的平均变化"
+    },
+    "minute_sum_change_per_futures_down": {
+      "value": -0.016,
+      "std": null,
+      "samples": 1,
+      "description": "期货跌1点时价格之和的平均变化"
+    },
+    "put_floor_threshold": {
+      "value": 3.0,
+      "std": null,
+      "samples": 1,
+      "description": "Put钉死判定阈值: 10+分钟内Put变化在±此值以内"
+    },
+    "put_floor_futures_trigger": {
+      "value": 80,
+      "std": null,
+      "samples": 1,
+      "description": "触发Put钉死信号的期货最小涨幅(点)"
+    }
+  },
+  "update_log": [
+    {
+      "date": "2026-02-28",
+      "session": "初始建立",
+      "summary": "基于2026-02-28夜盘数据建立初始信念体系，ag2604期货价格23927，分析了3个不同虚值程度的配对",
+      "changes": "创建B001-B006共6个初始信念"
+    },
+    {
+      "date": "2026-02-28",
+      "session": "Put钉死现象研究",
+      "summary": "发现深度虚值Put在期货持续上涨时会出现价格钉死现象，形成做多价格之和的窗口。4个配对全部验证了此现象，最典型区间23:26~00:15，P17000整整50分钟纹丝不动，P15000全天仅波动3点",
+      "changes": "B006 evidence_for 1→2, confidence 0.50→0.55; 新增B007(Put钉死现象), B008(gamma加速), B009(极深度虚值Put退化), B010(实时入场信号); 新增参数put_floor_threshold, put_floor_futures_trigger"
+    },
+    {
+      "date": "2026-02-28",
+      "session": "Put钉死→暴涨两阶段信号",
+      "summary": "发现Put钉死后的暴涨阶段: P17000在145钉死53分钟后，期货回调147点触发Put爆发到197(+36%)。关键发现: 期货回调时价格之和反而大涨(294→337)，因为Put暴涨>Call下跌。这是做多宽跨的最大利润来源，而非期货上涨阶段",
+      "changes": "新增B011(两阶段信号), B012(Put暴涨后高位平台)"
+    },
+    {
+      "date": "2026-02-28",
+      "session": "到期日历与DTE修正",
+      "summary": "添加完整的商品期权到期日规则(5个交易所)和计算后的604/605到期日历。修正之前DTE估算的严重错误(郑商所604实际DTE=11天,非3~7天)。更新B013增加郑商所专项回测数据",
+      "changes": "新增expiration_calendar(含rules/computed_dates/night_session_hours); B013更新郑商所604回测数据(同一夜盘不重复计evidence); 版本1.2→1.3"
+    },
+    {
+      "date": "2026-02-28",
+      "session": "知识库扩展与规则沉淀",
+      "summary": "知识库范围从'价格之和运动规律'扩展为'期权研究'全领域。沉淀theta计算方法(每天6小时交易)和选对门槛规则(总权金≥10,刚过门槛即可). 修正evidence重复计数错误(同一夜盘数据不论分析几次都只算1条证据)",
+      "changes": "meta.description扩展; 新增B014(theta计算方法), B015(选对门槛规则); 版本1.3→1.4"
+    }
+  ]
+}
