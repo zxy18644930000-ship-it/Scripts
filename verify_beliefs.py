@@ -14,6 +14,10 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
+# 优化点2: 预编译正则表达式，避免每次调用时重复编译
+_OPTION_RE = re.compile(r'([A-Za-z]+)(\d+)([CP])(\d+)', re.IGNORECASE)
+_FUTURES_RE = re.compile(r'([A-Za-z]+)(\d+)')
+
 FUTURES_BASE = '/Users/zhangxiaoyu/Downloads/期货数据_parquet'
 OPTIONS_BASE = '/Users/zhangxiaoyu/Downloads/期权_parquet'
 KNOWLEDGE_PATH = '/Users/zhangxiaoyu/Scripts/price_sum_knowledge.json'
@@ -61,7 +65,8 @@ def parse_option_symbol(sym, exchange_type):
     """解析期权symbol，返回 (contract, cp, strike) 或 None"""
     # 去掉交易所前缀
     s = sym.split('.')[-1] if '.' in sym else sym
-    m = re.match(r'([A-Za-z]+)(\d+)([CP])(\d+)', s, re.IGNORECASE)
+    # 优化点2: 使用预编译正则
+    m = _OPTION_RE.match(s)
     if m:
         product = m.group(1)
         month = m.group(2)
@@ -75,7 +80,8 @@ def futures_month_to_option_month(f_sym, exchange_type, product):
     """将期货合约号转换为期权合约月份
     期货: SF2401 → 期权月份: 401 (CZCE) or 2401 (SHFE/DCE)
     """
-    m = re.match(r'([A-Za-z]+)(\d+)', f_sym)
+    # 优化点2: 使用预编译正则
+    m = _FUTURES_RE.match(f_sym)
     if not m:
         return None
     month_str = m.group(2)  # e.g., '2401'
@@ -124,15 +130,16 @@ def process_product(exchange, product, futures_path, options_path, exchange_type
     # 获取所有期货合约
     f_symbols = df_f['symbol'].unique()
 
-    # 解析期权symbol
-    df_o['parsed'] = df_o['symbol'].apply(lambda s: parse_option_symbol(s, exchange_type))
-    df_o = df_o[df_o['parsed'].notna()].copy()
-    df_o['opt_product'] = df_o['parsed'].apply(lambda x: x[0])
-    df_o['opt_month'] = df_o['parsed'].apply(lambda x: x[1])
-    df_o['cp'] = df_o['parsed'].apply(lambda x: x[2])
-    df_o['strike'] = df_o['parsed'].apply(lambda x: x[3])
+    # 优化点3: 用str.extract()向量化替代多次apply()，一次正则提取所有列
+    syms = df_o['symbol'].str.split('.').str[-1]
+    extracted = syms.str.extract(_OPTION_RE)
+    valid = extracted[0].notna()
+    df_o = df_o[valid].copy()
+    df_o['opt_product'] = extracted.loc[valid, 0]
+    df_o['opt_month'] = extracted.loc[valid, 1]
+    df_o['cp'] = extracted.loc[valid, 2].str.upper()
+    df_o['strike'] = extracted.loc[valid, 3].astype(int)
     df_o['date'] = df_o['datetime'].dt.date
-    df_o.drop('parsed', axis=1, inplace=True)
 
     # 获取期权的合约月份列表
     option_months = df_o['opt_month'].unique()
@@ -333,19 +340,27 @@ def process_product(exchange, product, futures_path, options_path, exchange_type
             pin_after_sum_pct = None
             f_pct_threshold = 0.003  # 0.3%
 
-            for start_i in range(len(records)):
-                for end_i in range(start_i+10, min(start_i+120, len(records))):
-                    f_chg_w = records[end_i][1] - records[start_i][1]
-                    f_pct_w = f_chg_w / records[start_i][1]
-                    p_pct_w = abs(records[end_i][3] - records[start_i][3]) / max(records[start_i][3], 0.01)
-                    if f_pct_w > f_pct_threshold and p_pct_w < 0.02:  # Put变化<2%
-                        dur = end_i - start_i
+            # 优化点1: numpy向量化替代O(n²)嵌套循环
+            n_rec = len(records)
+            arr_pin = np.array([(r[1], r[3], r[4]) for r in records])  # futures, put, sum
+            f_prices = arr_pin[:, 0]
+            p_prices = arr_pin[:, 1]
+            s_prices = arr_pin[:, 2]
+
+            for window in range(10, min(120, n_rec)):
+                f_pct_w = (f_prices[window:] - f_prices[:n_rec-window]) / np.maximum(f_prices[:n_rec-window], 1e-8)
+                p_pct_w = np.abs(p_prices[window:] - p_prices[:n_rec-window]) / np.maximum(p_prices[:n_rec-window], 0.01)
+                mask = (f_pct_w > f_pct_threshold) & (p_pct_w < 0.02)
+                if mask.any():
+                    indices = np.where(mask)[0]
+                    for idx in indices:
+                        dur = window
                         if dur > pin_duration:
                             pin_found = True
                             pin_duration = dur
-                            # 信号后收益
-                            if end_i < len(records) - 1:
-                                pin_after_sum_pct = (records[-1][4] - records[end_i][4]) / records[end_i][4] * 100
+                            end_i = idx + window
+                            if end_i < n_rec - 1:
+                                pin_after_sum_pct = (s_prices[-1] - s_prices[end_i]) / max(s_prices[end_i], 0.01) * 100
 
             # Put暴涨检测 (5分钟内涨>10%)
             put_spike_found = False
@@ -430,10 +445,13 @@ def verify_beliefs(all_results):
     evidence = {f'B{i:03d}': {'for': 0, 'against': 0, 'neutral': 0, 'details': []}
                 for i in range(1, 16)}
 
-    # 按OTM级别分组
-    near = [r for r in all_results if r['otm_label'] == '近端']
-    mid = [r for r in all_results if r['otm_label'] == '中端']
-    far = [r for r in all_results if r['otm_label'] == '远端']
+    # 优化点4: 单次遍历分组，替代三次列表遍历
+    grouped = defaultdict(list)
+    for r in all_results:
+        grouped[r['otm_label']].append(r)
+    near = grouped['近端']
+    mid = grouped['中端']
+    far = grouped['远端']
 
     print(f"\n数据总量: 近端{len(near)}, 中端{len(mid)}, 远端{len(far)}")
 
@@ -758,9 +776,8 @@ if __name__ == '__main__':
                 'products_analyzed': len(set(r['product'] for r in all_results)),
                 'sessions_analyzed': len(set((r['product'], r['date']) for r in all_results)),
                 'by_otm': {
-                    '近端': len([r for r in all_results if r['otm_label'] == '近端']),
-                    '中端': len([r for r in all_results if r['otm_label'] == '中端']),
-                    '远端': len([r for r in all_results if r['otm_label'] == '远端']),
+                    label: sum(1 for r in all_results if r['otm_label'] == label)
+                    for label in ('近端', '中端', '远端')
                 }
             }
         }, f, ensure_ascii=False, indent=2)

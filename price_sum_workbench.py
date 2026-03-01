@@ -37,6 +37,19 @@ def save_config(pairs):
         json.dump(pairs, f, ensure_ascii=False, indent=2)
 
 
+# ============ 数据库连接复用 ============
+# 性能优化: 全局复用数据库连接，避免反复创建销毁
+_db_conn = None
+
+
+def get_db():
+    """获取或创建数据库连接（复用连接）"""
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return _db_conn
+
+
 # ============ 数据加载 ============
 
 def get_trading_day_start():
@@ -61,7 +74,7 @@ def _extract_futures_symbol(option_sym):
 
 def load_pair_data(call_sym, put_sym):
     """加载一个期权对的数据（含期货价格）"""
-    db = sqlite3.connect(DB_PATH)
+    db = get_db()  # 性能优化: 复用全局连接
     cur = db.cursor()
     day_start = get_trading_day_start()
 
@@ -86,8 +99,6 @@ def load_pair_data(call_sym, put_sym):
         """, (futures_sym, day_start))
         for dt_str, px in cur.fetchall():
             futures_data[dt_str] = px
-
-    db.close()
 
     all_times = sorted(set(call_data.keys()) | set(put_data.keys()) | set(futures_data.keys()))
     times, call_prices, put_prices, sum_prices, fut_prices = [], [], [], [], []

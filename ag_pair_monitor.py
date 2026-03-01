@@ -15,6 +15,7 @@ import os
 import re
 import argparse
 from datetime import datetime, date, timedelta
+from heapq import merge
 
 import dash
 from dash import dcc, html, dash_table
@@ -32,6 +33,19 @@ MAX_RATIO = 2.0              # 高价腿/低价腿 ≤ 2
 MIN_OTM_PCT = 4.0            # 最低虚值度4%
 SIGNAL_COUNT = 2             # 连续N次确认
 MAX_PAIRS = 30               # 最多监控对数
+
+
+# ============ 数据库连接复用 ============
+# 性能优化: 全局复用数据库连接，避免反复创建销毁
+_db_conn = None
+
+
+def get_db():
+    """获取或创建数据库连接（复用连接）"""
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return _db_conn
 
 
 # ============ 数据层 ============
@@ -122,13 +136,12 @@ def get_trading_day_start():
 
 def get_futures_price(product):
     """获取期货最新价"""
-    db = sqlite3.connect(DB_PATH)
+    db = get_db()  # 性能优化: 复用全局连接
     cur = db.cursor()
     cur.execute(
         "SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
         (product,))
     row = cur.fetchone()
-    db.close()
     return row[0] if row else None
 
 
@@ -156,7 +169,7 @@ def select_pairs(product, fut_price):
     # 用当天成交额判断流动性（当天=当前交易日，含夜盘）
     day_start = get_trading_day_start()
 
-    db = sqlite3.connect(DB_PATH)
+    db = get_db()  # 性能优化: 复用全局连接
     cur = db.cursor()
 
     # 获取有成交额的虚值期权（仅按成交额过滤）
@@ -192,19 +205,20 @@ def select_pairs(product, fut_price):
                     'vol': vol or 0, 'turnover': to_val or 0, 'otm': otm
                 })
 
-    db.close()
-
     if not calls or not puts:
         return []
 
-    # 按成交额排序
+    # 性能优化: 先分别排序，再用 heapq.merge 合并两个已排序列表，省去第三次排序
     calls.sort(key=lambda x: x['turnover'], reverse=True)
     puts.sort(key=lambda x: x['turnover'], reverse=True)
 
     # 核心原则：成交额大的期权优先配对，每个行权价只出现一次
     # 把所有Call和Put放一起，按成交额从大到小排队，逐个找搭档
-    all_options = [('call', c) for c in calls] + [('put', p) for p in puts]
-    all_options.sort(key=lambda x: x[1]['turnover'], reverse=True)
+    all_options = list(merge(
+        [('call', c) for c in calls],
+        [('put', p) for p in puts],
+        key=lambda x: x[1]['turnover'], reverse=True
+    ))
 
     used_calls = set()
     used_puts = set()
@@ -269,7 +283,7 @@ alerts = []         # 历史信号记录
 def load_history(call_sym, put_sym):
     """从数据库加载当天交易日的K线，按分钟对齐，去除价格不变的重复点"""
     data_start = get_trading_day_start()
-    db = sqlite3.connect(DB_PATH)
+    db = get_db()  # 性能优化: 复用全局连接
     cur = db.cursor()
 
     # 分别查两腿的1分钟K线
@@ -290,8 +304,6 @@ def load_history(call_sym, put_sym):
     for dt, px in cur.fetchall():
         if px and px > 0:
             put_data[dt] = px
-
-    db.close()
 
     # 合并所有时间点（不要求两腿同时有数据，用上一个已知价格填充）
     all_times = sorted(set(call_data.keys()) | set(put_data.keys()))
@@ -363,7 +375,7 @@ def init_monitors(prod):
 def update_all():
     """更新所有期权对的价格"""
     global fut_price_global
-    db = sqlite3.connect(DB_PATH)
+    db = get_db()  # 性能优化: 复用全局连接
     cur = db.cursor()
 
     # 更新期货价格
@@ -396,7 +408,6 @@ def update_all():
                 'sum_min': m.sum_min,
             })
 
-    db.close()
     return new_signals
 
 
