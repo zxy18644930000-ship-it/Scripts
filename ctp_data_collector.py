@@ -323,7 +323,7 @@ class CTPDataCollector:
     def _load_config(path):
         config_file = Path(path)
         if not config_file.exists():
-            alt = Path.home() / "Downloads" / "trade2026" / "config" / "ctp_config.json"
+            alt = Path(__file__).parent / "ctp_config.json"
             if alt.exists():
                 config_file = alt
             else:
@@ -509,7 +509,7 @@ class CTPDataCollector:
         if missing_keys:
             try:
                 import sqlite3 as _sql
-                _db = _sql.connect(self.db_path)
+                _db = _sql.connect(self.db_writer.db_path)
                 _cur = _db.cursor()
                 for key, sym in missing_keys:
                     _cur.execute(
@@ -775,7 +775,7 @@ def main():
     parser.add_argument("--daemon", "-d", action="store_true",
                         help="守护进程模式：持续运行，自动管理交易时段")
     parser.add_argument("--config", "-c",
-                        default=str(Path.home() / "Downloads/trade2026/config/ctp_config.json"),
+                        default=str(Path(__file__).parent / "ctp_config.json"),
                         help="CTP配置文件路径")
     args = parser.parse_args()
 

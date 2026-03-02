@@ -234,7 +234,8 @@ is_daemon_running() {
 start_daemon() {
     log "拉起daemon: $PYTHON $CTP_COLLECTOR $DAEMON_ARGS"
     local daemon_log="$LOG_DIR/collector_$(date +%Y%m%d).log"
-    nohup $PYTHON "$CTP_COLLECTOR" $DAEMON_ARGS >> "$daemon_log" 2>&1 &
+    # daemon模式下Python自己写日志文件，nohup输出丢弃避免重复
+    nohup $PYTHON "$CTP_COLLECTOR" $DAEMON_ARGS > /dev/null 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PID_FILE"
     sleep 2
