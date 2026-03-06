@@ -19,6 +19,7 @@ PYTHON="/usr/bin/python3"
 CTP_COLLECTOR="$SCRIPT_DIR/ctp_data_collector.py"
 
 # Daemon模式参数
+# 全市场全部期权（不限档数）
 DAEMON_ARGS="--all-options --daemon"
 # PID文件（用于快速检测daemon状态）
 PID_FILE="$SCRIPT_DIR/.ctp_daemon.pid"

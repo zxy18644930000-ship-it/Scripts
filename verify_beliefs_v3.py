@@ -14,26 +14,19 @@ OPTIONS_BASE = '/Users/zhangxiaoyu/Downloads/期权_parquet'
 KNOWLEDGE_PATH = '/Users/zhangxiaoyu/Scripts/price_sum_knowledge.json'
 
 PRODUCTS = [
-    ('SHFE', 'SN', 'SHFE/SN.parquet', 'SHFE/sn.parquet', 'shfe'),
-    ('SHFE', 'PB', 'SHFE/PB.parquet', 'SHFE/pb.parquet', 'shfe'),
-    ('SHFE', 'NI', 'SHFE/NI.parquet', 'SHFE/ni.parquet', 'shfe'),
-    ('SHFE', 'RB', 'SHFE/RB.parquet', 'SHFE/rb.parquet', 'shfe'),
-    ('SHFE', 'AD', 'SHFE/AD.parquet', 'SHFE/ad.parquet', 'shfe'),
-    ('CZCE', 'SF', 'CZCE/SF.parquet', 'CZCE/SF.parquet', 'czce'),
-    ('CZCE', 'SM', 'CZCE/SM.parquet', 'CZCE/SM.parquet', 'czce'),
-    ('CZCE', 'UR', 'CZCE/UR.parquet', 'CZCE/UR.parquet', 'czce'),
-    ('CZCE', 'PF', 'CZCE/PF.parquet', 'CZCE/PF.parquet', 'czce'),
-    ('CZCE', 'AP', 'CZCE/AP.parquet', 'CZCE/AP.parquet', 'czce'),
-    ('CZCE', 'CJ', 'CZCE/CJ.parquet', 'CZCE/CJ.parquet', 'czce'),
-    ('CZCE', 'ZC', 'CZCE/ZC.parquet', 'CZCE/ZC.parquet', 'czce'),
-    ('CZCE', 'PK', 'CZCE/PK.parquet', 'CZCE/PK.parquet', 'czce'),
-    ('CZCE', 'SH', 'CZCE/SH.parquet', 'CZCE/SH.parquet', 'czce'),
-    ('DCE', 'CS', 'DCE/CS.parquet', 'DCE/cs.parquet', 'dce'),
-    ('DCE', 'JD', 'DCE/JD.parquet', 'DCE/jd.parquet', 'dce'),
-    ('DCE', 'LH', 'DCE/LH.parquet', 'DCE/lh.parquet', 'dce'),
-    ('DCE', 'LG', 'DCE/LG.parquet', 'DCE/lg.parquet', 'dce'),
-    ('DCE', 'EG', 'DCE/EG.parquet', 'DCE/eg.parquet', 'dce'),
-    ('GFEX', 'SI', 'GFEX/SI.parquet', 'GFEX/si.parquet', 'gfex'),
+    # 只选期权文件<50MB的品种,避免内存爆炸
+    ('SHFE', 'SN', 'SHFE/SN.parquet', 'SHFE/sn.parquet', 'shfe'),  # 34MB
+    ('SHFE', 'PB', 'SHFE/PB.parquet', 'SHFE/pb.parquet', 'shfe'),  # 24MB
+    ('SHFE', 'AD', 'SHFE/AD.parquet', 'SHFE/ad.parquet', 'shfe'),  # 9MB
+    ('CZCE', 'SF', 'CZCE/SF.parquet', 'CZCE/SF.parquet', 'czce'),  # 40MB
+    ('CZCE', 'UR', 'CZCE/UR.parquet', 'CZCE/UR.parquet', 'czce'),  # 34MB
+    ('CZCE', 'PF', 'CZCE/PF.parquet', 'CZCE/PF.parquet', 'czce'),  # 38MB
+    ('CZCE', 'AP', 'CZCE/AP.parquet', 'CZCE/AP.parquet', 'czce'),  # 30MB
+    ('CZCE', 'CJ', 'CZCE/CJ.parquet', 'CZCE/CJ.parquet', 'czce'),  # 23MB
+    ('DCE', 'CS', 'DCE/CS.parquet', 'DCE/cs.parquet', 'dce'),  # 19MB
+    ('DCE', 'JD', 'DCE/JD.parquet', 'DCE/jd.parquet', 'dce'),  # 35MB
+    ('DCE', 'LH', 'DCE/LH.parquet', 'DCE/lh.parquet', 'dce'),  # 20MB
+    ('DCE', 'LG', 'DCE/LG.parquet', 'DCE/lg.parquet', 'dce'),  # 7MB
 ]
 
 
@@ -43,7 +36,12 @@ def P(msg):
 
 def parse_opt(sym):
     s = sym.split('.')[-1] if '.' in sym else sym
+    # 格式1: ag2604C37600 (SHFE/CZCE/GFEX/INE)
     m = re.match(r'([A-Za-z]+)(\d+)([CP])(\d+)', s, re.IGNORECASE)
+    if m:
+        return m.group(2), m.group(3).upper(), int(m.group(4))
+    # 格式2: cs2501-C-2250 (DCE)
+    m = re.match(r'([A-Za-z]+)(\d+)-([CP])-(\d+)', s, re.IGNORECASE)
     if m:
         return m.group(2), m.group(3).upper(), int(m.group(4))
     return None, None, None
@@ -138,9 +136,9 @@ def process_product(exchange, product, f_path, o_path, exch_type):
     df_o['date'] = df_o['datetime'].dt.date
 
     all_dates = sorted(set(df_f['date'].unique()) & set(df_o['date'].unique()))
-    # 采样50天
-    if len(all_dates) > 50:
-        idx = np.linspace(0, len(all_dates)-1, 50, dtype=int)
+    # 采样30天
+    if len(all_dates) > 30:
+        idx = np.linspace(0, len(all_dates)-1, 30, dtype=int)
         all_dates = [all_dates[i] for i in idx]
 
     results = []
@@ -175,7 +173,7 @@ def process_product(exchange, product, f_path, o_path, exch_type):
             continue
 
         # 选配对
-        for label, lo, hi in [('近端', 0.02, 0.08), ('中端', 0.10, 0.25), ('远端', 0.25, 0.60)]:
+        for label, lo, hi in [('近端', 0.02, 0.08), ('中端', 0.08, 0.20), ('远端', 0.15, 0.50)]:
             ck, pk = None, None
             for c in otm_c:
                 if lo <= (c - fp)/fp <= hi:

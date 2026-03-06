@@ -23,6 +23,12 @@ credentials*
 # OS
 .DS_Store
 Thumbs.db
+~$*
+
+# Temp logs
+*.log
+verify_output*.log
+auto_news.log
 
 # IDE
 .idea/

@@ -1,0 +1,50 @@
+html { scroll-behavior: smooth; }
+.nav-item:hover { background-color: #2a2a4a !important; border-left-color: #FFD700 !important; }
+
+/* Dash Dropdown 暗色主题 — 通过 className="dark-dropdown" 挂载 */
+/* 外层容器 */
+.dark-dropdown {
+    font-size: 13px !important;
+}
+/* 控制栏（选中值的显示区域）*/
+.dark-dropdown > div {
+    background-color: #1a1a3e !important;
+    border-color: #444 !important;
+    min-height: 32px !important;
+}
+/* 选中的文本值 — 金色 */
+.dark-dropdown > div > div > div:not([class*="placeholder"]) {
+    color: #FFD700 !important;
+}
+/* placeholder */
+.dark-dropdown > div > div > div[class*="placeholder"] {
+    color: #888 !important;
+}
+/* 输入框文字 */
+.dark-dropdown input {
+    color: #fff !important;
+}
+/* 下拉箭头和分隔线 */
+.dark-dropdown > div > div:last-child > div {
+    color: #888 !important;
+}
+.dark-dropdown > div > div:last-child > span {
+    background-color: #444 !important;
+}
+/* 下拉菜单 */
+.dark-dropdown > div:nth-child(2),
+.dark-dropdown > div[class*="menu"] {
+    background-color: #1a1a3e !important;
+    border-color: #444 !important;
+}
+/* 下拉选项 */
+.dark-dropdown [id*="option"] {
+    background-color: #1a1a3e !important;
+    color: #ddd !important;
+    cursor: pointer !important;
+}
+.dark-dropdown [id*="option"]:hover,
+.dark-dropdown [id*="option"][class*="focused"] {
+    background-color: #2a2a5e !important;
+    color: #FFD700 !important;
+}

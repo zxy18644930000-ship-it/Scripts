@@ -1,0 +1,1942 @@
+#!/usr/bin/env python3
+"""音乐乐理学习平台 — 为唱歌而生 — Port 8053"""
+
+from flask import Flask
+
+app = Flask(__name__)
+PORT = 8053
+
+@app.route('/')
+def index():
+    return HTML
+
+HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>乐理学习 · 为唱歌而生</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --border: #30363d;
+  --text: #c9d1d9; --text2: #8b949e; --text3: #484f58;
+  --blue: #58a6ff; --purple: #bc8cff; --green: #3fb950;
+  --orange: #d29922; --red: #f85149; --gold: #e3b341;
+  --cyan: #39d2c0; --pink: #f778ba;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; line-height:1.6; }
+a { color:var(--blue); text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+/* Layout */
+.app { display:flex; min-height:100vh; }
+.sidebar { width:280px; background:var(--bg2); border-right:1px solid var(--border); padding:20px 0; position:fixed; top:0; left:0; bottom:0; overflow-y:auto; z-index:10; }
+.sidebar::-webkit-scrollbar { width:6px; }
+.sidebar::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+.main { margin-left:280px; flex:1; padding:32px 40px; max-width:1100px; padding-bottom:200px; }
+
+/* Sidebar */
+.logo { padding:0 20px 20px; border-bottom:1px solid var(--border); margin-bottom:16px; }
+.logo h1 { font-size:18px; color:var(--text); font-weight:600; }
+.logo p { font-size:12px; color:var(--text2); margin-top:4px; }
+.progress-mini { margin:12px 20px 16px; padding:10px 12px; background:var(--bg3); border-radius:8px; cursor:pointer; }
+.progress-mini:hover { background:var(--border); }
+.progress-mini .bar { height:6px; background:var(--bg); border-radius:3px; margin-top:8px; overflow:hidden; }
+.progress-mini .bar-fill { height:100%; background:linear-gradient(90deg,var(--pink),var(--purple)); border-radius:3px; transition:width 0.5s; }
+.progress-mini span { font-size:13px; color:var(--text2); }
+.progress-mini strong { color:var(--text); float:right; }
+
+.nav-stage { margin-bottom:4px; }
+.nav-stage-header { padding:8px 20px; font-size:13px; font-weight:600; color:var(--text2); cursor:pointer; display:flex; align-items:center; gap:8px; }
+.nav-stage-header:hover { color:var(--text); }
+.nav-stage-header .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.nav-stage-header .arrow { font-size:10px; margin-left:auto; transition:transform 0.2s; }
+.nav-stage.open .arrow { transform:rotate(90deg); }
+.nav-lessons { display:none; }
+.nav-stage.open .nav-lessons { display:block; }
+.nav-lesson { padding:6px 20px 6px 48px; font-size:13px; color:var(--text2); cursor:pointer; display:flex; align-items:center; gap:8px; }
+.nav-lesson:hover { color:var(--text); background:var(--bg3); }
+.nav-lesson.active { color:var(--blue); background:rgba(88,166,255,0.1); }
+.nav-lesson .status { font-size:11px; }
+
+/* Dashboard */
+.dash-header { margin-bottom:32px; }
+.dash-header h2 { font-size:28px; font-weight:700; margin-bottom:8px; }
+.dash-header p { color:var(--text2); font-size:15px; }
+.stats-row { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:32px; }
+.stat-card { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:20px; }
+.stat-card .value { font-size:32px; font-weight:700; }
+.stat-card .label { font-size:13px; color:var(--text2); margin-top:4px; }
+.stage-cards { display:grid; grid-template-columns:repeat(2,1fr); gap:16px; margin-bottom:32px; }
+.stage-card { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:20px; cursor:pointer; transition:all 0.2s; }
+.stage-card:hover { border-color:var(--text3); transform:translateY(-2px); }
+.stage-card h3 { font-size:16px; margin-bottom:4px; display:flex; align-items:center; gap:8px; }
+.stage-card .stage-num { font-size:12px; padding:2px 8px; border-radius:4px; color:#fff; }
+.stage-card .desc { font-size:13px; color:var(--text2); margin-bottom:12px; }
+.stage-card .bar { height:6px; background:var(--bg); border-radius:3px; overflow:hidden; }
+.stage-card .bar-fill { height:100%; border-radius:3px; transition:width 0.5s; }
+.stage-card .meta { font-size:12px; color:var(--text3); margin-top:8px; }
+.next-lesson-card { background:linear-gradient(135deg, rgba(247,120,186,0.1), rgba(188,140,255,0.1)); border:1px solid rgba(247,120,186,0.3); border-radius:12px; padding:24px; margin-bottom:32px; display:flex; align-items:center; gap:20px; }
+.next-lesson-card .icon { font-size:40px; }
+.next-lesson-card h3 { font-size:18px; margin-bottom:4px; }
+.next-lesson-card p { color:var(--text2); font-size:14px; }
+.next-lesson-card button { margin-left:auto; padding:10px 24px; background:var(--pink); color:#fff; border:none; border-radius:8px; font-size:14px; cursor:pointer; white-space:nowrap; }
+.next-lesson-card button:hover { opacity:0.9; }
+
+/* Lesson Page */
+.lesson-header { margin-bottom:32px; padding-bottom:20px; border-bottom:1px solid var(--border); }
+.lesson-header .breadcrumb { font-size:13px; color:var(--text3); margin-bottom:8px; }
+.lesson-header h2 { font-size:28px; font-weight:700; margin-bottom:8px; }
+.lesson-header .meta { display:flex; gap:12px; align-items:center; }
+.badge { padding:3px 10px; border-radius:4px; font-size:12px; font-weight:600; }
+.badge-done { background:rgba(63,185,80,0.15); color:var(--green); }
+.badge-pending { background:rgba(139,148,158,0.15); color:var(--text2); }
+.badge-stage { color:#fff; }
+
+.lesson-content { line-height:1.8; }
+.lesson-content h3 { font-size:20px; font-weight:600; margin:28px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+.lesson-content h4 { font-size:16px; font-weight:600; margin:20px 0 8px; color:var(--blue); }
+.lesson-content p { margin-bottom:14px; font-size:15px; }
+.lesson-content ul, .lesson-content ol { margin-bottom:14px; padding-left:24px; }
+.lesson-content li { margin-bottom:6px; font-size:15px; }
+.lesson-content code { background:var(--bg3); padding:2px 6px; border-radius:4px; font-size:13px; color:var(--orange); }
+.highlight-box { background:rgba(88,166,255,0.08); border-left:3px solid var(--blue); padding:12px 16px; margin:16px 0; border-radius:0 8px 8px 0; }
+.warning-box { background:rgba(248,81,73,0.08); border-left:3px solid var(--red); padding:12px 16px; margin:16px 0; border-radius:0 8px 8px 0; }
+.success-box { background:rgba(63,185,80,0.08); border-left:3px solid var(--green); padding:12px 16px; margin:16px 0; border-radius:0 8px 8px 0; }
+
+.interactive-box { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:20px; margin:20px 0; }
+.interactive-box h4 { margin:0 0 12px; font-size:15px; color:var(--text); }
+.interactive-box .controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+.interactive-box label { font-size:13px; color:var(--text2); }
+.interactive-box input[type=range] { width:140px; accent-color:var(--pink); }
+.interactive-box select { background:var(--bg3); color:var(--text); border:1px solid var(--border); padding:4px 8px; border-radius:4px; font-size:13px; }
+.interactive-box .val { font-size:13px; color:var(--pink); min-width:50px; }
+.interactive-box canvas { display:block; margin:0 auto; border-radius:8px; }
+.btn { padding:8px 16px; background:var(--bg3); border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer; font-size:13px; transition:all 0.2s; }
+.btn:hover { border-color:var(--pink); color:var(--pink); }
+.btn.active { background:var(--pink); color:#fff; border-color:var(--pink); }
+.btn-primary { background:var(--pink); color:#fff; border-color:var(--pink); }
+.btn-primary:hover { opacity:0.85; }
+
+.takeaways { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:20px; margin:28px 0; }
+.takeaways h4 { font-size:16px; margin-bottom:12px; color:var(--green); }
+.takeaways li { margin-bottom:8px; }
+
+.lesson-nav { display:flex; justify-content:space-between; margin-top:40px; padding-top:20px; border-top:1px solid var(--border); }
+.lesson-nav button { padding:10px 20px; background:var(--bg3); border:1px solid var(--border); color:var(--text); border-radius:8px; cursor:pointer; font-size:14px; }
+.lesson-nav button:hover { border-color:var(--pink); color:var(--pink); }
+.lesson-nav button:disabled { opacity:0.3; cursor:default; }
+.complete-btn { padding:10px 24px; background:var(--green); color:#fff; border:none; border-radius:8px; font-size:14px; cursor:pointer; margin-top:20px; }
+.complete-btn:hover { opacity:0.85; }
+.complete-btn.done { background:var(--bg3); color:var(--green); border:1px solid var(--green); }
+
+/* Piano Dock */
+.piano-dock { position:fixed; bottom:0; left:280px; right:0; background:var(--bg2); border-top:1px solid var(--border); z-index:100; transition:transform 0.3s; }
+.piano-dock.collapsed { transform:translateY(calc(100% - 36px)); }
+.piano-toggle { position:absolute; top:-36px; left:50%; transform:translateX(-50%); background:var(--bg2); border:1px solid var(--border); border-bottom:none; padding:6px 20px; border-radius:8px 8px 0 0; cursor:pointer; color:var(--text2); font-size:13px; }
+.piano-toggle:hover { color:var(--text); }
+.piano-container { padding:12px 20px 16px; display:flex; flex-direction:column; align-items:center; gap:8px; }
+.piano-info { font-size:12px; color:var(--text2); display:flex; gap:16px; align-items:center; }
+.piano-keys { display:flex; position:relative; height:120px; user-select:none; }
+.piano-key { position:relative; cursor:pointer; transition:background 0.1s; }
+.piano-key.white { width:40px; height:120px; background:#e8e8e8; border:1px solid #999; border-radius:0 0 5px 5px; z-index:1; }
+.piano-key.white:hover { background:#fff; }
+.piano-key.white.pressed { background:var(--pink); }
+.piano-key.white.highlight { background:rgba(247,120,186,0.3); }
+.piano-key.black { width:26px; height:75px; background:#222; border:1px solid #000; border-radius:0 0 4px 4px; margin-left:-13px; margin-right:-13px; z-index:2; }
+.piano-key.black:hover { background:#444; }
+.piano-key.black.pressed { background:var(--purple); }
+.piano-key.black.highlight { background:rgba(188,140,255,0.4); }
+.piano-key .label { position:absolute; bottom:6px; left:50%; transform:translateX(-50%); font-size:10px; color:#666; pointer-events:none; }
+.piano-key.black .label { color:#aaa; bottom:4px; }
+
+/* Interval Trainer */
+.trainer-score { display:flex; gap:20px; margin-bottom:16px; }
+.trainer-score .s { font-size:24px; font-weight:700; }
+.trainer-options { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; }
+.trainer-options .btn { min-width:80px; text-align:center; }
+.trainer-options .btn.correct { background:var(--green); color:#fff; border-color:var(--green); }
+.trainer-options .btn.wrong { background:var(--red); color:#fff; border-color:var(--red); }
+.trainer-feedback { padding:12px; border-radius:8px; margin:12px 0; font-size:14px; }
+
+/* Metronome */
+.metronome-visual { display:flex; gap:12px; align-items:center; justify-content:center; margin:16px 0; }
+.beat-dot { width:30px; height:30px; border-radius:50%; background:var(--bg3); border:2px solid var(--border); transition:all 0.1s; }
+.beat-dot.active { background:var(--pink); border-color:var(--pink); box-shadow:0 0 12px rgba(247,120,186,0.5); }
+.beat-dot.strong { background:var(--red); border-color:var(--red); box-shadow:0 0 12px rgba(248,81,73,0.5); }
+
+/* Circle of Fifths */
+.cof-container { display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; }
+.cof-svg { flex-shrink:0; }
+.cof-info { flex:1; min-width:200px; }
+.cof-info h4 { margin-bottom:8px; }
+.cof-info .scale-notes { font-size:18px; letter-spacing:4px; margin:8px 0; color:var(--pink); }
+.cof-info .sig { font-size:14px; color:var(--text2); }
+
+/* Jianpu */
+.jianpu-display { font-family:monospace; font-size:24px; letter-spacing:6px; padding:16px; background:var(--bg); border-radius:8px; margin:12px 0; min-height:60px; line-height:2; }
+.jianpu-display .current { color:var(--pink); font-weight:700; text-decoration:underline; }
+
+@media (max-width:900px) {
+  .sidebar { display:none; }
+  .main { margin-left:0; padding:20px; padding-bottom:200px; }
+  .piano-dock { left:0; }
+  .stats-row { grid-template-columns:repeat(2,1fr); }
+  .stage-cards { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main" id="main"></main>
+</div>
+<div class="piano-dock collapsed" id="pianoDock">
+  <div class="piano-toggle" id="pianoToggle">Piano Keyboard</div>
+  <div class="piano-container">
+    <div class="piano-info">
+      <span id="pianoNote">--</span>
+      <span id="pianoFreq">--</span>
+      <span>Keys: A-L (white), W/E/T/Y/U/O/P (black)</span>
+    </div>
+    <div class="piano-keys" id="pianoKeys"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Audio Engine
+// ============================================================
+const Audio = {
+  ctx: null,
+  init() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+  playFreq(freq, duration=0.5, type='triangle') {
+    this.init();
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    const now = this.ctx.currentTime;
+    osc.type = type;
+    osc.frequency.value = freq;
+    // ADSR envelope
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.3, now + 0.01);
+    gain.gain.linearRampToValueAtTime(0.2, now + 0.08);
+    gain.gain.linearRampToValueAtTime(0.15, now + duration * 0.5);
+    gain.gain.linearRampToValueAtTime(0, now + duration);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(now);
+    osc.stop(now + duration);
+  },
+  midiToFreq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); },
+  playMidi(midi, dur=0.5) { this.playFreq(this.midiToFreq(midi), dur); },
+  playScale(midis, interval=0.4) {
+    midis.forEach((m, i) => {
+      setTimeout(() => this.playMidi(m, 0.45), i * interval * 1000);
+    });
+  },
+  playClick(strong=false) {
+    this.init();
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    const now = this.ctx.currentTime;
+    osc.type = 'sine';
+    osc.frequency.value = strong ? 1000 : 700;
+    gain.gain.setValueAtTime(strong ? 0.5 : 0.3, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.06);
+  }
+};
+
+// ============================================================
+// Music Theory Helpers
+// ============================================================
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const NOTE_NAMES_FLAT = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+const SOLFEGE = ['Do','Re','Mi','Fa','Sol','La','Si'];
+const MAJOR_STEPS = [0,2,4,5,7,9,11]; // semitones from root
+const MINOR_STEPS = [0,2,3,5,7,8,10];
+
+function getMajorScale(rootMidi) {
+  return MAJOR_STEPS.map(s => rootMidi + s);
+}
+function getMinorScale(rootMidi) {
+  return MINOR_STEPS.map(s => rootMidi + s);
+}
+function noteName(midi) {
+  return NOTE_NAMES[midi % 12] + Math.floor(midi / 12 - 1);
+}
+function noteNameSimple(midi) {
+  return NOTE_NAMES[midi % 12];
+}
+
+// ============================================================
+// Course Data
+// ============================================================
+const STAGE_COLORS = ['#f778ba','#bc8cff','#d29922','#39d2c0'];
+const STAGE_NAMES = ['声音基础','音阶与调','节奏与时值','音程与听力'];
+const STAGE_DESCS = ['理解声音的物理本质与人声','掌握音阶、调式和调号','节拍、时值与节奏感','音程辨别与综合实战'];
+const STAGE_LESSONS = [3,3,3,3];
+
+const LESSONS = [
+  // === Stage 1: 声音基础 ===
+  {id:1, title:'声音是什么：频率与音高', stage:0,
+   content: `
+<h3>一、声音的本质</h3>
+<p>声音是空气振动产生的波。振动越快（频率越高），我们听到的音就越高。频率的单位是<strong>赫兹(Hz)</strong>——每秒振动的次数。</p>
+<div class="highlight-box">
+<strong>核心概念</strong>：国际标准音 A4 = 440 Hz，这是所有乐器调音的基准。钢琴上中央C(C4)约为 261.6 Hz。
+</div>
+
+<h4>频率翻倍 = 高一个八度</h4>
+<p>A4 = 440Hz，A5 = 880Hz（翻倍），A3 = 220Hz（减半）。频率翻倍听起来是"同一个音但更高"，这就是<strong>八度(Octave)</strong>。</p>
+
+<h3>二、交互：频率与波形</h3>
+<p>拖动滑块改变频率，观察波形变化，点击播放听听声音：</p>
+<div class="interactive-box" id="freq-demo">
+  <h4>频率演示器</h4>
+  <div class="controls">
+    <label>频率：</label>
+    <input type="range" id="freqSlider" min="100" max="1200" value="440" step="1">
+    <span class="val" id="freqVal">440 Hz</span>
+    <button class="btn btn-primary" id="freqPlay">播放</button>
+    <button class="btn" id="freqA4">A4=440Hz</button>
+    <button class="btn" id="freqC4">C4=262Hz</button>
+  </div>
+  <canvas id="waveCanvas" width="600" height="150" style="width:100%;max-width:600px;background:var(--bg);"></canvas>
+</div>
+
+<h3>三、音名系统</h3>
+<p>西方音乐用 <strong>C D E F G A B</strong> 七个字母命名音高，加上数字标记八度：</p>
+<ul>
+  <li>C4 = 中央C（钢琴正中间）≈ 261.6 Hz</li>
+  <li>A4 = 标准音 = 440 Hz</li>
+  <li>C5 = 高八度C ≈ 523.3 Hz</li>
+</ul>
+<p>在下方钢琴键盘上试着弹几个音，注意音名和频率的对应关系。</p>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>声音 = 空气振动，频率(Hz) = 每秒振动次数</li>
+    <li>频率越高 → 音越高，频率翻倍 → 高一个八度</li>
+    <li>A4 = 440Hz 是国际标准音</li>
+    <li>音名用 C D E F G A B 加八度数字表示</li>
+  </ul>
+</div>
+`},
+
+  {id:2, title:'十二平均律与钢琴键盘', stage:0,
+   content: `
+<h3>一、为什么是12个音？</h3>
+<p>一个八度内被均匀分成 <strong>12个半音(semitone)</strong>，这就是<strong>十二平均律</strong>。每个半音之间的频率比恒定为 <code>2^(1/12) ≈ 1.0595</code>。</p>
+<div class="highlight-box">
+<strong>半音与全音</strong>：半音是最小的音程间距（相邻钢琴键）。两个半音 = 一个全音(tone)。
+</div>
+
+<h3>二、钢琴键盘结构</h3>
+<p>钢琴键盘由<strong>白键</strong>和<strong>黑键</strong>组成，一个八度有7个白键(C D E F G A B) + 5个黑键(C# D# F# G# A#)。</p>
+<ul>
+  <li><strong>E-F之间</strong>没有黑键（半音）</li>
+  <li><strong>B-C之间</strong>没有黑键（半音）</li>
+  <li>其余白键之间都有黑键（全音关系）</li>
+</ul>
+
+<h3>三、交互：键盘探索</h3>
+<p>点击下方的键盘图，观察半音和全音关系：</p>
+<div class="interactive-box" id="keyboard-explorer">
+  <h4>键盘结构图</h4>
+  <div class="controls">
+    <button class="btn" id="showSemitones">标注半音</button>
+    <button class="btn" id="showWholeTones">标注全音</button>
+    <button class="btn" id="playChromatic">播放半音阶</button>
+  </div>
+  <canvas id="kbCanvas" width="700" height="200" style="width:100%;max-width:700px;background:var(--bg);"></canvas>
+  <p id="kbInfo" style="font-size:13px;color:var(--text2);margin-top:8px;">点击键盘上的按键试试</p>
+</div>
+
+<h4>升号(#)与降号(b)</h4>
+<p>黑键有两种叫法：C# = Db, D# = Eb, F# = Gb, G# = Ab, A# = Bb。同一个音，不同名字——这叫<strong>等音(enharmonic)</strong>。</p>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>一个八度 = 12个半音，相邻半音频率比 ≈ 1.0595</li>
+    <li>半音 = 相邻键（含黑键），全音 = 两个半音</li>
+    <li>E-F 和 B-C 之间是半音（没有黑键）</li>
+    <li>黑键有升降两种名字（等音）</li>
+  </ul>
+</div>
+`},
+
+  {id:3, title:'人声音域与声部', stage:0,
+   content: `
+<h3>一、什么是音域？</h3>
+<p><strong>音域(Range)</strong>是一个人能唱出的从最低到最高的音的范围。一般成年人的歌唱音域约为 1.5-2 个八度。</p>
+
+<h3>二、四大声部</h3>
+<div class="interactive-box" id="voice-ranges">
+  <h4>声部音域图</h4>
+  <canvas id="rangeCanvas" width="700" height="280" style="width:100%;max-width:700px;background:var(--bg);"></canvas>
+  <div class="controls" style="margin-top:12px;">
+    <button class="btn" id="playSoprano">女高音 C4-C6</button>
+    <button class="btn" id="playAlto">女中音 F3-F5</button>
+    <button class="btn" id="playTenor">男高音 C3-C5</button>
+    <button class="btn" id="playBass">男低音 E2-E4</button>
+  </div>
+</div>
+
+<h4>详细声部说明</h4>
+<ul>
+  <li><strong>女高音(Soprano)</strong>: C4 - C6，最高亮的声部，旋律线常在这里</li>
+  <li><strong>女中音(Alto)</strong>: F3 - F5，温暖浑厚，和声的中间层</li>
+  <li><strong>男高音(Tenor)</strong>: C3 - C5，男声中最灵活的声部</li>
+  <li><strong>男低音(Bass)</strong>: E2 - E4，最深沉稳重的声部</li>
+</ul>
+
+<div class="highlight-box">
+<strong>唱歌小贴士</strong>：初学者不要急着扩展音域。先找到自己舒适的音域（"说话音区"上下各扩几个音），在这个范围内练习发声、气息和音准。
+</div>
+
+<h3>三、如何判断自己的声部？</h3>
+<ol>
+  <li>打开下方钢琴键盘</li>
+  <li>从中央C(C4)开始，跟着弹一个音唱一个音，往低处走</li>
+  <li>记下你能轻松唱到的最低音</li>
+  <li>再从C4往高处走，记下最高音</li>
+  <li>对照上面的声部范围，找到你大致所属的声部</li>
+</ol>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>音域 = 能唱的最低音到最高音的范围</li>
+    <li>四大声部：女高、女中、男高、男低</li>
+    <li>初学者先在舒适音域内练习，不急于扩展</li>
+    <li>用钢琴键盘跟唱来测试自己的音域</li>
+  </ul>
+</div>
+`},
+
+  // === Stage 2: 音阶与调 ===
+  {id:4, title:'大调音阶：Do Re Mi', stage:1,
+   content: `
+<h3>一、什么是音阶？</h3>
+<p><strong>音阶(Scale)</strong>是按照特定规则排列的一组音。最常用的是<strong>大调音阶(Major Scale)</strong>——就是我们耳熟能详的 Do Re Mi Fa Sol La Si。</p>
+
+<h3>二、大调的秘密公式</h3>
+<div class="highlight-box">
+<strong>全 全 半 全 全 全 半</strong><br>
+（W W H W W W H）<br>
+这是大调音阶唯一的规则。从任何音开始，按这个间距走，就能得到该调的大调音阶。
+</div>
+
+<h4>C大调示例</h4>
+<p>从C开始：C →(全)→ D →(全)→ E →(半)→ F →(全)→ G →(全)→ A →(全)→ B →(半)→ C</p>
+<p>恰好全是白键！这就是为什么C大调最基础——不需要任何黑键。</p>
+
+<h3>三、交互：音阶构建器</h3>
+<div class="interactive-box" id="scale-builder">
+  <h4>音阶构建器</h4>
+  <div class="controls">
+    <label>根音：</label>
+    <select id="scaleRoot">
+      <option value="60">C</option><option value="62">D</option>
+      <option value="64">E</option><option value="65">F</option>
+      <option value="67">G</option><option value="69">A</option>
+      <option value="71">B</option>
+      <option value="61">C#/Db</option><option value="63">D#/Eb</option>
+      <option value="66">F#/Gb</option><option value="68">G#/Ab</option>
+      <option value="70">A#/Bb</option>
+    </select>
+    <button class="btn btn-primary" id="playMajorScale">播放大调音阶</button>
+    <button class="btn" id="buildStep">逐步构建</button>
+  </div>
+  <div id="scaleDisplay" style="font-size:20px;letter-spacing:6px;margin:16px 0;color:var(--pink);min-height:30px;"></div>
+  <div id="scaleSteps" style="font-size:13px;color:var(--text2);"></div>
+</div>
+
+<h4>唱名与音名的对应</h4>
+<p>在C大调中：Do=C, Re=D, Mi=E, Fa=F, Sol=G, La=A, Si=B。但在G大调中：Do=G, Re=A, Mi=B... 唱名是<strong>相对的</strong>，总是从根音开始。</p>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>大调音阶 = 全全半全全全半</li>
+    <li>C大调全是白键，是最基础的调</li>
+    <li>唱名(Do Re Mi)是相对的，跟着调走</li>
+    <li>任何音都能做根音，按公式构建大调</li>
+  </ul>
+</div>
+`},
+
+  {id:5, title:'小调与调式色彩', stage:1,
+   content: `
+<h3>一、大调 vs 小调</h3>
+<p>如果说大调是"阳光明亮"的，那小调就是"忧郁深沉"的。这种色彩差异来自音阶内部的音程结构不同。</p>
+
+<h4>自然小调公式</h4>
+<div class="highlight-box">
+<strong>全 半 全 全 半 全 全</strong><br>
+（W H W W H W W）<br>
+对比大调的"全全半全全全半"，关键区别在第3、6、7级音降低了半音。
+</div>
+
+<h3>二、交互：大小调对比</h3>
+<div class="interactive-box" id="major-minor-compare">
+  <h4>大调 vs 小调 对比播放器</h4>
+  <div class="controls">
+    <label>根音：</label>
+    <select id="mmRoot">
+      <option value="60">C</option><option value="62">D</option>
+      <option value="64">E</option><option value="65">F</option>
+      <option value="67">G</option><option value="69">A</option>
+    </select>
+    <button class="btn btn-primary" id="playMajor">播放大调</button>
+    <button class="btn" id="playMinor">播放小调</button>
+    <button class="btn" id="playBoth">连续对比</button>
+  </div>
+  <div id="mmDisplay" style="margin-top:12px;">
+    <div style="margin-bottom:8px;"><span style="color:var(--pink);">大调：</span><span id="majorNotes" style="letter-spacing:4px;"></span></div>
+    <div><span style="color:var(--purple);">小调：</span><span id="minorNotes" style="letter-spacing:4px;"></span></div>
+  </div>
+</div>
+
+<h3>三、关系大小调</h3>
+<p>每个大调都有一个"亲戚"小调——<strong>关系小调(Relative Minor)</strong>。它们使用完全相同的音，只是起始音不同：</p>
+<ul>
+  <li>C大调的关系小调 = <strong>A小调</strong>（从La开始：A B C D E F G A）</li>
+  <li>G大调的关系小调 = <strong>E小调</strong></li>
+  <li>规律：大调根音往下数3个半音 = 关系小调的根音</li>
+</ul>
+
+<h3>四、调式在歌曲中的应用</h3>
+<p>快速判断一首歌是大调还是小调：</p>
+<ul>
+  <li>结尾落在哪个音上？落在Do = 大调，落在La = 小调</li>
+  <li>整体感觉：明亮欢快 → 大调，忧伤深沉 → 小调</li>
+</ul>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>大调 = 明亮，小调 = 忧郁，来自音阶结构差异</li>
+    <li>自然小调公式：全半全全半全全</li>
+    <li>关系大小调使用相同的音，只是起始音不同</li>
+    <li>歌曲结尾音和整体色彩可判断大小调</li>
+  </ul>
+</div>
+`},
+
+  {id:6, title:'调号与五度圈', stage:1,
+   content: `
+<h3>一、为什么需要调号？</h3>
+<p>C大调全是白键，但其他调需要黑键（升降号）。<strong>调号(Key Signature)</strong>写在乐谱开头，告诉你这首曲子要固定升或降哪些音。</p>
+<ul>
+  <li><strong>G大调</strong>：升F（1个升号）→ G A B C D E F#</li>
+  <li><strong>F大调</strong>：降B（1个降号）→ F G A Bb C D E</li>
+  <li><strong>D大调</strong>：升F、升C（2个升号）→ D E F# G A B C#</li>
+</ul>
+
+<h3>二、五度圈</h3>
+<p><strong>五度圈(Circle of Fifths)</strong>是音乐理论中最重要的图表。它以纯五度(7个半音)为间隔，把12个调排列成一个圆圈：</p>
+
+<div class="interactive-box" id="cof-box">
+  <h4>五度圈（点击切换调号）</h4>
+  <div class="cof-container">
+    <svg id="cofSvg" width="320" height="320" class="cof-svg"></svg>
+    <div class="cof-info" id="cofInfo">
+      <h4 id="cofKey">C 大调</h4>
+      <div id="cofSig" class="sig">无升降号</div>
+      <div id="cofScale" class="scale-notes">C D E F G A B</div>
+      <div id="cofRelative" style="font-size:13px;color:var(--text2);margin-top:8px;"></div>
+      <button class="btn btn-primary" id="cofPlay" style="margin-top:12px;">播放音阶</button>
+    </div>
+  </div>
+</div>
+
+<h4>五度圈的规律</h4>
+<ul>
+  <li>顺时针 = 升号调，每走一步多一个#：C → G(1#) → D(2#) → A(3#)...</li>
+  <li>逆时针 = 降号调，每走一步多一个b：C → F(1b) → Bb(2b) → Eb(3b)...</li>
+  <li>相邻的调只差一个升降号 → 它们之间转调最自然</li>
+</ul>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>调号告诉你哪些音需要固定升/降</li>
+    <li>五度圈以纯五度排列12个调</li>
+    <li>顺时针加#，逆时针加b</li>
+    <li>相邻调之间转调最自然流畅</li>
+  </ul>
+</div>
+`},
+
+  // === Stage 3: 节奏与时值 ===
+  {id:7, title:'节拍与拍号', stage:2,
+   content: `
+<h3>一、什么是节拍？</h3>
+<p><strong>节拍(Beat)</strong>是音乐的"心跳"。当你听歌时不自觉地点头或拍手，你就是在跟着节拍。节拍有<strong>强弱规律</strong>：</p>
+
+<h4>常见拍号</h4>
+<ul>
+  <li><strong>4/4拍</strong>：每小节4拍，强-弱-次强-弱。最常见，流行歌曲90%以上用4/4拍</li>
+  <li><strong>3/4拍</strong>：每小节3拍，强-弱-弱。华尔兹(圆舞曲)的节奏</li>
+  <li><strong>2/4拍</strong>：每小节2拍，强-弱。进行曲的节奏</li>
+  <li><strong>6/8拍</strong>：每小节6个八分音符，分2组，每组强-弱-弱。摇摆感</li>
+</ul>
+
+<h3>二、交互：可视化节拍器</h3>
+<div class="interactive-box" id="metronome-box">
+  <h4>节拍器</h4>
+  <div class="controls">
+    <label>BPM：</label>
+    <input type="range" id="bpmSlider" min="40" max="200" value="100">
+    <span class="val" id="bpmVal">100</span>
+    <label>拍号：</label>
+    <select id="timeSig">
+      <option value="4">4/4</option>
+      <option value="3">3/4</option>
+      <option value="2">2/4</option>
+      <option value="6">6/8</option>
+    </select>
+    <button class="btn btn-primary" id="metroStart">开始</button>
+    <button class="btn" id="metroStop">停止</button>
+  </div>
+  <div class="metronome-visual" id="metroVisual"></div>
+  <p style="font-size:13px;color:var(--text2);margin-top:8px;">提示：跟着节拍拍手或点头，感受强弱规律</p>
+</div>
+
+<h3>三、BPM（速度）</h3>
+<p><strong>BPM(Beats Per Minute)</strong> = 每分钟节拍数。常见速度：</p>
+<ul>
+  <li>60 BPM = 一秒一拍，缓慢的抒情歌</li>
+  <li>100 BPM = 中等速度，大多数流行歌</li>
+  <li>120 BPM = 较快，舞曲/电子音乐</li>
+  <li>140+ BPM = 快速，激烈的摇滚/说唱</li>
+</ul>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>节拍 = 音乐的心跳，有强弱规律</li>
+    <li>4/4拍最常见：强-弱-次强-弱</li>
+    <li>BPM = 速度，60=慢, 100=中, 120+=快</li>
+    <li>学会用节拍器练习稳定的节奏感</li>
+  </ul>
+</div>
+`},
+
+  {id:8, title:'音符时值', stage:2,
+   content: `
+<h3>一、音符的长短</h3>
+<p>音符的<strong>时值(Duration)</strong>决定了一个音要持续多久。以四分音符为1拍基准：</p>
+
+<h3>二、交互：时值树形图</h3>
+<div class="interactive-box" id="duration-tree">
+  <h4>音符时值关系（点击播放）</h4>
+  <canvas id="durationCanvas" width="700" height="350" style="width:100%;max-width:700px;background:var(--bg);cursor:pointer;"></canvas>
+</div>
+
+<h4>常见音符</h4>
+<ul>
+  <li><strong>全音符 (4拍)</strong>：最长，持续整个4/4小节</li>
+  <li><strong>二分音符 (2拍)</strong>：全音符的一半</li>
+  <li><strong>四分音符 (1拍)</strong>：最基本的单位，走路的节奏</li>
+  <li><strong>八分音符 (半拍)</strong>：四分音符的一半，跑步的节奏</li>
+  <li><strong>十六分音符 (1/4拍)</strong>：八分音符再分半</li>
+</ul>
+
+<h3>三、休止符</h3>
+<p>休止符 = 不发声的音符。每种音符都有对应的休止符，时值相同，只是用来标记"停顿"。</p>
+<div class="highlight-box">
+<strong>唱歌应用</strong>：休止符是你换气的地方！好的歌手会在休止符处自然换气，而不是在旋律中间断。
+</div>
+
+<h3>四、附点音符</h3>
+<p>音符后面加一个点 = 原时值 × 1.5：</p>
+<ul>
+  <li>附点二分音符 = 2 + 1 = 3拍</li>
+  <li>附点四分音符 = 1 + 0.5 = 1.5拍</li>
+  <li>附点八分音符 = 0.5 + 0.25 = 0.75拍</li>
+</ul>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>全(4拍) → 二分(2拍) → 四分(1拍) → 八分(半拍) → 十六分(1/4拍)</li>
+    <li>每级时值是上级的一半，形成二分树结构</li>
+    <li>休止符 = 不发声的音符，唱歌时用来换气</li>
+    <li>附点 = 原时值 × 1.5</li>
+  </ul>
+</div>
+`},
+
+  {id:9, title:'常见节奏型', stage:2,
+   content: `
+<h3>一、基本节奏型</h3>
+<p>节奏型是音符时值的组合模式。掌握几种常见的节奏型，你就能读懂大多数歌曲：</p>
+
+<h3>二、交互：节奏型播放器</h3>
+<div class="interactive-box" id="rhythm-player">
+  <h4>节奏型播放器</h4>
+  <div class="controls">
+    <label>BPM：</label>
+    <input type="range" id="rhythmBpm" min="60" max="160" value="100">
+    <span class="val" id="rhythmBpmVal">100</span>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
+    <button class="btn" data-rhythm="basic">基本四拍 ● ● ● ●</button>
+    <button class="btn" data-rhythm="eighth">八分音符 ●●●●●●●●</button>
+    <button class="btn" data-rhythm="synco">切分节奏 ● ●● ● ●●</button>
+    <button class="btn" data-rhythm="triplet">三连音 ●●●●●●</button>
+    <button class="btn" data-rhythm="dotted">附点节奏 ●.● ●.●</button>
+    <button class="btn" data-rhythm="waltz">华尔兹 ●  ● ●</button>
+  </div>
+  <div id="rhythmVisual" style="display:flex;gap:4px;align-items:center;min-height:40px;flex-wrap:wrap;"></div>
+</div>
+
+<h3>三、切分节奏</h3>
+<p><strong>切分(Syncopation)</strong>是把重音放在"非预期"的位置上——通常是弱拍或弱拍的后半拍。它让节奏产生"摇摆"、"推进"的感觉。</p>
+<div class="highlight-box">
+<strong>流行音乐中的切分</strong>：几乎所有流行歌都会用切分。歌词经常在弱拍"提前进入"，产生动感。
+</div>
+
+<h3>四、三连音</h3>
+<p><strong>三连音(Triplet)</strong>是把一拍均分成3等份。普通节拍是二分法(1拍=2个八分音符)，三连音打破了这个规则，产生独特的"滚动"感。</p>
+
+<h3>五、唱歌中的节奏</h3>
+<p>唱歌节奏不准是初学者最大的问题之一：</p>
+<ol>
+  <li><strong>先拍后唱</strong>：跟着节拍器拍手，稳定后再加入歌词</li>
+  <li><strong>切分要准</strong>：不是"随便提前"，而是精确地在弱拍位进入</li>
+  <li><strong>休止要干净</strong>：该停的地方停下来，不要拖音</li>
+</ol>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>掌握基本四拍、八分音符、切分、三连音等节奏型</li>
+    <li>切分 = 重音在弱拍，是流行音乐的灵魂</li>
+    <li>三连音 = 一拍分三等份</li>
+    <li>练习节奏：先拍后唱，用节拍器保持稳定</li>
+  </ul>
+</div>
+`},
+
+  // === Stage 4: 音程与听力 ===
+  {id:10, title:'音程基础', stage:3,
+   content: `
+<h3>一、什么是音程？</h3>
+<p><strong>音程(Interval)</strong>是两个音之间的距离，用"度"来衡量。</p>
+
+<h4>音程表</h4>
+<div class="interactive-box" id="interval-table">
+  <h4>12个半音程（点击听）</h4>
+  <div id="intervalList" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;"></div>
+</div>
+
+<h3>二、协和与不协和</h3>
+<ul>
+  <li><strong>完全协和</strong>：纯一度(0)、纯八度(12)、纯五度(7)、纯四度(5)</li>
+  <li><strong>不完全协和</strong>：大三度(4)、小三度(3)、大六度(9)、小六度(8)</li>
+  <li><strong>不协和</strong>：大二度(2)、小二度(1)、大七度(11)、小七度(10)、三全音(6)</li>
+</ul>
+
+<h3>三、歌曲记忆法</h3>
+<p>每个音程都可以用一首熟悉歌曲的开头来记忆：</p>
+<div class="interactive-box" id="song-memory">
+  <h4>音程歌曲关联（点击播放音程）</h4>
+  <div id="songList"></div>
+</div>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>音程 = 两个音的距离，用半音数或度数衡量</li>
+    <li>纯一/四/五/八度是完全协和的</li>
+    <li>用熟悉歌曲记忆各音程的听觉特征</li>
+    <li>唱歌时音程感 = 音准的基础</li>
+  </ul>
+</div>
+`},
+
+  {id:11, title:'听力训练', stage:3,
+   content: `
+<h3>一、为什么要练听力？</h3>
+<p>唱歌最核心的能力是<strong>音准</strong>——听到一个音，能准确地唱出来。这需要训练<strong>耳朵和大脑之间的连接</strong>。音程听辨是听力训练的基础。</p>
+
+<h3>二、音程听辨测试</h3>
+<div class="interactive-box" id="ear-trainer">
+  <h4>听力训练器</h4>
+  <div class="trainer-score">
+    <div><span class="s" style="color:var(--green);" id="etCorrect">0</span><span style="color:var(--text2);font-size:13px;"> 正确</span></div>
+    <div><span class="s" style="color:var(--red);" id="etWrong">0</span><span style="color:var(--text2);font-size:13px;"> 错误</span></div>
+    <div><span class="s" style="color:var(--blue);" id="etStreak">0</span><span style="color:var(--text2);font-size:13px;"> 连续</span></div>
+    <div><span class="s" style="color:var(--text2);" id="etTotal">0</span><span style="color:var(--text2);font-size:13px;"> 总题</span></div>
+  </div>
+  <div class="controls">
+    <label>难度：</label>
+    <select id="etDifficulty">
+      <option value="easy">初级（纯一/八/五/四度）</option>
+      <option value="medium">中级（加大小三/六度）</option>
+      <option value="hard">高级（全部12个音程）</option>
+    </select>
+    <label>方向：</label>
+    <select id="etDirection">
+      <option value="up">上行</option>
+      <option value="down">下行</option>
+      <option value="random">随机</option>
+    </select>
+  </div>
+  <div style="margin:16px 0;display:flex;gap:12px;">
+    <button class="btn btn-primary" id="etNew">出题</button>
+    <button class="btn" id="etReplay">重听</button>
+  </div>
+  <div class="trainer-options" id="etOptions"></div>
+  <div class="trainer-feedback" id="etFeedback" style="display:none;"></div>
+</div>
+
+<h3>三、练习建议</h3>
+<ol>
+  <li><strong>从初级开始</strong>：先熟悉纯一/八/五/四度</li>
+  <li><strong>每天10分钟</strong>：少量多次比一次大量练效果好</li>
+  <li><strong>唱出来</strong>：听到音程后尝试自己唱出来</li>
+  <li><strong>联系歌曲</strong>：回忆第10课的歌曲关联法</li>
+</ol>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>音准 = 听力训练的核心目标</li>
+    <li>从协和音程开始练，逐步增加难度</li>
+    <li>每天坚持10分钟听辨练习</li>
+    <li>听+唱结合效果最好</li>
+  </ul>
+</div>
+`},
+
+  {id:12, title:'综合实战', stage:3,
+   content: `
+<h3>一、简谱速成</h3>
+<p>中国最常用的记谱法是<strong>简谱(Numbered Musical Notation)</strong>，用数字1-7表示音阶：</p>
+<ul>
+  <li>1=Do, 2=Re, 3=Mi, 4=Fa, 5=Sol, 6=La, 7=Si</li>
+  <li>数字上方加点 = 高八度，下方加点 = 低八度</li>
+  <li>0 = 休止符</li>
+  <li>数字后加 - = 延长一拍，下加线 = 缩短一半</li>
+</ul>
+
+<h3>二、交互：简谱播放器</h3>
+<div class="interactive-box" id="jianpu-player">
+  <h4>简谱播放器（C大调）</h4>
+  <div class="controls">
+    <label>速度：</label>
+    <input type="range" id="jpBpm" min="60" max="160" value="100">
+    <span class="val" id="jpBpmVal">100</span>
+    <button class="btn btn-primary" id="jpPlay">播放</button>
+    <button class="btn" id="jpStop">停止</button>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
+    <button class="btn jp-preset" data-song="twinkle">小星星</button>
+    <button class="btn jp-preset" data-song="ode">欢乐颂</button>
+    <button class="btn jp-preset" data-song="jasmine">茉莉花</button>
+    <button class="btn jp-preset" data-song="doremisong">Do Re Mi之歌</button>
+  </div>
+  <div class="jianpu-display" id="jpDisplay">1 1 5 5 | 6 6 5 - | 4 4 3 3 | 2 2 1 -</div>
+  <p style="font-size:13px;color:var(--text2);margin-top:8px;" id="jpSongName">小星星</p>
+</div>
+
+<h3>三、视唱练习</h3>
+<p><strong>视唱(Sight-Singing)</strong>是看着谱就能唱出来的能力。练习步骤：</p>
+<ol>
+  <li>先用简谱播放器听一遍旋律</li>
+  <li>跟着钢琴键盘逐音唱唱名(Do Re Mi...)</li>
+  <li>不看键盘，只看简谱尝试唱</li>
+  <li>最后对照播放器检查音准</li>
+</ol>
+
+<h3>四、制定你的练习计划</h3>
+<div class="highlight-box">
+<strong>每日练习建议（30分钟）</strong>：
+<ul style="margin-top:8px;">
+  <li>5分钟：用钢琴键盘热身，弹大调音阶</li>
+  <li>10分钟：音程听辨训练（第11课）</li>
+  <li>10分钟：简谱视唱练习</li>
+  <li>5分钟：跟着节拍器练节奏感</li>
+</ul>
+</div>
+
+<h3>五、接下来学什么？</h3>
+<p>完成这12课乐理基础后，你已经具备了唱歌需要的理论知识。接下来应该：</p>
+<ol>
+  <li><strong>发声技巧</strong>：气息控制、共鸣腔体、混声</li>
+  <li><strong>歌曲练习</strong>：选择适合自己音域的歌曲开始练</li>
+  <li><strong>录音对比</strong>：录下自己的歌声，和原唱对比改进</li>
+</ol>
+
+<div class="takeaways">
+  <h4>本课要点</h4>
+  <ul>
+    <li>简谱用1-7表示Do-Si，加点表示高低八度</li>
+    <li>视唱 = 看谱直接唱，需要音准+节奏双重能力</li>
+    <li>每天30分钟练习：音阶+听辨+视唱+节奏</li>
+    <li>乐理是基础，接下来进入发声技巧训练</li>
+  </ul>
+</div>
+`}
+];
+
+// ============================================================
+// Interval Data
+// ============================================================
+const INTERVALS = [
+  {name:'纯一度', semitones:0, abbr:'P1', song:'同一个音', consonance:'完全协和'},
+  {name:'小二度', semitones:1, abbr:'m2', song:'大白鲨主题', consonance:'不协和'},
+  {name:'大二度', semitones:2, abbr:'M2', song:'祝你生日快乐', consonance:'不协和'},
+  {name:'小三度', semitones:3, abbr:'m3', song:'催眠曲(Brahms)', consonance:'不完全协和'},
+  {name:'大三度', semitones:4, abbr:'M3', song:'婚礼进行曲', consonance:'不完全协和'},
+  {name:'纯四度', semitones:5, abbr:'P4', song:'我们祝你圣诞快乐', consonance:'完全协和'},
+  {name:'三全音', semitones:6, abbr:'TT', song:'辛普森一家', consonance:'不协和'},
+  {name:'纯五度', semitones:7, abbr:'P5', song:'星球大战主题', consonance:'完全协和'},
+  {name:'小六度', semitones:8, abbr:'m6', song:'Love Story', consonance:'不完全协和'},
+  {name:'大六度', semitones:9, abbr:'M6', song:'My Bonnie', consonance:'不完全协和'},
+  {name:'小七度', semitones:10, abbr:'m7', song:'Somewhere(西区故事)', consonance:'不协和'},
+  {name:'大七度', semitones:11, abbr:'M7', song:'Take On Me', consonance:'不协和'},
+  {name:'纯八度', semitones:12, abbr:'P8', song:'Somewhere Over the Rainbow', consonance:'完全协和'},
+];
+
+// Circle of fifths data
+const COF_KEYS = [
+  {name:'C', sharps:0, flats:0, root:60, minor:'Am'},
+  {name:'G', sharps:1, flats:0, root:67, minor:'Em'},
+  {name:'D', sharps:2, flats:0, root:62, minor:'Bm'},
+  {name:'A', sharps:3, flats:0, root:69, minor:'F#m'},
+  {name:'E', sharps:4, flats:0, root:64, minor:'C#m'},
+  {name:'B', sharps:5, flats:0, root:71, minor:'G#m'},
+  {name:'F#/Gb', sharps:6, flats:6, root:66, minor:'D#m/Ebm'},
+  {name:'Db', sharps:0, flats:5, root:61, minor:'Bbm'},
+  {name:'Ab', sharps:0, flats:4, root:68, minor:'Fm'},
+  {name:'Eb', sharps:0, flats:3, root:63, minor:'Cm'},
+  {name:'Bb', sharps:0, flats:2, root:70, minor:'Gm'},
+  {name:'F', sharps:0, flats:1, root:65, minor:'Dm'},
+];
+
+// Jianpu songs
+const SONGS = {
+  twinkle: {name:'小星星', notes:'1 1 5 5 | 6 6 5 - | 4 4 3 3 | 2 2 1 - | 5 5 4 4 | 3 3 2 - | 5 5 4 4 | 3 3 2 - | 1 1 5 5 | 6 6 5 - | 4 4 3 3 | 2 2 1 -'},
+  ode: {name:'欢乐颂', notes:'3 3 4 5 | 5 4 3 2 | 1 1 2 3 | 3 - 2 2 | 3 3 4 5 | 5 4 3 2 | 1 1 2 3 | 2 - 1 1'},
+  jasmine: {name:'茉莉花', notes:'3 3 5 6 | 1+ 6 5 - | 5 3 5 6 | 5 - - - | 1 1 2 3 | 2 1 6. - | 5. 6. 1 2 | 1 - - -'},
+  doremisong: {name:'Do Re Mi之歌', notes:'1 2 3 1 | 3 1 3 - | 2 3 4 4 | 3 2 4 - | 3 4 5 3 | 5 3 5 - | 4 5 6 6 | 5 4 6 -'}
+};
+
+// ============================================================
+// App State
+// ============================================================
+let currentView = 'dashboard';
+let currentLesson = null;
+let metroTimer = null;
+let metroBeat = 0;
+let etState = {answer:null, answered:false, correct:0, wrong:0, streak:0, total:0};
+let jpTimer = null;
+let highlightedKeys = new Set();
+let pianoExpanded = false;
+
+// Progress in localStorage
+function getProgress() {
+  try { return JSON.parse(localStorage.getItem('music_progress') || '{}'); } catch { return {}; }
+}
+function setLessonDone(id) {
+  const p = getProgress();
+  p[id] = {done:true, date:new Date().toISOString().slice(0,10)};
+  localStorage.setItem('music_progress', JSON.stringify(p));
+}
+function isLessonDone(id) { return getProgress()[id]?.done; }
+function completedCount() { return LESSONS.filter(l => isLessonDone(l.id)).length; }
+
+// ============================================================
+// Render Sidebar
+// ============================================================
+function renderSidebar() {
+  const sb = document.getElementById('sidebar');
+  const done = completedCount();
+  let html = `
+    <div class="logo"><h1>乐理学习</h1><p>为唱歌而生 · 12课时</p></div>
+    <div class="progress-mini" onclick="navigate('dashboard')">
+      <span>学习进度</span><strong>${done}/12</strong>
+      <div class="bar"><div class="bar-fill" style="width:${done/12*100}%"></div></div>
+    </div>`;
+  let idx = 0;
+  STAGE_NAMES.forEach((name, si) => {
+    const count = STAGE_LESSONS[si];
+    const isOpen = currentLesson !== null && LESSONS[currentLesson]?.stage === si;
+    html += `<div class="nav-stage${isOpen?' open':''}" data-stage="${si}">
+      <div class="nav-stage-header" onclick="toggleStage(this)">
+        <span class="dot" style="background:${STAGE_COLORS[si]}"></span>
+        ${name}
+        <span class="arrow">▶</span>
+      </div>
+      <div class="nav-lessons">`;
+    for (let i = 0; i < count; i++) {
+      const l = LESSONS[idx];
+      const active = currentLesson === idx;
+      const done = isLessonDone(l.id);
+      html += `<div class="nav-lesson${active?' active':''}" onclick="navigate('lesson',${idx})">
+        <span class="status">${done?'✅':'○'}</span>${l.id}. ${l.title}
+      </div>`;
+      idx++;
+    }
+    html += `</div></div>`;
+  });
+  sb.innerHTML = html;
+}
+
+function toggleStage(el) {
+  el.parentElement.classList.toggle('open');
+}
+
+// ============================================================
+// Render Dashboard
+// ============================================================
+function renderDashboard() {
+  const done = completedCount();
+  const progress = getProgress();
+  // Find next lesson
+  let nextIdx = LESSONS.findIndex(l => !isLessonDone(l.id));
+  if (nextIdx < 0) nextIdx = 0;
+  const next = LESSONS[nextIdx];
+
+  let html = `
+    <div class="dash-header">
+      <h2>乐理学习平台</h2>
+      <p>为唱歌而生 — 从零开始掌握音乐基础理论</p>
+    </div>
+    <div class="stats-row">
+      <div class="stat-card"><div class="value" style="color:var(--pink);">${done}</div><div class="label">已完成课时</div></div>
+      <div class="stat-card"><div class="value" style="color:var(--text2);">12</div><div class="label">总课时数</div></div>
+      <div class="stat-card"><div class="value" style="color:var(--purple);">${Math.round(done/12*100)}%</div><div class="label">完成进度</div></div>
+      <div class="stat-card"><div class="value" style="color:var(--green);">4</div><div class="label">学习阶段</div></div>
+    </div>`;
+
+  if (done < 12) {
+    html += `
+    <div class="next-lesson-card">
+      <div class="icon">🎵</div>
+      <div><h3>继续学习：${next.title}</h3><p>${STAGE_NAMES[next.stage]} · 第${next.id}课</p></div>
+      <button onclick="navigate('lesson',${nextIdx})">开始学习</button>
+    </div>`;
+  } else {
+    html += `<div class="next-lesson-card"><div class="icon">🎉</div><div><h3>恭喜！你已完成全部12课！</h3><p>乐理基础已扎实，可以开始发声技巧训练了</p></div></div>`;
+  }
+
+  html += `<div class="stage-cards">`;
+  let idx = 0;
+  STAGE_NAMES.forEach((name, si) => {
+    const count = STAGE_LESSONS[si];
+    let stageDone = 0;
+    for (let i = 0; i < count; i++) { if (isLessonDone(LESSONS[idx+i].id)) stageDone++; }
+    html += `
+    <div class="stage-card" onclick="navigate('lesson',${idx})">
+      <h3><span class="stage-num" style="background:${STAGE_COLORS[si]}">阶段${si+1}</span>${name}</h3>
+      <div class="desc">${STAGE_DESCS[si]}</div>
+      <div class="bar"><div class="bar-fill" style="width:${stageDone/count*100}%;background:${STAGE_COLORS[si]}"></div></div>
+      <div class="meta">${stageDone}/${count} 课时完成</div>
+    </div>`;
+    idx += count;
+  });
+  html += `</div>`;
+
+  document.getElementById('main').innerHTML = html;
+}
+
+// ============================================================
+// Render Lesson
+// ============================================================
+function renderLesson(idx) {
+  const l = LESSONS[idx];
+  const done = isLessonDone(l.id);
+  const stageColor = STAGE_COLORS[l.stage];
+  let html = `
+    <div class="lesson-header">
+      <div class="breadcrumb">${STAGE_NAMES[l.stage]} › 第${l.id}课</div>
+      <h2>${l.title}</h2>
+      <div class="meta">
+        <span class="badge badge-stage" style="background:${stageColor}">阶段${l.stage+1}</span>
+        <span class="badge ${done?'badge-done':'badge-pending'}">${done?'已完成':'未完成'}</span>
+      </div>
+    </div>
+    <div class="lesson-content">${l.content}</div>
+    <button class="complete-btn ${done?'done':''}" onclick="toggleComplete(${l.id})" id="completeBtn">
+      ${done?'✅ 已完成 (点击取消)':'标记为已完成'}
+    </button>
+    <div class="lesson-nav">
+      <button ${idx===0?'disabled':''} onclick="navigate('lesson',${idx-1})">← 上一课</button>
+      <button ${idx===LESSONS.length-1?'disabled':''} onclick="navigate('lesson',${idx+1})">下一课 →</button>
+    </div>`;
+  document.getElementById('main').innerHTML = html;
+
+  // Initialize interactive components for this lesson
+  setTimeout(() => initLessonInteractive(l.id), 50);
+}
+
+function toggleComplete(id) {
+  const p = getProgress();
+  if (p[id]?.done) { delete p[id]; localStorage.setItem('music_progress', JSON.stringify(p)); }
+  else { setLessonDone(id); }
+  renderSidebar();
+  const btn = document.getElementById('completeBtn');
+  const done = isLessonDone(id);
+  btn.className = `complete-btn ${done?'done':''}`;
+  btn.textContent = done ? '✅ 已完成 (点击取消)' : '标记为已完成';
+}
+
+// ============================================================
+// Navigation
+// ============================================================
+function navigate(view, param) {
+  // Stop any running timers
+  if (metroTimer) { clearInterval(metroTimer); metroTimer = null; }
+  if (jpTimer) { clearTimeout(jpTimer); jpTimer = null; }
+
+  if (view === 'dashboard') {
+    currentView = 'dashboard';
+    currentLesson = null;
+    renderDashboard();
+  } else if (view === 'lesson') {
+    currentView = 'lesson';
+    currentLesson = param;
+    renderLesson(param);
+  }
+  renderSidebar();
+  window.scrollTo(0, 0);
+}
+
+// ============================================================
+// Piano Dock
+// ============================================================
+function buildPiano() {
+  const container = document.getElementById('pianoKeys');
+  // C4(60) to B5(83) = 2 octaves
+  const keys = [];
+  for (let midi = 60; midi <= 83; midi++) {
+    const note = midi % 12;
+    const isBlack = [1,3,6,8,10].includes(note);
+    keys.push({midi, note, isBlack, name: noteName(midi)});
+  }
+
+  container.innerHTML = '';
+  keys.forEach(k => {
+    const el = document.createElement('div');
+    el.className = `piano-key ${k.isBlack?'black':'white'}`;
+    el.dataset.midi = k.midi;
+    el.innerHTML = `<span class="label">${k.isBlack ? noteNameSimple(k.midi) : k.name}</span>`;
+    el.addEventListener('mousedown', () => pianoPress(k.midi));
+    el.addEventListener('mouseup', () => pianoRelease(k.midi));
+    el.addEventListener('mouseleave', () => pianoRelease(k.midi));
+    container.appendChild(el);
+  });
+}
+
+function pianoPress(midi) {
+  Audio.playMidi(midi, 0.6);
+  const el = document.querySelector(`.piano-key[data-midi="${midi}"]`);
+  if (el) el.classList.add('pressed');
+  document.getElementById('pianoNote').textContent = noteName(midi);
+  document.getElementById('pianoFreq').textContent = Audio.midiToFreq(midi).toFixed(1) + ' Hz';
+}
+function pianoRelease(midi) {
+  const el = document.querySelector(`.piano-key[data-midi="${midi}"]`);
+  if (el) el.classList.remove('pressed');
+}
+
+function highlightPianoKeys(midis) {
+  // Clear old highlights
+  document.querySelectorAll('.piano-key.highlight').forEach(el => el.classList.remove('highlight'));
+  highlightedKeys = new Set(midis);
+  midis.forEach(m => {
+    const el = document.querySelector(`.piano-key[data-midi="${m}"]`);
+    if (el) el.classList.add('highlight');
+  });
+}
+
+// Keyboard shortcuts
+const KEY_MAP = {
+  'a':60,'w':61,'s':62,'e':63,'d':64,'f':65,'t':66,'g':67,'y':68,'h':69,'u':70,'j':71,
+  'k':72,'o':73,'l':74,'p':75,';':76
+};
+
+document.addEventListener('keydown', e => {
+  if (e.repeat || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const midi = KEY_MAP[e.key.toLowerCase()];
+  if (midi !== undefined) { e.preventDefault(); pianoPress(midi); }
+});
+document.addEventListener('keyup', e => {
+  const midi = KEY_MAP[e.key.toLowerCase()];
+  if (midi !== undefined) pianoRelease(midi);
+});
+
+// Toggle piano dock
+document.getElementById('pianoToggle').addEventListener('click', () => {
+  const dock = document.getElementById('pianoDock');
+  dock.classList.toggle('collapsed');
+  pianoExpanded = !dock.classList.contains('collapsed');
+  document.getElementById('pianoToggle').textContent = pianoExpanded ? '收起键盘 ▼' : 'Piano Keyboard ▲';
+});
+
+// ============================================================
+// Lesson Interactive Initializers
+// ============================================================
+function initLessonInteractive(lessonId) {
+  switch(lessonId) {
+    case 1: initFreqDemo(); break;
+    case 2: initKeyboardExplorer(); break;
+    case 3: initVoiceRanges(); break;
+    case 4: initScaleBuilder(); break;
+    case 5: initMajorMinorCompare(); break;
+    case 6: initCircleOfFifths(); break;
+    case 7: initMetronome(); break;
+    case 8: initDurationTree(); break;
+    case 9: initRhythmPlayer(); break;
+    case 10: initIntervalTable(); break;
+    case 11: initEarTrainer(); break;
+    case 12: initJianpuPlayer(); break;
+  }
+}
+
+// --- Lesson 1: Frequency Demo ---
+function initFreqDemo() {
+  const slider = document.getElementById('freqSlider');
+  const val = document.getElementById('freqVal');
+  const canvas = document.getElementById('waveCanvas');
+  if (!slider || !canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  function drawWave(freq) {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = '#f778ba';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const cycles = freq / 50;
+    for (let x = 0; x < w; x++) {
+      const y = h/2 + Math.sin(x / w * cycles * 2 * Math.PI) * (h/2 - 10);
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // Grid
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, h/2); ctx.lineTo(w, h/2);
+    ctx.stroke();
+  }
+
+  slider.oninput = () => { val.textContent = slider.value + ' Hz'; drawWave(+slider.value); };
+  document.getElementById('freqPlay').onclick = () => Audio.playFreq(+slider.value, 0.8);
+  document.getElementById('freqA4').onclick = () => { slider.value = 440; val.textContent = '440 Hz'; drawWave(440); Audio.playFreq(440, 0.8); };
+  document.getElementById('freqC4').onclick = () => { slider.value = 262; val.textContent = '262 Hz'; drawWave(262); Audio.playFreq(261.6, 0.8); };
+  drawWave(440);
+}
+
+// --- Lesson 2: Keyboard Explorer ---
+function initKeyboardExplorer() {
+  const canvas = document.getElementById('kbCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const info = document.getElementById('kbInfo');
+  let showMode = null; // 'semi' or 'whole'
+
+  const whiteNotes = [0,2,4,5,7,9,11]; // C D E F G A B
+  const whiteLabels = ['C','D','E','F','G','A','B'];
+  const blackNotes = [1,3,6,8,10]; // C# D# F# G# A#
+  const blackPositions = [0.7, 1.7, 3.7, 4.7, 5.7]; // relative to white key index
+
+  function draw() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const kw = w / 14; // 14 white keys = 2 octaves
+    // White keys
+    for (let i = 0; i < 14; i++) {
+      ctx.fillStyle = '#e8e8e8';
+      ctx.fillRect(i*kw, 0, kw-1, h);
+      ctx.strokeStyle = '#999';
+      ctx.strokeRect(i*kw, 0, kw-1, h);
+      // Label
+      ctx.fillStyle = '#333';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'center';
+      const octave = i < 7 ? 4 : 5;
+      ctx.fillText(whiteLabels[i%7]+octave, i*kw+kw/2, h-8);
+    }
+    // Black keys
+    for (let oct = 0; oct < 2; oct++) {
+      blackPositions.forEach(pos => {
+        const x = (pos + oct*7)*kw;
+        ctx.fillStyle = '#222';
+        ctx.fillRect(x, 0, kw*0.6, h*0.6);
+      });
+    }
+    // Annotations
+    if (showMode === 'semi') {
+      // Mark E-F and B-C as semitones
+      const pairs = [[4,5],[11,12],[4+7,5+7],[11+7,12+7]];
+      ctx.fillStyle = 'rgba(248,81,73,0.3)';
+      [[2,3],[6,7],[9,10],[13,14]].forEach(([a]) => {
+        // E-F pairs at white key positions 2-3 and 6-7 (0-indexed)
+      });
+      // Just mark half-step between E-F and B-C
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillStyle = '#f85149';
+      // E4-F4
+      ctx.fillText('半', 2.5*kw, h*0.75);
+      // B4-C5
+      ctx.fillText('半', 6.5*kw, h*0.75);
+      // E5-F5
+      ctx.fillText('半', 9.5*kw, h*0.75);
+      // B5-C6
+      if (14*kw > w - 20) {} // skip if out of bounds
+      ctx.fillText('半', 13.5*kw, h*0.75);
+    }
+    if (showMode === 'whole') {
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillStyle = '#3fb950';
+      // C-D, D-E, F-G, G-A, A-B are whole tones
+      [0.5, 1.5, 3.5, 4.5, 5.5, 7.5, 8.5, 10.5, 11.5, 12.5].forEach(pos => {
+        ctx.fillText('全', pos*kw, h*0.75);
+      });
+    }
+  }
+
+  draw();
+  document.getElementById('showSemitones').onclick = () => { showMode = showMode === 'semi' ? null : 'semi'; draw(); };
+  document.getElementById('showWholeTones').onclick = () => { showMode = showMode === 'whole' ? null : 'whole'; draw(); };
+  document.getElementById('playChromatic').onclick = () => {
+    const notes = [];
+    for (let m = 60; m <= 72; m++) notes.push(m);
+    Audio.playScale(notes, 0.25);
+  };
+
+  canvas.onclick = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * canvas.width / rect.width;
+    const kw = canvas.width / 14;
+    const y = (e.clientY - rect.top) * canvas.height / rect.height;
+    // Check black keys first
+    for (let oct = 0; oct < 2; oct++) {
+      for (let bi = 0; bi < blackPositions.length; bi++) {
+        const bx = (blackPositions[bi] + oct*7)*kw;
+        if (x >= bx && x <= bx+kw*0.6 && y <= canvas.height*0.6) {
+          const midi = 60 + oct*12 + blackNotes[bi];
+          Audio.playMidi(midi, 0.5);
+          info.textContent = `${noteName(midi)} = ${Audio.midiToFreq(midi).toFixed(1)} Hz`;
+          return;
+        }
+      }
+    }
+    // White key
+    const ki = Math.floor(x / kw);
+    if (ki >= 0 && ki < 14) {
+      const oct = ki < 7 ? 0 : 1;
+      const midi = 60 + oct*12 + whiteNotes[ki % 7];
+      Audio.playMidi(midi, 0.5);
+      info.textContent = `${noteName(midi)} = ${Audio.midiToFreq(midi).toFixed(1)} Hz`;
+    }
+  };
+}
+
+// --- Lesson 3: Voice Ranges ---
+function initVoiceRanges() {
+  const canvas = document.getElementById('rangeCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  const ranges = [
+    {name:'女高音 Soprano', low:60, high:84, color:'#f778ba'},
+    {name:'女中音 Alto', low:53, high:77, color:'#bc8cff'},
+    {name:'男高音 Tenor', low:48, high:72, color:'#58a6ff'},
+    {name:'男低音 Bass', low:40, high:64, color:'#39d2c0'},
+  ];
+
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const midiMin = 36, midiMax = 88;
+  const scale = (w - 80) / (midiMax - midiMin);
+
+  ranges.forEach((r, i) => {
+    const y = 30 + i * 60;
+    // Label
+    ctx.fillStyle = r.color;
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(r.name, 5, y + 4);
+    // Bar
+    const x1 = 80 + (r.low - midiMin) * scale;
+    const x2 = 80 + (r.high - midiMin) * scale;
+    ctx.fillStyle = r.color + '40';
+    ctx.fillRect(x1, y - 10, x2 - x1, 24);
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y - 10, x2 - x1, 24);
+    // Range labels
+    ctx.fillStyle = r.color;
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(noteName(r.low), x1, y + 28);
+    ctx.fillText(noteName(r.high), x2, y + 28);
+  });
+
+  // Piano reference line
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  const y = h - 20;
+  ctx.beginPath(); ctx.moveTo(80, y); ctx.lineTo(w, y); ctx.stroke();
+  for (let m = midiMin; m <= midiMax; m += 12) {
+    const x = 80 + (m - midiMin) * scale;
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(noteName(m), x, h - 4);
+    ctx.beginPath(); ctx.moveTo(x, y-4); ctx.lineTo(x, y+4); ctx.stroke();
+  }
+
+  // Play buttons
+  document.getElementById('playSoprano')?.addEventListener('click', () => { Audio.playScale([60,64,67,72,76,79,84], 0.3); });
+  document.getElementById('playAlto')?.addEventListener('click', () => { Audio.playScale([53,57,60,65,69,72,77], 0.3); });
+  document.getElementById('playTenor')?.addEventListener('click', () => { Audio.playScale([48,52,55,60,64,67,72], 0.3); });
+  document.getElementById('playBass')?.addEventListener('click', () => { Audio.playScale([40,44,47,52,55,59,64], 0.3); });
+}
+
+// --- Lesson 4: Scale Builder ---
+function initScaleBuilder() {
+  const rootSel = document.getElementById('scaleRoot');
+  const display = document.getElementById('scaleDisplay');
+  const steps = document.getElementById('scaleSteps');
+  if (!rootSel) return;
+
+  function showScale(root) {
+    const scale = getMajorScale(root);
+    const names = scale.map(m => noteNameSimple(m));
+    display.textContent = names.join('  ') + '  ' + noteNameSimple(root+12);
+    const intervals = ['全','全','半','全','全','全','半'];
+    steps.textContent = names.map((n, i) => i < 6 ? `${n} —(${intervals[i]})→` : n).join(' ') + ` —(${intervals[6]})→ ${noteNameSimple(root+12)}`;
+    highlightPianoKeys([...scale, root+12]);
+  }
+
+  rootSel.onchange = () => showScale(+rootSel.value);
+  document.getElementById('playMajorScale').onclick = () => {
+    const root = +rootSel.value;
+    Audio.playScale([...getMajorScale(root), root+12], 0.35);
+  };
+
+  let buildIdx = 0;
+  document.getElementById('buildStep').onclick = () => {
+    const root = +rootSel.value;
+    const scale = [...getMajorScale(root), root+12];
+    if (buildIdx >= scale.length) buildIdx = 0;
+    Audio.playMidi(scale[buildIdx], 0.5);
+    const names = scale.slice(0, buildIdx+1).map(m => noteNameSimple(m));
+    display.textContent = names.join('  ');
+    highlightPianoKeys(scale.slice(0, buildIdx+1));
+    buildIdx++;
+  };
+
+  showScale(60);
+}
+
+// --- Lesson 5: Major vs Minor ---
+function initMajorMinorCompare() {
+  const rootSel = document.getElementById('mmRoot');
+  const majorNotes = document.getElementById('majorNotes');
+  const minorNotes = document.getElementById('minorNotes');
+  if (!rootSel) return;
+
+  function show(root) {
+    const maj = getMajorScale(root);
+    const min = getMinorScale(root);
+    majorNotes.textContent = [...maj, root+12].map(m => noteNameSimple(m)).join(' ');
+    minorNotes.textContent = [...min, root+12].map(m => noteNameSimple(m)).join(' ');
+  }
+
+  rootSel.onchange = () => show(+rootSel.value);
+  document.getElementById('playMajor').onclick = () => {
+    const root = +rootSel.value;
+    Audio.playScale([...getMajorScale(root), root+12], 0.35);
+    highlightPianoKeys([...getMajorScale(root), root+12]);
+  };
+  document.getElementById('playMinor').onclick = () => {
+    const root = +rootSel.value;
+    Audio.playScale([...getMinorScale(root), root+12], 0.35);
+    highlightPianoKeys([...getMinorScale(root), root+12]);
+  };
+  document.getElementById('playBoth').onclick = () => {
+    const root = +rootSel.value;
+    const maj = [...getMajorScale(root), root+12];
+    const min = [...getMinorScale(root), root+12];
+    Audio.playScale(maj, 0.3);
+    setTimeout(() => Audio.playScale(min, 0.3), maj.length * 300 + 500);
+  };
+  show(60);
+}
+
+// --- Lesson 6: Circle of Fifths ---
+function initCircleOfFifths() {
+  const svg = document.getElementById('cofSvg');
+  if (!svg) return;
+  const cx = 160, cy = 160, r = 130;
+  let selectedIdx = 0;
+
+  function draw() {
+    svg.innerHTML = '';
+    // Background circle
+    const circle = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    circle.setAttribute('cx', cx); circle.setAttribute('cy', cy);
+    circle.setAttribute('r', r+10);
+    circle.setAttribute('fill', 'none'); circle.setAttribute('stroke', '#30363d');
+    circle.setAttribute('stroke-width', '2');
+    svg.appendChild(circle);
+
+    COF_KEYS.forEach((key, i) => {
+      const angle = (i * 30 - 90) * Math.PI / 180;
+      const x = cx + r * Math.cos(angle);
+      const y = cy + r * Math.sin(angle);
+      const isSel = i === selectedIdx;
+
+      // Dot
+      const dot = document.createElementNS('http://www.w3.org/2000/svg','circle');
+      dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+      dot.setAttribute('r', isSel ? 22 : 18);
+      dot.setAttribute('fill', isSel ? '#f778ba' : '#21262d');
+      dot.setAttribute('stroke', isSel ? '#f778ba' : '#30363d');
+      dot.setAttribute('stroke-width', '2');
+      dot.setAttribute('cursor', 'pointer');
+      dot.onclick = () => { selectedIdx = i; draw(); updateCofInfo(); };
+      svg.appendChild(dot);
+
+      // Label
+      const text = document.createElementNS('http://www.w3.org/2000/svg','text');
+      text.setAttribute('x', x); text.setAttribute('y', y + 5);
+      text.setAttribute('text-anchor', 'middle');
+      text.setAttribute('fill', isSel ? '#fff' : '#c9d1d9');
+      text.setAttribute('font-size', isSel ? '14' : '12');
+      text.setAttribute('font-weight', isSel ? '700' : '400');
+      text.setAttribute('pointer-events', 'none');
+      text.textContent = key.name;
+      svg.appendChild(text);
+    });
+  }
+
+  function updateCofInfo() {
+    const key = COF_KEYS[selectedIdx];
+    document.getElementById('cofKey').textContent = `${key.name} 大调`;
+    const sig = key.sharps > 0 ? `${key.sharps}个升号(#)` : key.flats > 0 ? `${key.flats}个降号(b)` : '无升降号';
+    document.getElementById('cofSig').textContent = sig;
+    const scale = getMajorScale(key.root);
+    document.getElementById('cofScale').textContent = [...scale, key.root+12].map(m => noteNameSimple(m)).join(' ');
+    document.getElementById('cofRelative').textContent = `关系小调：${key.minor}`;
+    highlightPianoKeys([...scale, key.root+12]);
+  }
+
+  document.getElementById('cofPlay').onclick = () => {
+    const key = COF_KEYS[selectedIdx];
+    Audio.playScale([...getMajorScale(key.root), key.root+12], 0.35);
+  };
+
+  draw();
+  updateCofInfo();
+}
+
+// --- Lesson 7: Metronome ---
+function initMetronome() {
+  const bpmSlider = document.getElementById('bpmSlider');
+  const bpmVal = document.getElementById('bpmVal');
+  const timeSig = document.getElementById('timeSig');
+  const visual = document.getElementById('metroVisual');
+  if (!bpmSlider) return;
+
+  function buildDots() {
+    const beats = +timeSig.value;
+    visual.innerHTML = '';
+    for (let i = 0; i < beats; i++) {
+      const dot = document.createElement('div');
+      dot.className = 'beat-dot';
+      dot.dataset.beat = i;
+      visual.appendChild(dot);
+    }
+  }
+
+  bpmSlider.oninput = () => { bpmVal.textContent = bpmSlider.value; };
+  timeSig.onchange = () => { buildDots(); if (metroTimer) { stopMetro(); startMetro(); } };
+
+  function startMetro() {
+    const bpm = +bpmSlider.value;
+    const beats = +timeSig.value;
+    metroBeat = 0;
+    buildDots();
+    const interval = 60000 / bpm;
+    tick();
+    metroTimer = setInterval(tick, interval);
+
+    function tick() {
+      const dots = visual.querySelectorAll('.beat-dot');
+      dots.forEach(d => { d.classList.remove('active','strong'); });
+      const current = dots[metroBeat % beats];
+      if (current) {
+        const isStrong = metroBeat % beats === 0;
+        current.classList.add(isStrong ? 'strong' : 'active');
+        Audio.playClick(isStrong);
+      }
+      metroBeat++;
+    }
+  }
+
+  function stopMetro() {
+    if (metroTimer) { clearInterval(metroTimer); metroTimer = null; }
+    visual.querySelectorAll('.beat-dot').forEach(d => { d.classList.remove('active','strong'); });
+  }
+
+  document.getElementById('metroStart').onclick = () => { stopMetro(); startMetro(); };
+  document.getElementById('metroStop').onclick = stopMetro;
+  buildDots();
+}
+
+// --- Lesson 8: Duration Tree ---
+function initDurationTree() {
+  const canvas = document.getElementById('durationCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  const durations = [
+    {name:'全音符', beats:4, y:30, count:1},
+    {name:'二分音符', beats:2, y:100, count:2},
+    {name:'四分音符', beats:1, y:170, count:4},
+    {name:'八分音符', beats:0.5, y:240, count:8},
+    {name:'十六分音符', beats:0.25, y:310, count:16},
+  ];
+
+  function draw() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const barW = w - 120;
+
+    durations.forEach(d => {
+      // Label
+      ctx.fillStyle = '#c9d1d9';
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(d.name, 100, d.y + 16);
+      ctx.fillStyle = '#8b949e';
+      ctx.fillText(`(${d.beats}拍)`, 100, d.y + 32);
+
+      // Blocks
+      const blockW = barW / d.count;
+      for (let i = 0; i < d.count; i++) {
+        const x = 110 + i * blockW;
+        ctx.fillStyle = i % 2 === 0 ? '#f778ba40' : '#bc8cff40';
+        ctx.fillRect(x, d.y, blockW - 2, 30);
+        ctx.strokeStyle = i % 2 === 0 ? '#f778ba' : '#bc8cff';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x, d.y, blockW - 2, 30);
+      }
+    });
+
+    // Connection lines
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4,4]);
+    for (let i = 0; i < durations.length - 1; i++) {
+      const d = durations[i];
+      const next = durations[i+1];
+      for (let j = 0; j < d.count; j++) {
+        const blockW = barW / d.count;
+        const x = 110 + j * blockW + blockW/2;
+        ctx.beginPath();
+        ctx.moveTo(x, d.y + 30);
+        ctx.lineTo(x, next.y);
+        ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
+  }
+
+  canvas.onclick = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const y = (e.clientY - rect.top) * canvas.height / rect.height;
+    const d = durations.find(d => y >= d.y && y <= d.y + 35);
+    if (d) {
+      const bpm = 100;
+      const beatDur = 60 / bpm;
+      for (let i = 0; i < d.count; i++) {
+        setTimeout(() => Audio.playMidi(72, d.beats * beatDur * 0.8), i * d.beats * beatDur * 1000);
+      }
+    }
+  };
+
+  draw();
+}
+
+// --- Lesson 9: Rhythm Player ---
+function initRhythmPlayer() {
+  const bpmSlider = document.getElementById('rhythmBpm');
+  const bpmVal = document.getElementById('rhythmBpmVal');
+  const visual = document.getElementById('rhythmVisual');
+  if (!bpmSlider) return;
+
+  bpmSlider.oninput = () => { bpmVal.textContent = bpmSlider.value; };
+
+  const patterns = {
+    basic: [1,1,1,1], // quarter notes
+    eighth: [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],
+    synco: [1,0.5,0.5,1,0.5,0.5],
+    triplet: [0.333,0.333,0.334,0.333,0.333,0.334],
+    dotted: [1.5,0.5,1.5,0.5],
+    waltz: [1,1,1],
+  };
+
+  document.querySelectorAll('[data-rhythm]').forEach(btn => {
+    btn.onclick = () => {
+      const pattern = patterns[btn.dataset.rhythm];
+      const bpm = +bpmSlider.value;
+      const beatMs = 60000 / bpm;
+      visual.innerHTML = '';
+
+      let time = 0;
+      pattern.forEach((dur, i) => {
+        const dot = document.createElement('div');
+        dot.className = 'beat-dot';
+        dot.style.width = Math.max(20, dur * 40) + 'px';
+        dot.style.height = '30px';
+        dot.style.borderRadius = '6px';
+        visual.appendChild(dot);
+
+        setTimeout(() => {
+          dot.classList.add(i === 0 ? 'strong' : 'active');
+          Audio.playClick(i === 0);
+          setTimeout(() => dot.classList.remove('active', 'strong'), dur * beatMs * 0.8);
+        }, time);
+        time += dur * beatMs;
+      });
+    };
+  });
+}
+
+// --- Lesson 10: Interval Table ---
+function initIntervalTable() {
+  const list = document.getElementById('intervalList');
+  const songList = document.getElementById('songList');
+  if (!list) return;
+
+  INTERVALS.forEach(iv => {
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:8px 12px;background:var(--bg3);border-radius:6px;cursor:pointer;font-size:13px;';
+    div.innerHTML = `<strong>${iv.name}</strong> (${iv.semitones}半音)<br><span style="color:var(--text2);font-size:12px;">${iv.consonance}</span>`;
+    div.onclick = () => {
+      Audio.playMidi(60, 0.4);
+      setTimeout(() => Audio.playMidi(60 + iv.semitones, 0.4), 500);
+    };
+    list.appendChild(div);
+  });
+
+  if (songList) {
+    songList.innerHTML = '';
+    INTERVALS.forEach(iv => {
+      const div = document.createElement('div');
+      div.style.cssText = 'display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer;';
+      div.innerHTML = `<span style="min-width:70px;color:var(--pink);font-weight:600;">${iv.abbr} ${iv.name}</span><span style="color:var(--text2);font-size:13px;">${iv.song}</span>`;
+      div.onclick = () => {
+        Audio.playMidi(60, 0.4);
+        setTimeout(() => Audio.playMidi(60 + iv.semitones, 0.4), 500);
+      };
+      songList.appendChild(div);
+    });
+  }
+}
+
+// --- Lesson 11: Ear Trainer ---
+function initEarTrainer() {
+  const optionsDiv = document.getElementById('etOptions');
+  const feedback = document.getElementById('etFeedback');
+  if (!optionsDiv) return;
+
+  const difficulties = {
+    easy: [0,5,7,12],
+    medium: [0,3,4,5,7,8,9,12],
+    hard: [0,1,2,3,4,5,6,7,8,9,10,11,12]
+  };
+
+  function newQuestion() {
+    const diff = document.getElementById('etDifficulty').value;
+    const dir = document.getElementById('etDirection').value;
+    const pool = difficulties[diff];
+    const answer = pool[Math.floor(Math.random() * pool.length)];
+    const direction = dir === 'random' ? (Math.random() < 0.5 ? 1 : -1) : (dir === 'up' ? 1 : -1);
+    const baseMidi = 60 + Math.floor(Math.random() * 12);
+    const targetMidi = baseMidi + answer * direction;
+
+    etState.answer = answer;
+    etState.answered = false;
+    etState.baseMidi = baseMidi;
+    etState.targetMidi = targetMidi;
+
+    // Play
+    Audio.playMidi(baseMidi, 0.4);
+    setTimeout(() => Audio.playMidi(targetMidi, 0.4), 600);
+
+    // Options
+    optionsDiv.innerHTML = '';
+    pool.forEach(iv => {
+      const btn = document.createElement('button');
+      btn.className = 'btn';
+      btn.textContent = INTERVALS[iv].name;
+      btn.onclick = () => checkAnswer(iv, btn);
+      optionsDiv.appendChild(btn);
+    });
+    feedback.style.display = 'none';
+  }
+
+  function checkAnswer(choice, btn) {
+    if (etState.answered) return;
+    etState.answered = true;
+    etState.total++;
+
+    if (choice === etState.answer) {
+      etState.correct++;
+      etState.streak++;
+      btn.classList.add('correct');
+      feedback.style.display = 'block';
+      feedback.style.background = 'rgba(63,185,80,0.1)';
+      feedback.style.color = 'var(--green)';
+      feedback.textContent = `正确！${INTERVALS[etState.answer].name} — ${INTERVALS[etState.answer].song}`;
+    } else {
+      etState.wrong++;
+      etState.streak = 0;
+      btn.classList.add('wrong');
+      // Show correct answer
+      optionsDiv.querySelectorAll('.btn').forEach(b => {
+        if (b.textContent === INTERVALS[etState.answer].name) b.classList.add('correct');
+      });
+      feedback.style.display = 'block';
+      feedback.style.background = 'rgba(248,81,73,0.1)';
+      feedback.style.color = 'var(--red)';
+      feedback.textContent = `错误。正确答案：${INTERVALS[etState.answer].name}`;
+    }
+
+    document.getElementById('etCorrect').textContent = etState.correct;
+    document.getElementById('etWrong').textContent = etState.wrong;
+    document.getElementById('etStreak').textContent = etState.streak;
+    document.getElementById('etTotal').textContent = etState.total;
+  }
+
+  document.getElementById('etNew').onclick = newQuestion;
+  document.getElementById('etReplay').onclick = () => {
+    if (etState.baseMidi) {
+      Audio.playMidi(etState.baseMidi, 0.4);
+      setTimeout(() => Audio.playMidi(etState.targetMidi, 0.4), 600);
+    }
+  };
+}
+
+// --- Lesson 12: Jianpu Player ---
+function initJianpuPlayer() {
+  const display = document.getElementById('jpDisplay');
+  const bpmSlider = document.getElementById('jpBpm');
+  const bpmVal = document.getElementById('jpBpmVal');
+  const songName = document.getElementById('jpSongName');
+  if (!display) return;
+
+  let currentSong = 'twinkle';
+  bpmSlider.oninput = () => { bpmVal.textContent = bpmSlider.value; };
+
+  document.querySelectorAll('.jp-preset').forEach(btn => {
+    btn.onclick = () => {
+      currentSong = btn.dataset.song;
+      display.textContent = SONGS[currentSong].notes;
+      songName.textContent = SONGS[currentSong].name;
+    };
+  });
+
+  function parseSong(str) {
+    const tokens = [];
+    const chars = str.replace(/\|/g, '').replace(/\s+/g, ' ').trim().split(' ');
+    chars.forEach(ch => {
+      if (ch === '-') {
+        // Extend previous note
+        if (tokens.length) tokens[tokens.length-1].duration += 1;
+      } else if (ch === '0') {
+        tokens.push({midi:0, duration:1, text:'0'}); // rest
+      } else {
+        let base = 60; // C4
+        let num = 0;
+        let text = ch;
+        // Check for high octave (+ suffix or dot above)
+        let cleanCh = ch.replace(/\+/g, '').replace(/\./g, '');
+        num = parseInt(cleanCh);
+        if (num >= 1 && num <= 7) {
+          const scaleMap = [0,0,2,4,5,7,9,11]; // 1=C,2=D,3=E,4=F,5=G,6=A,7=B
+          let midi = base + scaleMap[num];
+          if (ch.includes('+') || ch.includes('1+')) midi += 12;
+          if (ch.endsWith('.') && !ch.startsWith('.')) midi -= 12; // low octave: 6. means low A
+          tokens.push({midi, duration:1, text: ch});
+        }
+      }
+    });
+    return tokens;
+  }
+
+  document.getElementById('jpPlay').onclick = () => {
+    if (jpTimer) { clearTimeout(jpTimer); jpTimer = null; }
+    const notes = parseSong(SONGS[currentSong].notes);
+    const bpm = +bpmSlider.value;
+    const beatMs = 60000 / bpm;
+
+    let idx = 0;
+    let time = 0;
+
+    function playNext() {
+      if (idx >= notes.length) return;
+      const note = notes[idx];
+
+      // Highlight in display
+      const allText = SONGS[currentSong].notes;
+      // Simple highlight: just show playing state
+      if (note.midi > 0) {
+        Audio.playMidi(note.midi, note.duration * beatMs / 1000 * 0.8);
+        pianoPress(note.midi);
+        setTimeout(() => pianoRelease(note.midi), note.duration * beatMs * 0.8);
+      }
+
+      idx++;
+      if (idx < notes.length) {
+        jpTimer = setTimeout(playNext, note.duration * beatMs);
+      }
+    }
+
+    playNext();
+  };
+
+  document.getElementById('jpStop').onclick = () => {
+    if (jpTimer) { clearTimeout(jpTimer); jpTimer = null; }
+  };
+}
+
+// ============================================================
+// Init
+// ============================================================
+buildPiano();
+navigate('dashboard');
+
+// First interaction to unlock AudioContext
+document.addEventListener('click', () => Audio.init(), {once:true});
+</script>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    print(f"🎵 乐理学习平台启动: http://localhost:{PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=True)

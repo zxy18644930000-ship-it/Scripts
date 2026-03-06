@@ -19,6 +19,7 @@ Version: 3.0
 Date: 2026-02-26
 """
 
+import os
 import re
 import sys
 import json
@@ -195,12 +196,16 @@ class BarAggregator:
         self._completed: List[dict] = []
 
     def update_tick(self, symbol, exchange, tick_time, price, volume, turnover, oi):
+        if tick_time.tzinfo:
+            tick_time = tick_time.replace(tzinfo=None)
         bar_minute = tick_time.replace(second=0, microsecond=0)
         with self._lock:
             if symbol in self._bars:
                 bar = self._bars[symbol]
                 if bar_minute > bar["datetime"]:
-                    self._completed.append(bar.copy())
+                    completed_bar = bar.copy()
+                    completed_bar.pop("_last_tick", None)
+                    self._completed.append(completed_bar)
                     self._bars[symbol] = self._new_bar(symbol, exchange, bar_minute, price, volume, turnover, oi)
                 else:
                     bar["high"] = max(bar["high"], price)
@@ -211,6 +216,7 @@ class BarAggregator:
                     bar["open_interest"] = oi
             else:
                 self._bars[symbol] = self._new_bar(symbol, exchange, bar_minute, price, volume, turnover, oi)
+            self._bars[symbol]["_last_tick"] = tick_time
 
     @staticmethod
     def _new_bar(symbol, exchange, dt, price, volume, turnover, oi):
@@ -222,6 +228,20 @@ class BarAggregator:
         with self._lock:
             bars = self._completed
             self._completed = []
+            # 把超过2分钟没有新tick的bar也输出（低流动性合约兜底）
+            now = datetime.now()
+            stale_syms = []
+            for sym, bar in self._bars.items():
+                last_tick = bar.get("_last_tick")
+                if not last_tick:
+                    continue
+                if (now - last_tick).total_seconds() > 120:
+                    bar_copy = bar.copy()
+                    bar_copy.pop("_last_tick", None)
+                    bars.append(bar_copy)
+                    stale_syms.append(sym)
+            for sym in stale_syms:
+                del self._bars[sym]
             return bars
 
     def flush_all(self):
@@ -229,7 +249,9 @@ class BarAggregator:
             bars = self._completed
             self._completed = []
             for bar in self._bars.values():
-                bars.append(bar.copy())
+                bar_copy = bar.copy()
+                bar_copy.pop("_last_tick", None)
+                bars.append(bar_copy)
             self._bars.clear()
             return bars
 
@@ -269,27 +291,40 @@ class DatabaseWriter:
     def write_bars(self, bars):
         if not bars:
             return
-        conn = sqlite3.connect(self.db_path)
-        written = 0
-        for bar in bars:
+        for attempt in range(3):
             try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO dbbardata "
-                    "(symbol,exchange,datetime,interval,volume,turnover,"
-                    "open_interest,open_price,high_price,low_price,close_price) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (bar["symbol"], bar["exchange"],
-                     bar["datetime"].strftime("%Y-%m-%d %H:%M:%S"), "1m",
-                     bar["volume"], bar["turnover"], bar["open_interest"],
-                     bar["open"], bar["high"], bar["low"], bar["close"]))
-                written += 1
-            except Exception as e:
-                logger.error(f"写入失败 {bar['symbol']}: {e}")
-        conn.commit()
-        conn.close()
-        self._total_written += written
-        if written > 0:
-            logger.info(f"写入 {written} 条K线 (累计 {self._total_written})")
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                written = 0
+                for bar in bars:
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO dbbardata "
+                            "(symbol,exchange,datetime,interval,volume,turnover,"
+                            "open_interest,open_price,high_price,low_price,close_price) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (bar["symbol"], bar["exchange"],
+                             bar["datetime"].strftime("%Y-%m-%d %H:%M:%S"), "1m",
+                             bar["volume"], bar["turnover"], bar["open_interest"],
+                             bar["open"], bar["high"], bar["low"], bar["close"]))
+                        written += 1
+                    except Exception as e:
+                        logger.error(f"写入失败 {bar['symbol']}: {e}")
+                conn.commit()
+                conn.close()
+                self._total_written += written
+                if written > 0:
+                    logger.info(f"写入 {written} 条K线 (累计 {self._total_written})")
+                return
+            except sqlite3.OperationalError as e:
+                logger.warning(f"数据库锁冲突(第{attempt+1}次): {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                time.sleep(2 * (attempt + 1))
+        logger.error("数据库写入3次重试均失败，跳过本批次")
 
     @property
     def total_written(self):
@@ -526,59 +561,14 @@ class CTPDataCollector:
 
         logger.info(f"获取到 {len(futures_prices)}/{len(selected_futures)} 个期货价格")
 
-        # ---- 阶段2: 根据价格选虚值期权 ----
+        # ---- 阶段2: 订阅所有活跃月份的全部期权 ----
         selected_options = []
         for prod in option_products:
             active_months = product_months.get(prod, [])
             opts = options_by_product[prod]
-
-            # 指定品种订阅全部期权
-            if prod in self.full_option_products:
-                for c in opts:
-                    if self._extract_month(c.symbol) in active_months:
-                        selected_options.append(c)
-                continue
-
-            for month in active_months:
-                fut_key = prod + month
-                fut_price = futures_prices.get(fut_key)
-
-                # 该月份的期权按Call/Put分组
-                calls = []
-                puts = []
-                for c in opts:
-                    parsed = self._parse_option(c.symbol)
-                    if not parsed:
-                        continue
-                    _, opt_month, cp, strike = parsed
-                    if opt_month != month:
-                        continue
-                    if cp == 'C':
-                        calls.append((strike, c))
-                    else:
-                        puts.append((strike, c))
-
-                if fut_price:
-                    # 有期货价格：选虚值期权
-                    # Call虚值 = strike > fut_price，取最近的N档
-                    otm_calls = sorted([(s, c) for s, c in calls if s > fut_price],
-                                       key=lambda x: x[0])[:self.OTM_STRIKES_PER_SIDE]
-                    # Put虚值 = strike < fut_price，取最近的N档
-                    otm_puts = sorted([(s, c) for s, c in puts if s < fut_price],
-                                      key=lambda x: -x[0])[:self.OTM_STRIKES_PER_SIDE]
-                    selected_options.extend(c for _, c in otm_calls)
-                    selected_options.extend(c for _, c in otm_puts)
-                else:
-                    # 没有期货价格：取中间20档期权
-                    all_strikes = sorted(calls, key=lambda x: x[0])
-                    mid = len(all_strikes) // 2
-                    half = self.OTM_STRIKES_PER_SIDE
-                    selected_options.extend(
-                        c for _, c in all_strikes[max(0, mid-half):mid+half])
-                    all_strikes_p = sorted(puts, key=lambda x: x[0])
-                    mid_p = len(all_strikes_p) // 2
-                    selected_options.extend(
-                        c for _, c in all_strikes_p[max(0, mid_p-half):mid_p+half])
+            for c in opts:
+                if self._extract_month(c.symbol) in active_months:
+                    selected_options.append(c)
 
         # ---- 订阅期权 ----
         for c in selected_options:
@@ -627,8 +617,11 @@ class CTPDataCollector:
             time.sleep(60)
             if not self._running:
                 break
-            bars = self.aggregator.flush()
-            self.db_writer.write_bars(bars)
+            try:
+                bars = self.aggregator.flush()
+                self.db_writer.write_bars(bars)
+            except Exception as e:
+                logger.error(f"写入循环异常(不退出): {e}")
 
             now = time.time()
             if now - self._last_status_time > 300:
@@ -637,7 +630,7 @@ class CTPDataCollector:
                            f"{self.db_writer.total_written} bars | "
                            f"{len(self._subscribed)} 合约")
 
-    def run(self):
+    def run(self, daemon_mode=False):
         if not self.connect():
             return
 
@@ -659,8 +652,10 @@ class CTPDataCollector:
         logger.info("交易时段结束后自动退出")
         logger.info("=" * 50)
 
-        signal.signal(signal.SIGINT, lambda s, f: self.shutdown())
-        signal.signal(signal.SIGTERM, lambda s, f: self.shutdown())
+        # daemon模式下不覆盖信号处理器，由run_daemon统一管理
+        if not daemon_mode:
+            signal.signal(signal.SIGINT, lambda s, f: self.shutdown())
+            signal.signal(signal.SIGTERM, lambda s, f: self.shutdown())
 
         try:
             while self._running:
@@ -676,17 +671,33 @@ class CTPDataCollector:
     def shutdown(self):
         if not self._running and not self._connected:
             return
-        logger.info("正在关闭...")
         self._running = False
+        self._connected = False
+        self._engine_close_failed = False
+        logger.info("正在关闭...")
 
-        remaining = self.aggregator.flush_all()
-        self.db_writer.write_bars(remaining)
+        try:
+            remaining = self.aggregator.flush_all()
+            self.db_writer.write_bars(remaining)
+        except Exception as e:
+            logger.error(f"flush数据失败: {e}")
 
         if self.main_engine:
-            try:
-                self.main_engine.close()
-            except Exception as e:
-                logger.error(f"关闭引擎: {e}")
+            # main_engine.close() 调用CTP C++底层，可能段错误或死锁
+            # 用子线程+超时保护，避免杀死daemon进程
+            def _close_engine():
+                try:
+                    self.main_engine.close()
+                except Exception as e:
+                    logger.error(f"关闭引擎异常: {e}")
+                    self._engine_close_failed = True
+            t = threading.Thread(target=_close_engine, daemon=True)
+            t.start()
+            t.join(timeout=10)
+            if t.is_alive():
+                logger.warning("关闭引擎超时(10秒)，跳过")
+                self._engine_close_failed = True
+            self.main_engine = None
 
         total = self.db_writer.total_written
         logger.info(f"采集结束: {self._tick_count} ticks, {total} 条K线")
@@ -741,14 +752,21 @@ def run_daemon(args):
         retry_count = 0
         max_retries = 3
         while is_trading_time() and not stop_flag and retry_count < max_retries:
-            collector = CTPDataCollector(
-                config_path=args.config,
-                symbols=args.symbols,
-                products=args.product,
-                all_options=args.all_options,
-                full_option_products=getattr(args, 'full_options', None),
-            )
-            collector.run()  # 运行到交易时段结束自动返回
+            try:
+                collector = CTPDataCollector(
+                    config_path=args.config,
+                    symbols=args.symbols,
+                    products=args.product,
+                    all_options=args.all_options,
+                    full_option_products=getattr(args, 'full_options', None),
+                )
+                collector.run(daemon_mode=True)
+            except Exception as e:
+                logger.error(f"采集器异常: {e}")
+                try:
+                    collector.shutdown()
+                except Exception:
+                    pass
 
             if stop_flag or not is_trading_time():
                 break
@@ -759,6 +777,15 @@ def run_daemon(args):
 
         if stop_flag:
             break
+
+        # CTP引擎关闭失败时，C++底层资源可能泄漏，新连接只能收到部分交易所行情
+        # 此时重启整个进程是最可靠的清理方式
+        engine_dirty = hasattr(collector, '_engine_close_failed') and collector._engine_close_failed
+        if engine_dirty:
+            logger.warning("CTP引擎关闭异常，重启进程以清理底层资源...")
+            notify("CTP数据采集", "引擎异常，正在重启进程")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
         logger.info("本时段采集结束，等待下一时段...")
 
     logger.info("守护进程退出")

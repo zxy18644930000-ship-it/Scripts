@@ -1,0 +1,103 @@
+{
+  "run_time": "2026-03-02 02:30:08",
+  "total": 791,
+  "evidence": {
+    "B001": {
+      "for": 393,
+      "against": 278,
+      "neutral": 120
+    },
+    "B002": {
+      "for": 278,
+      "against": 346,
+      "neutral": 73
+    },
+    "B003": {
+      "for": 439,
+      "against": 160,
+      "neutral": 0
+    },
+    "B004": {
+      "for": 477,
+      "against": 122,
+      "neutral": 0
+    },
+    "B005": {
+      "for": 544,
+      "against": 0,
+      "neutral": 247
+    },
+    "B006": {
+      "for": 27,
+      "against": 6,
+      "neutral": 0
+    },
+    "B007": {
+      "for": 544,
+      "against": 0,
+      "neutral": 247
+    },
+    "B008": {
+      "for": 175,
+      "against": 0,
+      "neutral": 329
+    },
+    "B009": {
+      "for": 20,
+      "against": 37,
+      "neutral": 6
+    },
+    "B010": {
+      "for": 95,
+      "against": 388,
+      "neutral": 0
+    },
+    "B011": {
+      "for": 192,
+      "against": 0,
+      "neutral": 232
+    },
+    "B012": {
+      "for": 181,
+      "against": 184,
+      "neutral": 0
+    },
+    "B013": {
+      "for": 209,
+      "against": 58,
+      "neutral": 22
+    },
+    "B014": {
+      "for": 1,
+      "against": 0,
+      "neutral": 0
+    },
+    "B015": {
+      "for": 125,
+      "against": 0,
+      "neutral": 0
+    }
+  },
+  "stats": {
+    "products": [
+      "LG",
+      "UR",
+      "AD",
+      "PF",
+      "CS",
+      "AP",
+      "SF",
+      "CJ",
+      "LH",
+      "JD",
+      "PB",
+      "SN"
+    ],
+    "sessions": 328,
+    "by_otm": {
+      "近端": 328,
+      "中端": 327,
+      "远端": 136
+    }
+  }
+}
