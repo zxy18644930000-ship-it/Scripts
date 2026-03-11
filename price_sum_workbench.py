@@ -23,8 +23,17 @@ try:
 except ImportError:
     _HAS_CHECKER = False
 
+# Gamma 风控计算（Volga 预警）
+try:
+    from gamma_monitor import calculate_pair_greeks as _gm_calc_greeks
+    _HAS_GAMMA_MONITOR = True
+except ImportError:
+    _HAS_GAMMA_MONITOR = False
+
 DB_PATH = os.path.expanduser('~/.vntrader/database.db')
 CONFIG_PATH = os.path.expanduser('~/Scripts/price_sum_pairs.json')
+ALERT_HISTORY_PATH = os.path.expanduser('~/Scripts/alert_history.json')
+ALERT_DB_PATH = os.path.expanduser('~/Scripts/alert_history.db')  # SQLite长期存储
 PORT = 8052
 REFRESH_MS = 60_000
 
@@ -52,10 +61,88 @@ _EXCHANGE_MAP = {
     'SC': 'INE',
 }
 
-# 各交易所期权到期: 交割月前一月的近似日 (不含节假日调整)
+# 各交易所期权到期: 交割月前一月的近似日 (旧版,仅作兼容保留)
 _EXPIRY_DAY = {
     'CZCE': 11, 'CZCE_SP': -5, 'DCE': 17, 'SHFE': 25, 'GFEX': 6, 'INE': 13,
 }
+
+# === 统一到期日计算 (官方规则, 模块级) ===
+try:
+    import sys as _sys
+    if '/Users/zhangxiaoyu/Downloads/trade2026' not in _sys.path:
+        _sys.path.insert(0, '/Users/zhangxiaoyu/Downloads/trade2026')
+    from infra.expiry.option_expiry_calendar import get_expiry_date as _official_expiry
+    from infra.expiry.option_expiry_calendar import get_trading_calendar as _get_cal
+    _trading_cal = _get_cal()
+    _USE_OFFICIAL_CAL = True
+except Exception:
+    _USE_OFFICIAL_CAL = False
+    _trading_cal = None
+    from calendar import monthrange as _mr
+    _CZCE_TWO_MONTH = {'AP', 'CJ', 'PX'}
+    def _official_expiry(ex, yr, mo, cal=None, product_code=''):
+        """简化回退: 不含节假日但规则正确"""
+        pc = product_code.upper()
+        if ex in ('CZCE', 'CZCE_SP', 'GFEX_CZCE') and pc in _CZCE_TWO_MONTH:
+            pm = mo - 2 if mo > 2 else mo + 10
+            py = yr if mo > 2 else yr - 1
+            tds = [date(py,pm,d) for d in range(1, _mr(py,pm)[1]+1) if date(py,pm,d).weekday()<5]
+            return tds[-3] if len(tds)>=3 else None
+        pm = mo-1 if mo>1 else 12; py = yr if mo>1 else yr-1
+        if ex in ('CZCE', 'CZCE_SP', 'GFEX_CZCE'):
+            tds = [date(py,pm,d) for d in range(1, min(16, _mr(py,pm)[1]+1)) if date(py,pm,d).weekday()<5]
+            return tds[-3] if len(tds)>=3 else None
+        tds = [date(py,pm,d) for d in range(1, _mr(py,pm)[1]+1) if date(py,pm,d).weekday()<5]
+        if ex == 'DCE':
+            return tds[11] if len(tds)>=12 else None
+        elif ex in ('SHFE','INE'):
+            n = 5 if ex=='SHFE' else 13
+            return tds[-n] if len(tds)>=n else None
+        elif ex == 'GFEX':
+            return tds[4] if len(tds)>=5 else None
+        return None
+
+
+# CTP夜盘数据用交易日日期存储(周五夜盘存为下周一日期)，
+# 同一日期下夜盘22:59的datetime>日盘14:01，简单DESC会取到昨晚旧价。
+# 修正：按日期DESC + 日盘优先(priority=1) + 时间DESC排序。
+_LATEST_PRICE_SQL = """SELECT close_price FROM dbbardata WHERE symbol=?
+    ORDER BY datetime DESC
+    LIMIT 1"""
+
+
+def calc_expiry(product, year, month):
+    """统一到期日计算入口: 品种代码→交易所→官方规则"""
+    pc = product.upper()
+    ex = _EXCHANGE_MAP.get(pc, '')
+    if not ex:
+        return None
+    # CZCE_SP 在官方日历中用 CZCE
+    cal_ex = 'CZCE' if ex == 'CZCE_SP' else ex
+    cal = _trading_cal if _USE_OFFICIAL_CAL else None
+    return _official_expiry(cal_ex, year, month, cal, product_code=pc)
+
+
+def calc_dte(product, month_str):
+    """从品种+月份码(3/4位)计算DTE天数"""
+    try:
+        if len(month_str) == 3:
+            year = 2020 + int(month_str[0])
+            mon = int(month_str[1:])
+        elif len(month_str) == 4:
+            year = 2000 + int(month_str[:2])
+            mon = int(month_str[2:])
+        else:
+            return None
+    except (ValueError, IndexError):
+        return None
+    if mon < 1 or mon > 12:
+        return None
+    exp = calc_expiry(product, year, mon)
+    if not exp:
+        return None
+    dte = (exp - date.today()).days
+    return max(dte, 0)
 
 # ============ 智能平仓时机提醒 ============
 # 数据来源优先级：
@@ -465,7 +552,7 @@ def _load_dashboard():
 def _load_strategy_positions():
     """
     从策略状态文件(~/state/*_state.json)读取所有持仓。
-    这些文件由交易系统每60秒自动保存，不需要重启交易系统。
+    如果state文件无持仓，兜底从dashboard.json读取CTP真实持仓（4小时内有效）。
     Returns:
         list of dict: [{symbol, exchange, direction, volume, avg_price, pnl, product}, ...]
     """
@@ -477,21 +564,37 @@ def _load_strategy_positions():
             if not fname.endswith('_state.json'):
                 continue
             fpath = os.path.join(_STRATEGY_STATE_DIR, fname)
-            # 跳过超过5分钟没更新的文件
-            if time.time() - os.path.getmtime(fpath) > 300:
+            file_age = time.time() - os.path.getmtime(fpath)
+            # 超过24小时一律跳过
+            if file_age > 86400:
                 continue
             try:
                 with open(fpath, 'r') as f:
                     state = json.load(f)
                 product = state.get('product_code', '')
+                # 策略未运行且文件超过4小时 → 跳过（防止幽灵持仓）
+                if file_age > 14400 and product and not _is_strategy_running(product):
+                    continue
+                extra = state.get('extra', {})
+                real_call_px = extra.get('entry_call_price')
+                real_put_px = extra.get('entry_put_price')
+                call_sym = state.get('call_symbol', '').split('.')[0]
+                put_sym = state.get('put_symbol', '').split('.')[0]
                 for p in state.get('positions', []):
                     if p.get('volume', 0) > 0:
+                        sym = p.get('symbol', '')
+                        avg = p.get('avg_price', 0)
+                        # 用实际成交价覆盖CTP结算价
+                        if sym and real_call_px and sym == call_sym:
+                            avg = real_call_px
+                        elif sym and real_put_px and sym == put_sym:
+                            avg = real_put_px
                         positions.append({
-                            'symbol': p.get('symbol', ''),
+                            'symbol': sym,
                             'exchange': p.get('exchange', ''),
                             'direction': p.get('direction', ''),
                             'volume': p.get('volume', 0),
-                            'avg_price': p.get('avg_price', 0),
+                            'avg_price': avg,
                             'pnl': p.get('pnl', 0),
                             'product': product,
                         })
@@ -499,6 +602,35 @@ def _load_strategy_positions():
                 continue
     except Exception:
         pass
+
+    # 兜底：如果state文件无持仓，从dashboard.json读取CTP真实持仓（4小时内有效）
+    if not positions:
+        try:
+            if os.path.exists(_DASHBOARD_JSON_PATH):
+                dash_age = time.time() - os.path.getmtime(_DASHBOARD_JSON_PATH)
+                if dash_age < 14400:  # 4小时内
+                    with open(_DASHBOARD_JSON_PATH, 'r') as f:
+                        dash = json.load(f)
+                    for dp in dash.get('positions', []):
+                        if dp.get('volume', 0) > 0:
+                            sym = dp.get('symbol', '')
+                            # 从合约代码推断品种（如CF605C17000→CF）
+                            prod = ''
+                            import re
+                            m = re.match(r'^([A-Za-z]{1,3})', sym)
+                            if m:
+                                prod = m.group(1).upper()
+                            positions.append({
+                                'symbol': sym,
+                                'exchange': dp.get('exchange', ''),
+                                'direction': dp.get('direction', ''),
+                                'volume': dp.get('volume', 0),
+                                'avg_price': dp.get('avg_price', 0),
+                                'pnl': dp.get('pnl', 0),
+                                'product': prod,
+                            })
+        except Exception:
+            pass
     return positions
 
 
@@ -515,7 +647,7 @@ def _load_commodity_config(product):
 
 
 def _load_full_strategy_states():
-    """读取所有活跃的策略状态文件（含extra信息）"""
+    """读取所有活跃的策略状态文件（含extra信息），兜底dashboard.json"""
     states = []
     try:
         if not os.path.isdir(_STRATEGY_STATE_DIR):
@@ -524,17 +656,42 @@ def _load_full_strategy_states():
             if not fname.endswith('_state.json'):
                 continue
             fpath = os.path.join(_STRATEGY_STATE_DIR, fname)
-            if time.time() - os.path.getmtime(fpath) > 300:
+            file_age = time.time() - os.path.getmtime(fpath)
+            if file_age > 86400:
                 continue
             try:
                 with open(fpath, 'r') as f:
                     state = json.load(f)
                 if state.get('positions'):
+                    product = state.get('product_code', '')
+                    # 策略未运行且文件超过4小时 → 跳过
+                    if file_age > 14400 and product and not _is_strategy_running(product):
+                        continue
                     states.append(state)
             except Exception:
                 continue
     except Exception:
         pass
+
+    # 兜底：state文件无持仓时，从dashboard.json构造虚拟state
+    if not states:
+        try:
+            if os.path.exists(_DASHBOARD_JSON_PATH):
+                dash_age = time.time() - os.path.getmtime(_DASHBOARD_JSON_PATH)
+                if dash_age < 14400:  # 4小时内
+                    with open(_DASHBOARD_JSON_PATH, 'r') as f:
+                        dash = json.load(f)
+                    dash_positions = [p for p in dash.get('positions', []) if p.get('volume', 0) > 0]
+                    if dash_positions:
+                        states.append({
+                            'product_code': '',
+                            'positions': dash_positions,
+                            'call_symbol': '',
+                            'put_symbol': '',
+                            'extra': {},
+                        })
+        except Exception:
+            pass
     return states
 
 
@@ -552,29 +709,122 @@ def _build_account_bar():
     positions = []
     for state in strategy_states:
         product = state.get('product_code', '')
+        extra = state.get('extra', {})
+        # 实际成交价（优先级高于CTP持仓价，后者会被结算价调整）
+        real_call_px = extra.get('entry_call_price')
+        real_put_px = extra.get('entry_put_price')
+        call_sym = state.get('call_symbol', '').split('.')[0]  # "CF605C17000.CZCE" → "CF605C17000"
+        put_sym = state.get('put_symbol', '').split('.')[0]
         for p in state.get('positions', []):
             if p.get('volume', 0) > 0:
                 p['product'] = product
+                # 用实际成交价覆盖CTP结算价
+                sym = p.get('symbol', '')
+                if sym and real_call_px and sym == call_sym:
+                    p['avg_price'] = real_call_px
+                elif sym and real_put_px and sym == put_sym:
+                    p['avg_price'] = real_put_px
                 positions.append(p)
 
+    # 提前加载dashboard（持仓现价 + 后面的账户资金都需要）
+    dash_data = _load_dashboard()
+    # 即使5分钟超时，仍尝试读取位置现价（4小时内有效）
+    if not dash_data and os.path.exists(_DASHBOARD_JSON_PATH):
+        _dash_age = time.time() - os.path.getmtime(_DASHBOARD_JSON_PATH)
+        if _dash_age < 14400:
+            try:
+                with open(_DASHBOARD_JSON_PATH, 'r') as f:
+                    dash_data = json.load(f)
+                dash_data['_stale'] = True  # 标记为非实时
+            except Exception:
+                pass
+
     if positions:
+        # 获取期权最新价格用于盈亏计算
+        # 优先级: 1. dashboard.json现价 2. vnpy DB K线
+        _pos_syms = [p.get('symbol', '') for p in positions if p.get('symbol')]
+        _pos_px = {}
+
+        # 1. 从dashboard.json读现价
+        if dash_data:
+            for dp in dash_data.get('positions', []):
+                _sym = dp.get('symbol', '')
+                _cpx = dp.get('current_price', 0)
+                if _sym in _pos_syms and _cpx > 0:
+                    _pos_px[_sym] = _cpx
+
+        # 2. 兜底：vnpy DB（跳过结算bar，取倒数第二条）
+        _missing = [s for s in _pos_syms if s and s not in _pos_px]
+        if _missing:
+            try:
+                _db = get_db()
+                _cur = _db.cursor()
+                for _s in _missing:
+                    # 取最近2条bar，如果最新一条是结算价（与前一条间隔>10分钟），用前一条
+                    _cur.execute(
+                        'SELECT datetime, close_price FROM dbbardata WHERE symbol=? '
+                        'ORDER BY datetime DESC LIMIT 2', (_s,))
+                    _rows = _cur.fetchall()
+                    if _rows and len(_rows) >= 2:
+                        from datetime import datetime as _dtcls
+                        _t0 = _dtcls.fromisoformat(_rows[0][0])
+                        _t1 = _dtcls.fromisoformat(_rows[1][0])
+                        gap = (_t0 - _t1).total_seconds()
+                        if gap > 600 and _rows[1][1] > 0:
+                            # 间隔超10分钟，最新bar是结算价，用前一条
+                            _pos_px[_s] = _rows[1][1]
+                        elif _rows[0][1] > 0:
+                            _pos_px[_s] = _rows[0][1]
+                    elif _rows and _rows[0][1] > 0:
+                        _pos_px[_s] = _rows[0][1]
+            except Exception:
+                pass
+
         row1_parts.append(html.Span('持仓 ', style={'color': '#888', 'fontSize': '12px', 'marginRight': '8px'}))
+        total_pnl = 0
         for p in positions:
             sym = p.get('symbol', '?')
             direction = p.get('direction', '')
             vol = p.get('volume', 0)
             avg = p.get('avg_price', 0)
-            dir_label = '空' if 'SHORT' in str(direction).upper() else '多'
-            dir_color = '#FF8800' if 'SHORT' in str(direction).upper() else '#00BFFF'
+            is_short = 'SHORT' in str(direction).upper()
+            dir_label = '空' if is_short else '多'
+            dir_color = '#FF8800' if is_short else '#00BFFF'
+
+            # 盈亏计算: 卖方盈亏 = (开仓价 - 现价) × 乘数 × 手数
+            prod = p.get('product', '').upper()
+            mult = _MULTIPLIER.get(prod, 10)
+            latest = _pos_px.get(sym)
+            pnl_parts = []
+            if latest is not None and avg > 0:
+                if is_short:
+                    pnl = (avg - latest) * mult * vol
+                else:
+                    pnl = (latest - avg) * mult * vol
+                total_pnl += pnl
+                pnl_color = '#00e676' if pnl >= 0 else '#f44336'
+                pnl_parts = [
+                    html.Span(f' 现{latest:.0f}', style={'color': '#aaa', 'fontSize': '11px'}),
+                    html.Span(f' {pnl:+,.0f}', style={'color': pnl_color, 'fontSize': '12px', 'fontWeight': 'bold'}),
+                ]
+
             row1_parts.append(html.Span([
                 html.Span(f'{sym}', style={'color': '#4fc3f7', 'fontSize': '13px', 'fontWeight': 'bold'}),
                 html.Span(f' {dir_label}{vol}手', style={'color': dir_color, 'fontSize': '12px'}),
                 html.Span(f' @{avg:.0f}', style={'color': '#888', 'fontSize': '11px'}),
+                *pnl_parts,
             ], style={'marginRight': '18px'}))
 
-    # 从dashboard.json读账户资金和系统状态
-    dash_data = _load_dashboard()
-    if dash_data:
+        # 总盈亏汇总
+        if total_pnl != 0:
+            pnl_sum_color = '#00e676' if total_pnl >= 0 else '#f44336'
+            row1_parts.append(html.Span([
+                html.Span('合计 ', style={'color': '#888', 'fontSize': '11px'}),
+                html.Span(f'{total_pnl:+,.0f}', style={'color': pnl_sum_color, 'fontSize': '14px', 'fontWeight': 'bold'}),
+            ], style={'marginRight': '12px'}))
+
+    # 从dashboard.json读账户资金和系统状态（已在上方加载）
+    if dash_data and not dash_data.get('_stale'):
         acc = dash_data.get('account')
         if acc:
             if positions:
@@ -670,20 +920,7 @@ def _build_account_bar():
             except Exception:
                 pass
 
-        # 强平时间
-        fc_night = tp.get('force_close_start_night', '')
-        fc_day = tp.get('force_close_start_day', '')
-        fc_parts = []
-        if fc_night and fc_night != '02:00:00':
-            fc_parts.append(f'夜{fc_night[:5]}')
-        if fc_day and fc_day != '02:00:00':
-            fc_parts.append(f'日{fc_day[:5]}')
-        if fc_parts:
-            row2_parts.append(html.Span(f'强平{"/".join(fc_parts)}', style={
-                **tag_style, 'color': '#FF8800', 'backgroundColor': '#FF880022'}))
-        else:
-            row2_parts.append(html.Span('强平禁用', style={
-                **tag_style, 'color': '#666', 'backgroundColor': '#66666622'}))
+        # 强平时间标签已移除（由下方"时间强平"按钮控制状态显示）
 
         # 目标手数
         target_lots = tp.get('target_lots', 0)
@@ -787,14 +1024,20 @@ def _estimate_dte(product, month_code):
         return None, None
 
 
-def _make_advisory_spans(call_sym):
+def _make_advisory_spans(call_sym, put_sym=None):
     """为期权对生成交易建议，返回 html.Span 列表（嵌入标题行，不新建 div）"""
     try:
         parsed = _parse_contract(call_sym)
         if not parsed:
             return []
         product, month, _, _ = parsed
-        dte, exchange = _estimate_dte(product, month)
+        dte_result = _estimate_dte(product, month)
+        # 兼容两种返回格式: int 或 (int, str)
+        if isinstance(dte_result, tuple):
+            dte, exchange = dte_result
+        else:
+            dte = dte_result
+            exchange = _EXCHANGE_MAP.get(product.upper(), '?')
         if dte is None:
             return []
 
@@ -845,6 +1088,25 @@ def _make_advisory_spans(call_sym):
             spans.append(_badge('买', '胜率偏低', '#888'))
             spans.append(_badge('Scalp', '可做', '#FFD700'))
 
+        # Volga 预警 badge（需要 put_sym 和 gamma_monitor）
+        if put_sym and _HAS_GAMMA_MONITOR:
+            try:
+                pg = _gm_calc_greeks(call_sym, put_sym)
+                if pg and pg.net_vega > 1e-10:
+                    vv = pg.volga_vega_ratio
+                    if vv > 30:
+                        vcolor, vtxt = '#FF4444', f'V/V:{vv:.0f} 爆发!'
+                    elif vv > 15:
+                        vcolor, vtxt = '#FF8800', f'V/V:{vv:.0f} 偏高'
+                    else:
+                        vcolor, vtxt = '#00FF88', f'V/V:{vv:.0f}'
+                    spans.append(html.Span(f' {vtxt} ',
+                        style={'color': vcolor, 'fontSize': '10px', 'fontWeight': 'bold',
+                               'marginLeft': '6px', 'border': f'1px solid {vcolor}',
+                               'padding': '1px 4px', 'borderRadius': '3px'}))
+            except Exception:
+                pass
+
         return spans
     except Exception:
         return []
@@ -867,6 +1129,29 @@ def save_config(pairs):
     """保存期权对列表"""
     with open(CONFIG_PATH, 'w') as f:
         json.dump(pairs, f, ensure_ascii=False, indent=2)
+
+
+_TRADE_STATE_PATH = os.path.expanduser('~/Scripts/trade_state.json')
+
+
+def _load_trade_state():
+    """加载交易行选中状态"""
+    try:
+        if os.path.exists(_TRADE_STATE_PATH):
+            with open(_TRADE_STATE_PATH, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_trade_state(state):
+    """保存交易行选中状态"""
+    try:
+        with open(_TRADE_STATE_PATH, 'w') as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 # ============ 数据库连接（线程安全） ============
@@ -968,7 +1253,51 @@ def load_pair_data(call_sym, put_sym):
         for dt_str, px in cur.fetchall():
             futures_data[dt_str] = px
 
-    all_times = sorted(set(call_data.keys()) | set(put_data.keys()) | set(futures_data.keys()))
+    def _night_before_day(dt_str):
+        """排序键：夜盘减1天让它排在对应日盘之前，但当前夜盘不减（排在图表最右边）"""
+        try:
+            dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+            if dt.hour >= 20 or dt.hour < 5:
+                # 当前正在进行的夜盘数据不减1天，让它排在今天日盘之后（图表最右边）
+                if now.hour >= 20:
+                    # 夜盘前半段(20:xx-23:59)：今天日期的夜盘数据是当前实时数据
+                    if dt_str[:10] == now.strftime('%Y-%m-%d') and dt.hour >= 20:
+                        return dt
+                elif now.hour < 5:
+                    # 夜盘后半段(0:00-4:59)：昨天20:xx+ 或 今天0:xx-4:xx 都是当前夜盘
+                    yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+                    if (dt_str[:10] == yesterday and dt.hour >= 20) or \
+                       (dt_str[:10] == now.strftime('%Y-%m-%d') and dt.hour < 5):
+                        return dt
+                dt -= timedelta(days=1)
+            return dt
+        except Exception:
+            return datetime.min
+
+    # 过滤异常时间戳数据：
+    # 1. 15:05~20:55 之间不可能有交易（收盘后、夜盘开盘前），属于CTP异常写入
+    # 2. 比当前时间还晚的"未来数据"（如周五夜盘被CTP标记为周一日期）
+    now = datetime.now()
+    def _is_bad_timestamp(dt_str):
+        try:
+            dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+            h = dt.hour
+            m = dt.minute
+            # 15:05~20:55 之间是非交易时段，过滤掉
+            if (h == 15 and m >= 5) or (16 <= h <= 19) or (h == 20 and m < 55):
+                return True
+            # 过滤掉未来数据
+            if dt > now + timedelta(minutes=5):
+                return True
+        except Exception:
+            pass
+        return False
+
+    all_times = sorted(
+        (t for t in set(call_data.keys()) | set(put_data.keys()) | set(futures_data.keys())
+         if not _is_bad_timestamp(t)),
+        key=_night_before_day
+    )
     times, call_prices, put_prices, sum_prices, fut_prices = [], [], [], [], []
     last_c, last_p, last_f = None, None, None
 
@@ -1026,7 +1355,7 @@ def _calc_bollinger(closes_5min, period=26, multiplier=1.5):
     return mid + multiplier * std, mid, mid - multiplier * std
 
 
-def _check_double_rise(times, call_prices, put_prices, sum_prices):
+def _check_double_rise(times, call_prices, put_prices, sum_prices, price_tick=1):
     """检测价格之和突破布林上轨（与trade2026布林策略统一）
     条件：价格之和突破布林上轨(5分钟K线, 26周期, 1.5σ)
     不强制要求两腿同涨，由布林带自适应判断异常。
@@ -1069,6 +1398,10 @@ def _check_double_rise(times, call_prices, put_prices, sum_prices):
 
     upper, middle, lower = boll
     if s_now > upper:
+        # 噪音过滤：突破幅度不到2个tick的忽略（盘口跳动不是真双涨）
+        breach_ticks = (s_now - upper) / price_tick if price_tick > 0 else 999
+        if breach_ticks < 2:
+            return {'alert': False, 'boll_middle': middle}
         breach_pct = (s_now - middle) / middle if middle > 0 else 0
         return {
             'alert': True,
@@ -1079,7 +1412,360 @@ def _check_double_rise(times, call_prices, put_prices, sum_prices):
             'boll_middle': middle,
             'method': 'bollinger',
         }
-    return {'alert': False}
+    return {'alert': False, 'boll_middle': middle}
+
+
+# ============ 预警历史记录 & 回归追踪 ============
+# 设计原则：
+#   1. 预警触发时立即写入文件（不丢数据）
+#   2. 回归和未回归都永久记录（无幸存者偏差）
+#   3. 重启时从文件恢复活跃预警（不丢失未回归样本）
+#   4. 双写：JSON（兼容）+ SQLite（长期分析/回测）
+# 存储位置：
+#   JSON: ~/Scripts/alert_history.json（工作台实时读写）
+#   SQLite: ~/Scripts/alert_history.db（长期归档，方便SQL查询和回测）
+
+import sqlite3 as _alert_sqlite3
+
+def _init_alert_db():
+    """初始化 SQLite 预警数据库"""
+    try:
+        conn = _alert_sqlite3.connect(ALERT_DB_PATH)
+        conn.execute('''CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_sym TEXT NOT NULL,
+            put_sym TEXT NOT NULL,
+            futures_sym TEXT,
+            alert_time TEXT NOT NULL,
+            alert_sum REAL,
+            boll_upper REAL,
+            boll_middle REAL,
+            alert_deviation REAL,
+            call_chg REAL,
+            put_chg REAL,
+            peak_sum REAL,
+            peak_time TEXT,
+            peak_deviation REAL,
+            last_sum REAL,
+            last_update TEXT,
+            resolved INTEGER DEFAULT 0,
+            resolve_time TEXT,
+            resolve_sum REAL,
+            resolve_minutes REAL
+        )''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_alerts_time
+                        ON alerts(alert_time)''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_alerts_product
+                        ON alerts(futures_sym)''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_alerts_resolved
+                        ON alerts(resolved)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[alert_db] 初始化失败: {e}')
+
+_init_alert_db()
+
+
+def _alert_db_insert(rec):
+    """插入一条预警到 SQLite"""
+    try:
+        conn = _alert_sqlite3.connect(ALERT_DB_PATH)
+        conn.execute('''INSERT INTO alerts
+            (call_sym, put_sym, futures_sym, alert_time, alert_sum,
+             boll_upper, boll_middle, alert_deviation, call_chg, put_chg,
+             peak_sum, peak_time, peak_deviation, last_sum, last_update,
+             resolved, resolve_time, resolve_sum, resolve_minutes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+            rec.get('call_sym'), rec.get('put_sym'), rec.get('futures_sym'),
+            rec.get('alert_time'), rec.get('alert_sum'),
+            rec.get('boll_upper'), rec.get('boll_middle'), rec.get('alert_deviation'),
+            rec.get('call_chg'), rec.get('put_chg'),
+            rec.get('peak_sum'), rec.get('peak_time'), rec.get('peak_deviation'),
+            rec.get('last_sum'), rec.get('last_update'),
+            1 if rec.get('resolved') else 0,
+            rec.get('resolve_time'), rec.get('resolve_sum'), rec.get('resolve_minutes'),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[alert_db] 插入失败: {e}')
+
+
+def _alert_db_update(call_sym, put_sym, alert_time, updates):
+    """更新 SQLite 中的预警记录"""
+    try:
+        conn = _alert_sqlite3.connect(ALERT_DB_PATH)
+        set_clauses = []
+        values = []
+        for k, v in updates.items():
+            if k == 'resolved':
+                set_clauses.append('resolved = ?')
+                values.append(1 if v else 0)
+            else:
+                set_clauses.append(f'{k} = ?')
+                values.append(v)
+        values.extend([call_sym, put_sym, alert_time])
+        conn.execute(f'''UPDATE alerts SET {", ".join(set_clauses)}
+                        WHERE call_sym = ? AND put_sym = ? AND alert_time = ?''',
+                     values)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[alert_db] 更新失败: {e}')
+
+
+def _migrate_json_to_db():
+    """将现有 JSON 历史迁移到 SQLite（幂等，只迁移不存在的记录）"""
+    history = _load_alert_history()
+    if not history:
+        return
+    try:
+        conn = _alert_sqlite3.connect(ALERT_DB_PATH)
+        existing = conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
+        if existing >= len(history):
+            conn.close()
+            return  # 已迁移过
+        for rec in history:
+            # 检查是否已存在
+            row = conn.execute(
+                'SELECT id FROM alerts WHERE call_sym=? AND put_sym=? AND alert_time=?',
+                (rec.get('call_sym'), rec.get('put_sym'), rec.get('alert_time'))
+            ).fetchone()
+            if row:
+                continue
+            conn.execute('''INSERT INTO alerts
+                (call_sym, put_sym, futures_sym, alert_time, alert_sum,
+                 boll_upper, boll_middle, alert_deviation, call_chg, put_chg,
+                 peak_sum, peak_time, peak_deviation, last_sum, last_update,
+                 resolved, resolve_time, resolve_sum, resolve_minutes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+                rec.get('call_sym'), rec.get('put_sym'), rec.get('futures_sym'),
+                rec.get('alert_time'), rec.get('alert_sum'),
+                rec.get('boll_upper'), rec.get('boll_middle'), rec.get('alert_deviation'),
+                rec.get('call_chg'), rec.get('put_chg'),
+                rec.get('peak_sum'), rec.get('peak_time'), rec.get('peak_deviation'),
+                rec.get('last_sum'), rec.get('last_update'),
+                1 if rec.get('resolved') else 0,
+                rec.get('resolve_time'), rec.get('resolve_sum'), rec.get('resolve_minutes'),
+            ))
+        conn.commit()
+        conn.close()
+        print(f'[alert_db] 已迁移 {len(history)} 条JSON记录到SQLite')
+    except Exception as e:
+        print(f'[alert_db] 迁移失败: {e}')
+
+
+def _load_alert_history():
+    """加载预警历史"""
+    if os.path.exists(ALERT_HISTORY_PATH):
+        try:
+            with open(ALERT_HISTORY_PATH, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_alert_history(history):
+    """保存预警历史"""
+    try:
+        with open(ALERT_HISTORY_PATH, 'w') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f'[alert_history] 保存失败: {e}')
+
+
+def _update_record_in_history(key, updates):
+    """更新历史文件中指定记录的字段"""
+    history = _load_alert_history()
+    for rec in history:
+        rec_key = f'{rec.get("call_sym", "")}|{rec.get("put_sym", "")}'
+        if rec_key == key and not rec.get('resolved'):
+            rec.update(updates)
+            break
+    _save_alert_history(history)
+
+
+_alert_active = {}  # 内存中跟踪当前活跃的预警 {key: record}
+
+
+def _init_active_alerts():
+    """启动时从文件恢复未回归的活跃预警"""
+    global _alert_active
+    history = _load_alert_history()
+    for rec in history:
+        if not rec.get('resolved'):
+            key = f'{rec.get("call_sym", "")}|{rec.get("put_sym", "")}'
+            _alert_active[key] = rec
+    if _alert_active:
+        print(f'[alert_history] 恢复 {len(_alert_active)} 个活跃预警')
+
+
+# 启动时恢复 + 迁移历史数据到SQLite
+_init_active_alerts()
+_migrate_json_to_db()
+
+
+def record_alert(call_sym, put_sym, futures_sym, dr_info, sum_now, boll_middle):
+    """记录新预警或更新活跃预警的峰值"""
+    key = f'{call_sym}|{put_sym}'
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if key in _alert_active:
+        # 已有活跃预警，更新峰值
+        rec = _alert_active[key]
+        if sum_now > rec.get('peak_sum', 0):
+            rec['peak_sum'] = sum_now
+            rec['peak_time'] = now_str
+            rec['peak_deviation'] = (sum_now - boll_middle) / boll_middle if boll_middle > 0 else 0
+            rec['last_sum'] = sum_now
+            rec['last_update'] = now_str
+            # 同步更新文件和SQLite中的峰值
+            peak_updates = {
+                'peak_sum': rec['peak_sum'], 'peak_time': now_str,
+                'peak_deviation': rec['peak_deviation'],
+                'last_sum': sum_now, 'last_update': now_str,
+            }
+            _update_record_in_history(key, peak_updates)
+            _alert_db_update(rec['call_sym'], rec['put_sym'], rec['alert_time'], peak_updates)
+        return
+
+    # 新预警 → 立即写入文件
+    rec = {
+        'call_sym': call_sym,
+        'put_sym': put_sym,
+        'futures_sym': futures_sym or '?',
+        'alert_time': now_str,
+        'alert_sum': sum_now,
+        'boll_upper': dr_info.get('boll_upper', 0),
+        'boll_middle': boll_middle,
+        'alert_deviation': (sum_now - boll_middle) / boll_middle if boll_middle > 0 else 0,
+        'call_chg': dr_info.get('call_chg', 0),
+        'put_chg': dr_info.get('put_chg', 0),
+        'peak_sum': sum_now,
+        'peak_time': now_str,
+        'peak_deviation': (sum_now - boll_middle) / boll_middle if boll_middle > 0 else 0,
+        'last_sum': sum_now,
+        'last_update': now_str,
+        'resolved': False,
+        'resolve_time': None,
+        'resolve_sum': None,
+        'resolve_minutes': None,
+    }
+    _alert_active[key] = rec
+
+    # 立即持久化（JSON + SQLite 双写）
+    history = _load_alert_history()
+    history.append(rec)
+    _save_alert_history(history)
+    _alert_db_insert(rec)
+    print(f'[alert_history] 新预警(已存盘): {futures_sym} {call_sym}+{put_sym} sum={sum_now:.1f} upper={dr_info.get("boll_upper", 0):.1f}')
+
+
+def check_alert_resolved(call_sym, put_sym, sum_now, boll_middle):
+    """检查活跃预警是否已回归均值（价格之和回到布林中轨附近）"""
+    key = f'{call_sym}|{put_sym}'
+    if key not in _alert_active:
+        return
+    rec = _alert_active[key]
+    if rec['resolved']:
+        return
+
+    # 更新最后已知价格（无论是否回归）
+    rec['last_sum'] = sum_now
+    rec['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 回归条件：价格之和 <= 布林中轨（真正回到均值）
+    if sum_now <= boll_middle:
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        rec['resolved'] = True
+        rec['resolve_time'] = now_str
+        rec['resolve_sum'] = sum_now
+        # 计算回归耗时（分钟）
+        try:
+            t0 = datetime.strptime(rec['alert_time'], '%Y-%m-%d %H:%M:%S')
+            t1 = datetime.strptime(now_str, '%Y-%m-%d %H:%M:%S')
+            rec['resolve_minutes'] = (t1 - t0).total_seconds() / 60
+        except Exception:
+            rec['resolve_minutes'] = None
+
+        # 更新文件和SQLite中对应记录
+        resolve_updates = {
+            'resolved': True, 'resolve_time': now_str,
+            'resolve_sum': sum_now, 'resolve_minutes': rec['resolve_minutes'],
+            'last_sum': sum_now, 'last_update': now_str,
+        }
+        _update_record_in_history(key, resolve_updates)
+        _alert_db_update(rec['call_sym'], rec['put_sym'], rec['alert_time'], resolve_updates)
+        del _alert_active[key]
+        print(f'[alert_history] 回归: {rec["futures_sym"]} {rec["resolve_minutes"]:.0f}分钟 '
+              f'sum {rec["alert_sum"]:.1f} -> {sum_now:.1f}')
+
+
+def get_alert_stats():
+    """统计预警数据（含回归+未回归，无幸存者偏差）"""
+    history = _load_alert_history()
+    if not history:
+        return None
+
+    resolved = [r for r in history if r.get('resolved') and r.get('resolve_minutes') is not None]
+    unresolved = [r for r in history if not r.get('resolved')]
+
+    stats = {
+        'total': len(history),
+        'resolved': len(resolved),
+        'unresolved': len(unresolved),
+        'resolve_rate': len(resolved) / len(history) * 100 if history else 0,
+        'active': len(_alert_active),
+    }
+
+    # 回归样本统计
+    if resolved:
+        minutes_list = sorted(r['resolve_minutes'] for r in resolved)
+        deviations = [r.get('alert_deviation', 0) * 100 for r in resolved]
+        peak_devs = [r.get('peak_deviation', 0) * 100 for r in resolved]
+        stats.update({
+            'avg_minutes': sum(minutes_list) / len(minutes_list),
+            'median_minutes': minutes_list[len(minutes_list) // 2],
+            'p25_minutes': minutes_list[int(len(minutes_list) * 0.25)] if len(minutes_list) >= 4 else minutes_list[0],
+            'p75_minutes': minutes_list[int(len(minutes_list) * 0.75)] if len(minutes_list) >= 4 else minutes_list[-1],
+            'min_minutes': minutes_list[0],
+            'max_minutes': minutes_list[-1],
+            'avg_deviation': sum(deviations) / len(deviations),
+            'avg_peak_deviation': sum(peak_devs) / len(peak_devs),
+        })
+
+    # 未回归样本统计
+    if unresolved:
+        ur_devs = [r.get('peak_deviation', 0) * 100 for r in unresolved]
+        stats['unresolved_avg_peak_deviation'] = sum(ur_devs) / len(ur_devs)
+
+    # 按品种分组（全部样本）
+    by_product = {}
+    for r in history:
+        prod = r.get('futures_sym', '?')
+        if prod not in by_product:
+            by_product[prod] = {'resolved': [], 'unresolved': []}
+        if r.get('resolved'):
+            by_product[prod]['resolved'].append(r)
+        else:
+            by_product[prod]['unresolved'].append(r)
+
+    stats['by_product'] = {prod: {
+        'total': len(data['resolved']) + len(data['unresolved']),
+        'resolved': len(data['resolved']),
+        'unresolved': len(data['unresolved']),
+        'resolve_rate': len(data['resolved']) / (len(data['resolved']) + len(data['unresolved'])) * 100,
+        'avg_min': (sum(r['resolve_minutes'] for r in data['resolved']) / len(data['resolved']))
+                   if data['resolved'] else None,
+        'median_min': (sorted(r['resolve_minutes'] for r in data['resolved'])[len(data['resolved']) // 2])
+                      if data['resolved'] else None,
+    } for prod, data in by_product.items()}
+
+    # 最近记录（全部，不只回归的）
+    stats['recent'] = history[-30:][::-1]
+    return stats
 
 
 def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
@@ -1213,7 +1899,9 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     call_last = call_prices[-1] if call_prices else 0
     put_last = put_prices[-1] if put_prices else 0
     leg_ratio = max(call_last, put_last) / min(call_last, put_last) if min(call_last, put_last) > 0 else 999
-    dr = _check_double_rise(times, call_prices, put_prices, sum_prices)
+    product = _extract_product(call_sym)
+    tick = _PRICE_TICK.get(product, 1)
+    dr = _check_double_rise(times, call_prices, put_prices, sum_prices, price_tick=tick)
     return fig, {'sum': latest_sum, 'futures_sym': futures_sym, 'double_rise': dr,
                  'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio}
 
@@ -1269,46 +1957,35 @@ def _parse_contract(sym):
 
 
 # 品种行权价间隔打分参数 (optimal_min, optimal_max, max_reasonable)
-_STRIKE_PARAMS = {
-    'P': (0.08, 0.14, 0.15), 'TA': (0.05, 0.10, 0.12),
-    'AG': (0.05, 0.09, 0.12), 'EB': (0.08, 0.14, 0.15),
-    'CF': (0.08, 0.14, 0.15), 'SA': (0.02, 0.04, 0.10),
-    'SP': (0.02, 0.04, 0.06), 'AO': (0.02, 0.04, 0.06),
-    'FG': (0.02, 0.04, 0.06),
-}
-_DEFAULT_STRIKE_PARAMS = (0.08, 0.14, 0.15)
-
 _auto_cache = {'pairs': [], 'ts': None}
+_v6_recommended_pairs = []  # 今日计划精选的OTM宽跨推荐，由toggle_plan填充
 
 
 def _score_pair(cp, pp, cs, ps, fp, cv, pv, strike_params=None):
     """计算期权对得分 (0-10)
-    70% 价格接近度 + 15% 行权价间隔 + 15% 流动性（阈值制，>50手/分钟满分）
+    核心原则：两腿权利金价格越接近越好 + 瓶颈腿成交额
     """
+    import math as _m
     if cp <= 0 or pp <= 0 or fp <= 0:
         return 0
+    # OTM过滤
+    c_otm = (cs - fp) / fp
+    p_otm = (fp - ps) / fp
+    if c_otm < 0.02 or p_otm < 0.02:
+        return 0  # 太接近ATM
+    if c_otm > 0.15 or p_otm > 0.15:
+        return 0  # 太深度虚值
+    # 1. 价格对称性 (50%) — 两腿权利金越接近越好
     ratio = max(cp, pp) / min(cp, pp)
-    if ratio <= 1.3:
-        price_score = 1.0
-    elif ratio < 1.5:
-        price_score = 1.0 - (ratio - 1.3) / 0.2 * 0.5  # 1.3→1.0, 1.5→0.5
-    else:
-        return 0  # ratio>=1.5 直接淘汰
-    spacing_pct = abs(cs - ps) / fp
-    opt_min, opt_max, max_r = strike_params or _DEFAULT_STRIKE_PARAMS
-    if spacing_pct <= opt_min * 0.3:
-        spacing_score = 0.0
-    elif spacing_pct < opt_min:
-        spacing_score = (spacing_pct - opt_min * 0.3) / (opt_min * 0.7)
-    elif spacing_pct <= opt_max:
-        spacing_score = 1.0
-    elif spacing_pct < max_r:
-        spacing_score = 1.0 - (spacing_pct - opt_max) / (max_r - opt_max)
-    else:
-        spacing_score = 0.0
-    avg_vol = (cv + pv) / 2
-    liq_score = min(1.0, avg_vol / 50)  # 阈值制：50手/分钟即满分
-    return (price_score * 0.70 + spacing_score * 0.15 + liq_score * 0.15) * 10
+    if ratio > 2.5:
+        return 0  # 差距太大，淘汰
+    price_sym = max(0, 1.0 - (ratio - 1.0) * 0.6)  # 1.0→1.0, 1.5→0.7, 2.0→0.4
+    # 2. 瓶颈腿成交额 (30%) — 价格×成交量，log scale
+    min_turnover = min(cp * cv, pp * pv)
+    vol_score = max(0, min((_m.log10(max(min_turnover, 10)) - 3.5) / 1.5, 1.0))
+    # 3. 单腿最低权利金 (20%) — 两腿都要有足够的权利金收入
+    min_px_score = 1.0 if min(cp, pp) >= 4 else 0.5 if min(cp, pp) >= 2 else 0.1
+    return (price_sym * 0.50 + vol_score * 0.30 + min_px_score * 0.20) * 10
 
 
 def auto_select_pairs():
@@ -1364,26 +2041,34 @@ def auto_select_pairs():
         months.sort(key=lambda x: x[0])
         month, data = months[0]
         fp_sym, fp = data['futures']
-        otm_calls = [(s, p, v, k) for s, p, v, k in data['calls'] if k > fp]
-        otm_puts = [(s, p, v, k) for s, p, v, k in data['puts'] if k < fp]
+        otm_calls = [(s, p, v, k) for s, p, v, k in data['calls'] if k > fp and p > 0]
+        otm_puts = [(s, p, v, k) for s, p, v, k in data['puts'] if k < fp and p > 0]
         if not otm_calls or not otm_puts:
             continue
-        params = _STRIKE_PARAMS.get(prod, _DEFAULT_STRIKE_PARAMS)
+
+        # 按虚值度排序，只搜索前10档
+        otm_calls.sort(key=lambda x: x[3] - fp)
+        otm_puts.sort(key=lambda x: fp - x[3])
 
         best = None
-        for c_sym, c_px, c_vol, c_k in otm_calls:
-            for p_sym, p_px, p_vol, p_k in otm_puts:
+        for c_sym, c_px, c_vol, c_k in otm_calls[:10]:
+            for p_sym, p_px, p_vol, p_k in otm_puts[:10]:
                 if c_px + p_px < 8 or min(c_px, p_px) < 2:
                     continue
-                spacing = abs(c_k - p_k) / fp if fp > 0 else 0
-                if spacing < 0.02:
-                    continue
-                score = _score_pair(c_px, p_px, c_k, p_k, fp, c_vol, p_vol, params)
+                score = _score_pair(c_px, p_px, c_k, p_k, fp, c_vol, p_vol)
                 if score > 0 and (best is None or score > best[0]):
                     best = (score, c_sym, p_sym, c_px + p_px)
 
         if best:
             score, c_sym, p_sym, psum = best
+            # 数据量检查：至少需要130条1分钟数据（≈26根5分钟K线）才能算布林带
+            min_bars = 130
+            cur.execute("SELECT COUNT(*) FROM dbbardata WHERE symbol=?", (c_sym,))
+            c_cnt = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM dbbardata WHERE symbol=?", (p_sym,))
+            p_cnt = cur.fetchone()[0]
+            if min(c_cnt, p_cnt) < min_bars:
+                continue  # 数据不足，跳过
             result.append({
                 'call': c_sym, 'put': p_sym,
                 'product': prod, 'month': month,
@@ -1425,6 +2110,262 @@ _MULTIPLIER = {
     'SI':5,'LC':1,'PS':5,
     'SC':1000,'BZ':100,
 }
+
+# 保证金率（各品种期货保证金比例，用于期权卖出保证金计算）
+_MARGIN_RATE = {
+    'AG': 0.12, 'AU': 0.10, 'CU': 0.12, 'AL': 0.10, 'ZN': 0.10, 'PB': 0.10,
+    'NI': 0.12, 'SN': 0.12, 'RU': 0.12, 'FU': 0.12, 'BU': 0.12, 'SP': 0.10,
+    'AO': 0.12, 'RB': 0.10, 'BR': 0.10,
+    'P': 0.10, 'M': 0.10, 'Y': 0.10, 'I': 0.13, 'JM': 0.12, 'JD': 0.10,
+    'LH': 0.12, 'PP': 0.10, 'L': 0.10, 'V': 0.10, 'EB': 0.12, 'EG': 0.10,
+    'C': 0.10, 'CS': 0.10, 'B': 0.10, 'LG': 0.12,
+    'CF': 0.10, 'SA': 0.10, 'FG': 0.10, 'TA': 0.10, 'MA': 0.10, 'SR': 0.10,
+    'OI': 0.10, 'RM': 0.10, 'SM': 0.10, 'SF': 0.10, 'PK': 0.10, 'SH': 0.10,
+    'UR': 0.10, 'PF': 0.10, 'AP': 0.10, 'CJ': 0.10, 'PX': 0.10, 'ZC': 0.10,
+    'SI': 0.12, 'LC': 0.14, 'PS': 0.10,
+    'SC': 0.13, 'BZ': 0.12,
+}
+
+
+def _calc_strangle_margin(call_px, put_px, call_k, put_k, fut_px, mult, mgn_rate):
+    """计算卖出宽跨式保证金（中国期货期权标准公式）
+
+    单腿卖出保证金 = 权利金 + max(期货保证金 - 虚值额/2, 期货保证金/2)
+    宽跨式保证金 = max(Call保证金, Put保证金) + min(Call权利金, Put权利金)
+    """
+    fut_margin = fut_px * mult * mgn_rate  # 标的期货保证金
+    # Call虚值额 = max(行权价 - 期货价, 0) × 合约乘数
+    otm_c = max(call_k - fut_px, 0) * mult
+    # Put虚值额 = max(期货价 - 行权价, 0) × 合约乘数
+    otm_p = max(fut_px - put_k, 0) * mult
+    premium_c = call_px * mult
+    premium_p = put_px * mult
+    call_margin = premium_c + max(fut_margin - otm_c / 2, fut_margin / 2)
+    put_margin = premium_p + max(fut_margin - otm_p / 2, fut_margin / 2)
+    strangle_margin = max(call_margin, put_margin) + min(premium_c, premium_p)
+    return strangle_margin
+
+
+# === v6 日内宽跨参数 (B033/B035/B037回测, 模块级共享) ===
+_DTE_RANGES = [('DTE≤7', 0, 7), ('DTE8-14', 8, 14), ('DTE15-30', 15, 30),
+               ('DTE31-60', 31, 60), ('DTE>60', 61, 999)]
+
+_ENTRY_LABELS = {'night_0': 'N21:00', 'night_30': 'N21:30', 'night_60': 'N22:00',
+                 'day_0': 'D09:00', 'day_30': 'D09:30'}
+
+_V6_CONFIG = {
+    'A':  {'name': '豆一',   'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'night_30','tp': 0.8, 'sl': 999,  'sharpe': 14.41, 'wr': 82.8, 'n': 29},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 3.0,  'sharpe': 21.64, 'wr': 87.0, 'n': 23},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.8, 'sl': 999,  'sharpe': 15.36, 'wr': 89.5, 'n': 114},
+           'DTE>60':   {'entry': 'day_30',  'tp': 1.0, 'sl': 2.0,  'sharpe': 25.72, 'wr': 87.5, 'n': 24}},
+    'AG': {'name': '白银',   'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_30','tp': 0.5, 'sl': 4.0,  'sharpe': 5.88,  'wr': 73.9, 'n': 69},
+           'DTE31-60': {'entry': 'night_60','tp': 0.5, 'sl': 3.5,  'sharpe': 8.73,  'wr': 86.1, 'n': 122},
+           'DTE>60':   {'entry': 'night_30','tp': 0.5, 'sl': 2.5,  'sharpe': 21.86, 'wr': 97.0, 'n': 66}},
+    'AL': {'name': '铝',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.5, 'sl': 999,  'sharpe': 9.16,  'wr': 85.5, 'n': 62},
+           'DTE8-14':  {'entry': 'night_0', 'tp': 0.3, 'sl': 999,  'sharpe': 17.42, 'wr': 92.3, 'n': 39},
+           'DTE15-30': {'entry': 'night_0', 'tp': 0.5, 'sl': 999,  'sharpe': 17.19, 'wr': 88.3, 'n': 111},
+           'DTE31-60': {'entry': 'night_30','tp': 0.5, 'sl': 3.5,  'sharpe': 26.99, 'wr': 90.9, 'n': 22}},
+    'AP': {'name': '苹果',   'ex': 'CZCE', 'months': [1,3,5,10,11],
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.3, 'sl': 999,  'sharpe': 21.21, 'wr': 100., 'n': 41},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.3, 'sl': 3.0,  'sharpe': 19.75, 'wr': 95.8, 'n': 24}},
+    'AU': {'name': '黄金',   'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_60','tp': 0.5, 'sl': 3.5,  'sharpe': 13.49, 'wr': 87.5, 'n': 88},
+           'DTE31-60': {'entry': 'night_60','tp': 0.3, 'sl': 3.5,  'sharpe': 20.91, 'wr': 95.4, 'n': 197},
+           'DTE>60':   {'entry': 'night_30','tp': 0.5, 'sl': 3.5,  'sharpe': 8.86,  'wr': 89.4, 'n': 207}},
+    'B':  {'name': '豆二',   'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 2.0,  'sharpe': 15.99, 'wr': 90.2, 'n': 51},
+           'DTE31-60': {'entry': 'day_0',   'tp': 1.0, 'sl': 2.0,  'sharpe': 9.96,  'wr': 84.2, 'n': 95},
+           'DTE>60':   {'entry': 'night_0', 'tp': 1.0, 'sl': 2.5,  'sharpe': 27.39, 'wr': 92.5, 'n': 40}},
+    'BR': {'name': '丁橡',   'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 16.56, 'wr': 83.3, 'n': 54},
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.5, 'sl': 5.0,  'sharpe': 20.84, 'wr': 94.1, 'n': 51},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.8, 'sl': 4.0,  'sharpe': 11.9,  'wr': 81.8, 'n': 110},
+           'DTE>60':   {'entry': 'night_0', 'tp': 1.5, 'sl': 2.0,  'sharpe': 19.68, 'wr': 88.9, 'n': 36}},
+    'C':  {'name': '玉米',   'ex': 'DCE',  'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'night_0', 'tp': 1.2, 'sl': 999,  'sharpe': 21.86, 'wr': 82.8, 'n': 29},
+           'DTE31-60': {'entry': 'night_0', 'tp': 1.5, 'sl': 3.5,  'sharpe': 8.88,  'wr': 68.0, 'n': 97}},
+    'CF': {'name': '棉花',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 999,  'sharpe': 20.58, 'wr': 92.3, 'n': 39},
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.3, 'sl': 5.0,  'sharpe': 15.13, 'wr': 93.5, 'n': 107},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.3, 'sl': 3.0,  'sharpe': 12.36, 'wr': 96.1, 'n': 178},
+           'DTE>60':   {'entry': 'night_0', 'tp': 0.3, 'sl': 5.0,  'sharpe': 12.22, 'wr': 93.0, 'n': 227}},
+    'CJ': {'name': '红枣',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'day_30',  'tp': 1.2, 'sl': 999,  'sharpe': 24.31, 'wr': 93.9, 'n': 33},
+           'DTE31-60': {'entry': 'day_30',  'tp': 1.2, 'sl': 3.0,  'sharpe': 12.46, 'wr': 87.3, 'n': 71}},
+    'CS': {'name': '淀粉',   'ex': 'DCE',  'months': [1,3,5,7,9,11],
+           'DTE31-60': {'entry': 'day_0',   'tp': 2.0, 'sl': 3.0,  'sharpe': 10.37, 'wr': 75.7, 'n': 74}},
+    'CU': {'name': '铜',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.3, 'sl': 999,  'sharpe': 7.54,  'wr': 82.7, 'n': 98},
+           'DTE8-14':  {'entry': 'day_0',   'tp': 0.3, 'sl': 2.5,  'sharpe': 6.52,  'wr': 85.1, 'n': 154},
+           'DTE15-30': {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 8.75,  'wr': 89.8, 'n': 167}},
+    'EB': {'name': '苯乙烯', 'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 6.13,  'wr': 65.4, 'n': 52},
+           'DTE8-14':  {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 17.14, 'wr': 94.1, 'n': 68},
+           'DTE15-30': {'entry': 'night_60','tp': 0.3, 'sl': 999,  'sharpe': 13.88, 'wr': 95.6, 'n': 226}},
+    'EG': {'name': '乙二醇', 'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_30','tp': 0.8, 'sl': 999,  'sharpe': 12.28, 'wr': 82.3, 'n': 68},
+           'DTE31-60': {'entry': 'night_60','tp': 0.8, 'sl': 5.0,  'sharpe': 17.78, 'wr': 85.7, 'n': 70}},
+    'FG': {'name': '玻璃',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'night_30','tp': 0.8, 'sl': 3.5,  'sharpe': 17.0,  'wr': 75.0, 'n': 24}},
+    'JD': {'name': '鸡蛋',   'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.5, 'sl': 2.0,  'sharpe': 14.3,  'wr': 90.2, 'n': 51},
+           'DTE31-60': {'entry': 'day_30',  'tp': 1.0, 'sl': 3.0,  'sharpe': 15.45, 'wr': 86.2, 'n': 58}},
+    'L':  {'name': '塑料',   'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 17.73, 'wr': 95.3, 'n': 64},
+           'DTE31-60': {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 11.3,  'wr': 92.0, 'n': 75}},
+    'LC': {'name': '碳酸锂', 'ex': 'GFEX', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 999,  'sharpe': 8.09,  'wr': 82.9, 'n': 35},
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.5, 'sl': 2.5,  'sharpe': 13.44, 'wr': 88.6, 'n': 35},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 26.78, 'wr': 95.6, 'n': 68}},
+    'LH': {'name': '生猪',   'ex': 'DCE',  'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.8, 'sl': 3.0,  'sharpe': 19.33, 'wr': 89.7, 'n': 29},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 19.74, 'wr': 95.0, 'n': 20}},
+    'M':  {'name': '豆粕',   'ex': 'DCE',  'months': [1,3,5,7,8,9,11,12],
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.5, 'sl': 3.5,  'sharpe': 13.58, 'wr': 84.6, 'n': 26},
+           'DTE31-60': {'entry': 'night_60','tp': 0.5, 'sl': 5.0,  'sharpe': 20.51, 'wr': 93.3, 'n': 30}},
+    'MA': {'name': '甲醇',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_30','tp': 0.5, 'sl': 3.5,  'sharpe': 28.21, 'wr': 92.6, 'n': 27}},
+    'NI': {'name': '镍',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.3, 'sl': 999,  'sharpe': 31.18, 'wr': 96.5, 'n': 29},
+           'DTE8-14':  {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 13.15, 'wr': 88.9, 'n': 45},
+           'DTE15-30': {'entry': 'night_60','tp': 0.3, 'sl': 5.0,  'sharpe': 17.51, 'wr': 93.3, 'n': 89},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.8, 'sl': 2.5,  'sharpe': 21.11, 'wr': 95.0, 'n': 40}},
+    'OI': {'name': '菜油',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 5.0,  'sharpe': 13.02, 'wr': 83.9, 'n': 31},
+           'DTE8-14':  {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 21.78, 'wr': 92.5, 'n': 40},
+           'DTE15-30': {'entry': 'night_60','tp': 0.3, 'sl': 999,  'sharpe': 15.84, 'wr': 94.1, 'n': 101},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.3, 'sl': 2.5,  'sharpe': 15.27, 'wr': 95.4, 'n': 109},
+           'DTE>60':   {'entry': 'night_0', 'tp': 1.5, 'sl': 999,  'sharpe': 15.72, 'wr': 84.5, 'n': 330}},
+    'P':  {'name': '棕榈油', 'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 14.54, 'wr': 89.5, 'n': 95},
+           'DTE31-60': {'entry': 'night_60','tp': 0.3, 'sl': 3.0,  'sharpe': 25.0,  'wr': 95.8, 'n': 24}},
+    'PB': {'name': '铅',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'night_0', 'tp': 0.8, 'sl': 999,  'sharpe': 11.47, 'wr': 69.6, 'n': 46},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.8, 'sl': 999,  'sharpe': 15.36, 'wr': 86.7, 'n': 45},
+           'DTE31-60': {'entry': 'night_0', 'tp': 1.0, 'sl': 3.0,  'sharpe': 17.66, 'wr': 86.7, 'n': 30}},
+    'PF': {'name': '短纤',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.3, 'sl': 999,  'sharpe': 16.71, 'wr': 95.0, 'n': 20},
+           'DTE8-14':  {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 32.5,  'wr': 97.0, 'n': 33},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 2.5,  'sharpe': 23.31, 'wr': 96.7, 'n': 30}},
+    'PG': {'name': 'LPG',    'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 10.1,  'wr': 76.9, 'n': 65},
+           'DTE8-14':  {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 17.84, 'wr': 91.5, 'n': 59},
+           'DTE15-30': {'entry': 'night_0', 'tp': 0.3, 'sl': 999,  'sharpe': 13.82, 'wr': 95.4, 'n': 131},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.5, 'sl': 3.5,  'sharpe': 20.41, 'wr': 92.6, 'n': 54}},
+    'PK': {'name': '花生',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.5, 'sl': 999,  'sharpe': 17.06, 'wr': 86.2, 'n': 29},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 3.5,  'sharpe': 18.66, 'wr': 81.6, 'n': 38},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 999,  'sharpe': 9.81,  'wr': 87.3, 'n': 55},
+           'DTE31-60': {'entry': 'day_0',   'tp': 0.5, 'sl': 2.0,  'sharpe': 18.61, 'wr': 97.1, 'n': 35}},
+    'PP': {'name': '聚丙烯', 'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 5.0,  'sharpe': 20.33, 'wr': 89.5, 'n': 38},
+           'DTE15-30': {'entry': 'night_30','tp': 0.3, 'sl': 5.0,  'sharpe': 22.05, 'wr': 98.4, 'n': 64},
+           'DTE31-60': {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 12.32, 'wr': 96.0, 'n': 75}},
+    'PX': {'name': '对二甲苯','ex': 'CZCE','months': list(range(1,13)),
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.8, 'sl': 3.0,  'sharpe': 33.68, 'wr': 85.7, 'n': 21},
+           'DTE31-60': {'entry': 'night_0', 'tp': 1.0, 'sl': 999,  'sharpe': 18.76, 'wr': 86.4, 'n': 88}},
+    'RB': {'name': '螺纹钢', 'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 11.55, 'wr': 77.1, 'n': 35},
+           'DTE31-60': {'entry': 'night_30','tp': 0.8, 'sl': 4.0,  'sharpe': 15.43, 'wr': 83.0, 'n': 94},
+           'DTE>60':   {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 23.23, 'wr': 92.1, 'n': 38}},
+    'RM': {'name': '菜粕',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE8-14':  {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 14.03, 'wr': 80.0, 'n': 30},
+           'DTE15-30': {'entry': 'night_30','tp': 0.5, 'sl': 4.0,  'sharpe': 25.62, 'wr': 91.1, 'n': 56},
+           'DTE31-60': {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 30.19, 'wr': 100., 'n': 25}},
+    'RU': {'name': '橡胶',   'ex': 'SHFE', 'months': [1,3,4,5,6,7,8,9,10,11],
+           'DTE15-30': {'entry': 'night_60','tp': 0.8, 'sl': 4.0,  'sharpe': 13.03, 'wr': 80.0, 'n': 40},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.8, 'sl': 5.0,  'sharpe': 13.32, 'wr': 85.7, 'n': 84},
+           'DTE>60':   {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 40.34, 'wr': 97.1, 'n': 34}},
+    'SA': {'name': '纯碱',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'night_0', 'tp': 0.8, 'sl': 999,  'sharpe': 12.26, 'wr': 76.2, 'n': 21},
+           'DTE31-60': {'entry': 'night_30','tp': 0.8, 'sl': 3.0,  'sharpe': 11.83, 'wr': 82.0, 'n': 50}},
+    'SC': {'name': '原油',   'ex': 'INE',  'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 999,  'sharpe': 6.88,  'wr': 69.4, 'n': 134},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.3, 'sl': 3.0,  'sharpe': 8.32,  'wr': 78.0, 'n': 91},
+           'DTE15-30': {'entry': 'night_30','tp': 0.3, 'sl': 5.0,  'sharpe': 8.18,  'wr': 81.1, 'n': 264}},
+    'SF': {'name': '硅铁',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 2.5,  'sharpe': 10.47, 'wr': 71.4, 'n': 28},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 2.5,  'sharpe': 7.11,  'wr': 72.4, 'n': 29},
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.5,  'sharpe': 5.64,  'wr': 83.6, 'n': 122},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.0,  'sharpe': 13.03, 'wr': 87.9, 'n': 66}},
+    'SH': {'name': '烧碱',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 11.5,  'wr': 68.2, 'n': 22},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 5.0,  'sharpe': 23.38, 'wr': 88.0, 'n': 25},
+           'DTE15-30': {'entry': 'day_30',  'tp': 0.5, 'sl': 3.0,  'sharpe': 43.64, 'wr': 96.7, 'n': 30},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.8, 'sl': 4.0,  'sharpe': 17.2,  'wr': 90.2, 'n': 61}},
+    'SI': {'name': '工业硅', 'ex': 'GFEX', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.5, 'sl': 3.0,  'sharpe': 5.41,  'wr': 62.1, 'n': 95},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 2.0,  'sharpe': 12.09, 'wr': 90.9, 'n': 44},
+           'DTE31-60': {'entry': 'day_30',  'tp': 0.8, 'sl': 2.5,  'sharpe': 18.46, 'wr': 95.0, 'n': 40}},
+    'SM': {'name': '锰硅',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 999,  'sharpe': 13.14, 'wr': 86.4, 'n': 22},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.8, 'sl': 3.0,  'sharpe': 8.51,  'wr': 80.4, 'n': 51},
+           'DTE31-60': {'entry': 'day_0',   'tp': 0.8, 'sl': 2.5,  'sharpe': 14.22, 'wr': 93.5, 'n': 46}},
+    'SN': {'name': '锡',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.3, 'sl': 999,  'sharpe': 20.97, 'wr': 90.0, 'n': 50},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.3, 'sl': 4.0,  'sharpe': 19.33, 'wr': 90.0, 'n': 50},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.5, 'sl': 4.0,  'sharpe': 11.36, 'wr': 94.2, 'n': 104}},
+    'SR': {'name': '白糖',   'ex': 'CZCE', 'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'night_60','tp': 0.5, 'sl': 999,  'sharpe': 9.26,  'wr': 84.9, 'n': 73},
+           'DTE31-60': {'entry': 'night_30','tp': 0.8, 'sl': 4.0,  'sharpe': 9.98,  'wr': 80.2, 'n': 172}},
+    'TA': {'name': 'PTA',    'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.5, 'sl': 2.5,  'sharpe': 11.2,  'wr': 69.0, 'n': 29},
+           'DTE15-30': {'entry': 'night_30','tp': 0.5, 'sl': 4.0,  'sharpe': 14.76, 'wr': 90.3, 'n': 31},
+           'DTE31-60': {'entry': 'night_60','tp': 0.5, 'sl': 5.0,  'sharpe': 14.7,  'wr': 93.8, 'n': 32},
+           'DTE>60':   {'entry': 'night_30','tp': 1.0, 'sl': 5.0,  'sharpe': 13.28, 'wr': 89.5, 'n': 133}},
+    'UR': {'name': '尿素',   'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_0',   'tp': 0.5, 'sl': 3.5,  'sharpe': 16.35, 'wr': 85.7, 'n': 21},
+           'DTE8-14':  {'entry': 'day_0',   'tp': 1.0, 'sl': 3.5,  'sharpe': 19.36, 'wr': 81.0, 'n': 21},
+           'DTE15-30': {'entry': 'day_0',   'tp': 0.8, 'sl': 2.0,  'sharpe': 18.97, 'wr': 90.0, 'n': 30}},
+    'V':  {'name': 'PVC',    'ex': 'DCE',  'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.3, 'sl': 999,  'sharpe': 34.55, 'wr': 100., 'n': 26},
+           'DTE15-30': {'entry': 'night_30','tp': 0.3, 'sl': 999,  'sharpe': 25.03, 'wr': 100., 'n': 77},
+           'DTE31-60': {'entry': 'night_0', 'tp': 0.3, 'sl': 5.0,  'sharpe': 9.97,  'wr': 95.7, 'n': 93}},
+    'Y':  {'name': '豆油',   'ex': 'DCE',  'months': [1,3,5,7,9,11],
+           'DTE15-30': {'entry': 'night_60','tp': 0.5, 'sl': 999,  'sharpe': 21.39, 'wr': 93.3, 'n': 30},
+           'DTE>60':   {'entry': 'night_30','tp': 1.0, 'sl': 3.0,  'sharpe': 13.4,  'wr': 92.0, 'n': 138}},
+    'ZC': {'name': '动力煤', 'ex': 'CZCE', 'months': list(range(1,13)),
+           'DTE8-14':  {'entry': 'night_30','tp': 0.5, 'sl': 999,  'sharpe': 17.73, 'wr': 90.9, 'n': 22},
+           'DTE31-60': {'entry': 'day_0',   'tp': 0.3, 'sl': 2.5,  'sharpe': 14.28, 'wr': 89.7, 'n': 39}},
+    'ZN': {'name': '锌',     'ex': 'SHFE', 'months': list(range(1,13)),
+           'DTE≤7':    {'entry': 'day_30',  'tp': 0.3, 'sl': 5.0,  'sharpe': 11.58, 'wr': 81.5, 'n': 27},
+           'DTE8-14':  {'entry': 'day_30',  'tp': 0.3, 'sl': 3.0,  'sharpe': 16.33, 'wr': 87.5, 'n': 32},
+           'DTE15-30': {'entry': 'night_60','tp': 0.3, 'sl': 999,  'sharpe': 43.49, 'wr': 95.8, 'n': 24}},
+}
+
+# 无夜盘品种（用于今日计划的时段过滤）
+_NO_NIGHT_SESSION = {
+    # 郑商所无夜盘
+    'AP', 'CJ', 'PX', 'PK', 'SM', 'SF',
+    # 大商所无夜盘
+    'JD', 'LH', 'CS', 'RR',
+    # 广期所无夜盘
+    'LC',
+}
+
+
+def _get_session_context():
+    """根据当前时间返回 (session_label, filter_night_only)
+    session_label: 面板标题用的文字
+    filter_night_only: True=只显示有夜盘品种, False=显示全部"""
+    h = datetime.now().hour
+    m = datetime.now().minute
+    hm = h * 100 + m
+    if 900 <= hm <= 1500:
+        return '日盘交易计划', False
+    elif 1501 <= hm <= 2059:
+        return '今晚夜盘计划 (21:00开盘)', True
+    elif 2100 <= hm <= 2359:
+        return '夜盘交易计划 (进行中)', True
+    elif 0 <= hm <= 230:
+        return '夜盘交易计划 (进行中)', True
+    else:
+        # 02:31 ~ 08:59 → 下一场是日盘
+        return '日盘交易计划 (09:00开盘)', False
+
 
 # VRP缓存（5分钟有效）
 _vrp_cache = {'data': None, 'ts': 0}
@@ -1468,45 +2409,8 @@ def _calc_rv(close_prices, annualize_factor=252*6*60):
 
 
 def _estimate_dte(product, month_str):
-    """估算DTE天数"""
-    product_upper = product.upper()
-    exchange = _EXCHANGE_MAP.get(product_upper, '')
-
-    try:
-        if len(month_str) == 3:
-            # CZCE格式: 604 → 2026-04
-            year = 2020 + int(month_str[0])
-            mon = int(month_str[1:])
-        elif len(month_str) == 4:
-            year = 2000 + int(month_str[:2])
-            mon = int(month_str[2:])
-        else:
-            return None
-    except (ValueError, IndexError):
-        return None
-
-    if mon < 1 or mon > 12:
-        return None
-
-    import calendar
-    exp_day = _EXPIRY_DAY.get(exchange, 15)
-    if exp_day < 0:
-        # 倒数第N天 → 月末往前推
-        exp_month = mon - 1 if mon > 1 else 12
-        exp_year = year if mon > 1 else year - 1
-        last_day = calendar.monthrange(exp_year, exp_month)[1]
-        exp_day = last_day + exp_day
-    else:
-        exp_month = mon - 1 if mon > 1 else 12
-        exp_year = year if mon > 1 else year - 1
-
-    try:
-        exp_date = date(exp_year, exp_month, min(exp_day, 28))
-    except ValueError:
-        return None
-
-    dte = (exp_date - date.today()).days
-    return max(dte, 0)
+    """估算DTE天数 — 委托给统一的 calc_dte"""
+    return calc_dte(product, month_str)
 
 
 def _parse_futures_symbol(sym):
@@ -1563,8 +2467,7 @@ def scan_vrp():
                 continue
 
             # 期货最新价格
-            cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
-                        (best_sym,))
+            cur.execute(_LATEST_PRICE_SQL, (best_sym,))
             row = cur.fetchone()
             if not row:
                 continue
@@ -1629,16 +2532,14 @@ def scan_vrp():
                 atm_put = re.sub(r'C(\d+)$', f'P{atm_strike}', atm_call)
 
             # ATM Call 最新价
-            cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
-                        (atm_call,))
+            cur.execute(_LATEST_PRICE_SQL, (atm_call,))
             row = cur.fetchone()
             if not row or row[0] <= 0:
                 continue
             call_price = row[0]
 
             # ATM Put 最新价
-            cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1",
-                        (atm_put,))
+            cur.execute(_LATEST_PRICE_SQL, (atm_put,))
             row = cur.fetchone()
             put_price = row[0] if row and row[0] > 0 else None
 
@@ -1966,17 +2867,34 @@ def _build_trade_row(idx):
             style={'width': '60px', 'padding': '5px 8px', 'fontSize': '13px',
                    'backgroundColor': '#1a1a3e', 'color': '#fff',
                    'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center'}),
-        html.Span('Ask≥', style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
+        html.Span('Ask≥', id={'type': 'entry-condition-label', 'index': idx},
+                  style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
         dcc.Input(
-            id={'type': 'min-ask-sum', 'index': idx}, type='number', placeholder='不限',
+            id={'type': 'entry-condition-sum', 'index': idx}, type='number', placeholder='不限',
             style={'width': '62px', 'padding': '5px 6px', 'fontSize': '12px',
                    'backgroundColor': '#1a1a3e', 'color': '#FFD700',
                    'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center'}),
-        html.Button('卖出进仓', id={'type': 'trade-entry-btn', 'index': idx}, n_clicks=0, style={
+        dcc.Dropdown(
+            id={'type': 'entry-direction', 'index': idx},
+            options=[{'label': '卖出开仓', 'value': 'sell'}, {'label': '买入开仓', 'value': 'buy'}],
+            value='sell', clearable=False,
+            style={'width': '100px', 'display': 'inline-block', 'marginLeft': '6px',
+                   'fontSize': '12px', 'verticalAlign': 'middle'}),
+        html.Button('进仓', id={'type': 'trade-entry-btn', 'index': idx}, n_clicks=0, style={
             'padding': '5px 16px', 'fontSize': '13px', 'cursor': 'pointer',
             'backgroundColor': '#1a4a1e', 'color': '#00FF88',
-            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginLeft': '6px',
+            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginLeft': '4px',
             'fontWeight': 'bold'}),
+        dcc.Checklist(
+            id={'type': 'entry-split-toggle', 'index': idx},
+            options=[{'label': '分轮', 'value': 'split'}],
+            value=[], inline=True,
+            style={'display': 'inline-block', 'marginLeft': '6px', 'fontSize': '11px',
+                   'verticalAlign': 'middle'},
+            inputStyle={'marginRight': '2px', 'cursor': 'pointer'},
+            labelStyle={'color': '#aaa', 'fontSize': '11px', 'cursor': 'pointer'}),
+        html.Span(id={'type': 'entry-split-plan', 'index': idx}, style={
+            'color': '#4fc3f7', 'fontSize': '11px', 'marginLeft': '2px'}),
         html.Span(id={'type': 'trade-entry-status', 'index': idx}, style={
             'color': '#00FF88', 'fontSize': '12px', 'marginLeft': '10px'}),
     ]
@@ -1990,17 +2908,34 @@ def _build_trade_row(idx):
             style={'width': '60px', 'padding': '5px 8px', 'fontSize': '13px',
                    'backgroundColor': '#1a1a3e', 'color': '#fff',
                    'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center'}),
-        html.Span('Bid≤', style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
+        html.Span('Bid≤', id={'type': 'close-condition-label', 'index': idx},
+                  style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
         dcc.Input(
-            id={'type': 'max-bid-sum', 'index': idx}, type='number', placeholder='不限',
+            id={'type': 'close-condition-sum', 'index': idx}, type='number', placeholder='不限',
             style={'width': '62px', 'padding': '5px 6px', 'fontSize': '12px',
                    'backgroundColor': '#1a1a3e', 'color': '#FF6B6B',
                    'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center'}),
-        html.Button('买入平仓', id={'type': 'trade-close-btn', 'index': idx}, n_clicks=0, style={
+        dcc.Dropdown(
+            id={'type': 'close-direction', 'index': idx},
+            options=[{'label': '买入平仓', 'value': 'buy_close'}, {'label': '卖出平仓', 'value': 'sell_close'}],
+            value='buy_close', clearable=False,
+            style={'width': '100px', 'display': 'inline-block', 'marginLeft': '6px',
+                   'fontSize': '12px', 'verticalAlign': 'middle'}),
+        html.Button('平仓', id={'type': 'trade-close-btn', 'index': idx}, n_clicks=0, style={
             'padding': '5px 16px', 'fontSize': '13px', 'cursor': 'pointer',
             'backgroundColor': '#4a1a1e', 'color': '#FF6B6B',
-            'border': '1px solid #FF6B6B', 'borderRadius': '4px', 'marginLeft': '6px',
+            'border': '1px solid #FF6B6B', 'borderRadius': '4px', 'marginLeft': '4px',
             'fontWeight': 'bold'}),
+        dcc.Checklist(
+            id={'type': 'close-split-toggle', 'index': idx},
+            options=[{'label': '分轮', 'value': 'split'}],
+            value=[], inline=True,
+            style={'display': 'inline-block', 'marginLeft': '6px', 'fontSize': '11px',
+                   'verticalAlign': 'middle'},
+            inputStyle={'marginRight': '2px', 'cursor': 'pointer'},
+            labelStyle={'color': '#aaa', 'fontSize': '11px', 'cursor': 'pointer'}),
+        html.Span(id={'type': 'close-split-plan', 'index': idx}, style={
+            'color': '#FF6B6B', 'fontSize': '11px', 'marginLeft': '2px'}),
         html.Span(id={'type': 'trade-close-status', 'index': idx}, style={
             'color': '#FF6B6B', 'fontSize': '12px', 'marginLeft': '10px'}),
         html.Span('│', style={'color': '#333', 'margin': '0 8px'}),
@@ -2011,6 +2946,14 @@ def _build_trade_row(idx):
             'fontWeight': 'bold'}),
         html.Span(id={'type': 'emergency-status', 'index': idx}, style={
             'fontSize': '11px', 'marginLeft': '6px'}),
+        html.Span('│', style={'color': '#333', 'margin': '0 8px'}),
+        html.Button('时间强平', id={'type': 'force-close-btn', 'index': idx}, n_clicks=0, style={
+            'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
+            'backgroundColor': '#1a3a1a', 'color': '#00FF88',
+            'border': '1px solid #00FF88', 'borderRadius': '4px',
+            'fontWeight': 'bold'}),
+        html.Span(id={'type': 'force-close-status', 'index': idx}, style={
+            'fontSize': '11px', 'marginLeft': '6px'}),
     ]
 
     return html.Div([
@@ -2020,7 +2963,9 @@ def _build_trade_row(idx):
     ], id={'type': 'trade-row', 'index': idx}, style={'marginBottom': '8px'})
 
 
-app.layout = html.Div([
+def serve_layout():
+    """每次页面加载都从文件读取最新配置（而非启动时的静态快照）"""
+    return html.Div([
     # 顶部标题栏
     html.Div([
         html.H2('期权工作台', style={'margin': '0', 'color': '#fff', 'display': 'inline-block'}),
@@ -2028,6 +2973,11 @@ app.layout = html.Div([
             'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
             'cursor': 'pointer', 'backgroundColor': '#0a4a6e', 'color': '#4fc3f7',
             'border': '1px solid #4fc3f7', 'borderRadius': '4px', 'marginTop': '3px'}),
+        html.Button('预警统计', id='alert-stats-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#3a3a0a', 'color': '#FFD700',
+            'border': '1px solid #FFD700', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
         html.Button('VRP扫描', id='vrp-btn', n_clicks=0, style={
             'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
             'cursor': 'pointer', 'backgroundColor': '#0a3a0a', 'color': '#00FF88',
@@ -2037,6 +2987,11 @@ app.layout = html.Div([
             'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
             'cursor': 'pointer', 'backgroundColor': '#4a0a0a', 'color': '#ff9800',
             'border': '1px solid #ff9800', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
+        html.Button('价差监控', id='spread-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#1a0a3a', 'color': '#bb86fc',
+            'border': '1px solid #bb86fc', 'borderRadius': '4px', 'marginTop': '3px',
             'marginRight': '8px'}),
     ], style={'backgroundColor': '#1a1a2e', 'padding': '15px 25px',
               'borderBottom': '3px solid #e94560'}),
@@ -2050,18 +3005,24 @@ app.layout = html.Div([
     # 资讯面板（默认隐藏）
     html.Div(id='news-panel', style={'display': 'none'}),
 
+    # 价差Z-Score监控面板（默认隐藏）
+    html.Div(id='spread-panel', style={'display': 'none'}),
+
+    # 预警统计面板（默认隐藏）
+    html.Div(id='alert-stats-panel', style={'display': 'none'}),
+
     # 账户+持仓状态栏（由tick快照动态更新）
     html.Div(id='account-bar'),
 
-    # 交易面板（动态多行）
+    # 交易面板（动态多行，根据持久化状态恢复）
     html.Div([
         html.Div(id='trade-rows-container', children=[
-            _build_trade_row(0),
+            _build_trade_row(i) for i in range(max(1, len(_load_trade_state().get('selections', [])) or 1))
         ]),
         # 全局紧急停止保留为隐藏占位（回调引用需要）
         html.Button(id='emergency-stop-btn', n_clicks=0, style={'display': 'none'}),
         html.Span(id='emergency-stop-status', style={'display': 'none'}),
-        dcc.Store(id='trade-row-count', data=1),
+        dcc.Store(id='trade-row-count', data=max(1, len(_load_trade_state().get('selections', [])) or 1)),
     ], style={'padding': '8px 20px', 'backgroundColor': '#0d1117',
               'borderBottom': '1px solid #1a1a3e'}),
 
@@ -2124,9 +3085,11 @@ app.layout = html.Div([
     dcc.Store(id='pairs-store', data=load_config()),
     dcc.Store(id='scorecard-collapsed', data=True),
     dcc.Store(id='loading-state', data={}),  # {product: start_timestamp}
+    dcc.Store(id='trade-state', data=_load_trade_state()),  # 交易行选中状态持久化
 
     # 定时刷新
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
+    dcc.Interval(id='account-timer', interval=5000, n_intervals=0),
     dcc.Interval(id='load-timer', interval=2000, disabled=True),
 
     # 回到顶部悬浮按钮
@@ -2141,6 +3104,9 @@ app.layout = html.Div([
     }),
 
 ], style={'backgroundColor': '#0f0f23', 'minHeight': '100vh'})
+
+
+app.layout = serve_layout  # 函数引用（非调用），每次页面加载都执行
 
 # 回到顶部 — clientside callback（纯JS，零延迟）
 app.clientside_callback(
@@ -2226,11 +3192,14 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
             if pair[0] == leg1 and pair[1] == leg2 and pc1 == c1 and pc2 == c2:
                 return no_update, f'{leg1}×{c1:g}+{leg2}×{c2:g} 已存在', no_update, no_update
         # 检查两腿价格比率
+        # CTP夜盘数据用交易日日期存储(如周五夜盘存为下周一日期)，
+        # 导致 ORDER BY datetime DESC 会优先取到陈旧的夜盘价格而非当前日盘价格。
+        # 修复：同日期内日盘(hour<20)优先于夜盘(hour>=20)
         db = get_db()
         cur = db.cursor()
-        cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1", (leg1,))
+        cur.execute(_LATEST_PRICE_SQL, (leg1,))
         r1 = cur.fetchone()
-        cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? ORDER BY datetime DESC LIMIT 1", (leg2,))
+        cur.execute(_LATEST_PRICE_SQL, (leg2,))
         r2 = cur.fetchone()
         if r1 and r2 and r1[0] > 0 and r2[0] > 0:
             p1, p2 = r1[0] * c1, r2[0] * c2
@@ -2271,9 +3240,11 @@ def adopt_pair(adopt_clicks, pairs):
     call_sym, put_sym = key.split('|', 1)
     for p in pairs:
         if p[0] == call_sym and p[1] == put_sym:
+            print(f'[adopt_pair] {call_sym}+{put_sym} 已存在于pairs中, 跳过')
             return no_update, f'{call_sym}+{put_sym} 已存在'
     pairs.insert(0, [call_sym, put_sym, 1.0, 1.0])  # 排在最前面
     save_config(pairs)
+    print(f'[adopt_pair] 已收藏 {call_sym} + {put_sym}, 当前共{len(pairs)}对')
     return pairs, f'已收藏 {call_sym} + {put_sym}'
 
 
@@ -2345,13 +3316,19 @@ def _send_strategy_command(product, endpoint, payload=None):
         try:
             import requests as _req
             resp = _req.post(f'{url}/{endpoint}', json=payload or {}, timeout=5)
+        except Exception:
+            # 连接失败（策略未启动等），fallback 文件
+            return _send_strategy_command_file(product, endpoint, payload)
+        # HTTP 已发送成功，不再 fallback 文件（避免重复下单）
+        try:
             data = resp.json()
             if resp.status_code == 200 and data.get('ok'):
                 return True, data.get('message', '成功')
             return False, data.get('error', f'HTTP {resp.status_code}')
-        except Exception:
-            pass  # HTTP 失败，fallback 文件
-    # Fallback: 写文件信号（兼容旧策略）
+        except Exception as e:
+            # POST 已成功但响应解析失败，视为成功（命令已送达）
+            return True, f'已发送(响应解析异常: {e})'
+    # 无 API URL，用文件信号
     return _send_strategy_command_file(product, endpoint, payload)
 
 
@@ -2373,14 +3350,20 @@ def _send_strategy_command_file(product, endpoint, payload=None):
             return True, '已写入信号文件(fallback)'
         elif endpoint == 'emergency_stop':
             es_path = os.path.join(_STATE_DIR, '.emergency_stop')
-            if os.path.exists(es_path):
-                os.unlink(es_path)
-                return True, '已恢复(文件)'
+            action = (payload or {}).get('action', 'stop')
+            if action == 'resume':
+                if os.path.exists(es_path):
+                    os.unlink(es_path)
+                    return True, '已恢复(文件)'
+                return True, '已在运行中(文件)'
             else:
+                # action == 'stop': 幂等写入
                 with open(es_path, 'w') as f:
                     from datetime import datetime as _dt
                     f.write(_dt.now().isoformat())
                 return True, '已停止(文件)'
+        elif endpoint == 'force_close_toggle':
+            return False, '文件信号不支持强平切换，需HTTP API'
         return False, f'未知端点: {endpoint}'
     except Exception as e:
         return False, str(e)
@@ -2397,20 +3380,28 @@ def _start_strategy(product):
     return log_file
 
 
-def _smart_round_volumes(total_volume):
-    """智能分轮：1-2手不拆，3-6手每轮1手，7-15手每轮2手，16-30手每轮3手，31+手每轮5手"""
+def _smart_round_volumes(total_volume, mode='entry'):
+    """智能分轮：entry=条件单友好少轮次，exit=效率优先拆粗"""
     if total_volume <= 0:
         return []
-    if total_volume <= 2:
+    if total_volume <= 3:
         return [total_volume]
-    if total_volume <= 6:
-        per = 1
-    elif total_volume <= 15:
-        per = 2
-    elif total_volume <= 30:
-        per = 3
+    if mode == 'exit':
+        if total_volume <= 8:
+            per = 3
+        elif total_volume <= 20:
+            per = 5
+        else:
+            per = 10
     else:
-        per = 5
+        if total_volume <= 6:
+            per = 3
+        elif total_volume <= 15:
+            per = 5
+        elif total_volume <= 30:
+            per = 5
+        else:
+            per = 10
     rounds = []
     rem = total_volume
     while rem > 0:
@@ -2419,37 +3410,93 @@ def _smart_round_volumes(total_volume):
     return rounds
 
 
+# ========== 分轮计划实时显示 ==========
+@app.callback(
+    Output({'type': 'entry-split-plan', 'index': MATCH}, 'children'),
+    Input({'type': 'entry-split-toggle', 'index': MATCH}, 'value'),
+    Input({'type': 'trade-volume', 'index': MATCH}, 'value'),
+    prevent_initial_call=True,
+)
+def show_entry_split_plan(toggle, volume):
+    if not toggle or 'split' not in toggle or not volume or volume < 1:
+        return ''
+    rounds = _smart_round_volumes(int(volume), mode='entry')
+    if len(rounds) <= 1:
+        return html.Span('(不需分轮)', style={'color': '#888'})
+    return f'{len(rounds)}轮{rounds}'
+
+
+@app.callback(
+    Output({'type': 'close-split-plan', 'index': MATCH}, 'children'),
+    Input({'type': 'close-split-toggle', 'index': MATCH}, 'value'),
+    Input({'type': 'close-volume', 'index': MATCH}, 'value'),
+    prevent_initial_call=True,
+)
+def show_close_split_plan(toggle, volume):
+    if not toggle or 'split' not in toggle or not volume or volume < 1:
+        return ''
+    rounds = _smart_round_volumes(int(volume), mode='exit')
+    if len(rounds) <= 1:
+        return html.Span('(不需分轮)', style={'color': '#888'})
+    return f'{len(rounds)}轮{rounds}'
 
 
 @app.callback(
     Output('emergency-stop-status', 'children'),
     Output({'type': 'trade-entry-status', 'index': ALL}, 'children', allow_duplicate=True),
-    Output({'type': 'min-ask-sum', 'index': ALL}, 'value', allow_duplicate=True),
+    Output({'type': 'entry-condition-sum', 'index': ALL}, 'value', allow_duplicate=True),
     Input('emergency-stop-btn', 'n_clicks'),
-    State({'type': 'min-ask-sum', 'index': ALL}, 'value'),
+    State({'type': 'entry-condition-sum', 'index': ALL}, 'value'),
     prevent_initial_call=True,
 )
 def on_emergency_stop_click(n_clicks, all_min_ask):
-    """紧急停止：POST /emergency_stop 到所有运行中的策略，清除条件单"""
+    """紧急停止/恢复：自动感知状态，运行中→停止，已停止→恢复。服务端幂等，快速连点安全。"""
     if not n_clicks:
         n_rows = len(all_min_ask) if all_min_ask else 0
         return no_update, [no_update] * n_rows, [no_update] * n_rows
     n_rows = len(all_min_ask) if all_min_ask else 0
+
+    es_path = os.path.join(_STATE_DIR, '.emergency_stop')
+
+    # 先查状态：文件优先（最可靠），HTTP辅助
+    # 文件是 ground truth，因为HTTP可能超时/卡住
+    any_stopped = os.path.exists(es_path)
+    if not any_stopped:
+        try:
+            for f in os.listdir(_STATE_DIR):
+                if f.endswith('_api_port'):
+                    product = f.replace('_api_port', '')
+                    status = _get_strategy_status(product)
+                    if status and status.get('emergency_stopped'):
+                        any_stopped = True
+                        break
+        except Exception:
+            pass
+
+    action = 'resume' if any_stopped else 'stop'
+    payload = {'action': action}
+
+    # 无论HTTP是否成功，都同步文件状态（文件是 ground truth）
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        if action == 'stop':
+            with open(es_path, 'w') as f:
+                f.write(datetime.now().isoformat())
+        else:
+            if os.path.exists(es_path):
+                os.unlink(es_path)
+    except Exception:
+        pass
+
     results = []
-    any_stopped = False
-    any_resumed = False
     tried_products = set()
     try:
         for f in os.listdir(_STATE_DIR):
             if f.endswith('_api_port'):
                 product = f.replace('_api_port', '')
                 tried_products.add(product)
-                ok, msg = _send_strategy_command(product, 'emergency_stop')
+                ok, msg = _send_strategy_command(product, 'emergency_stop', payload)
                 if ok:
-                    if '恢复' in msg:
-                        any_resumed = True
-                    else:
-                        any_stopped = True
                     results.append(f'{product}:{msg}')
                 else:
                     results.append(f'{product}:失败-{msg}')
@@ -2457,13 +3504,7 @@ def on_emergency_stop_click(n_clicks, all_min_ask):
         pass
 
     if not tried_products:
-        ok, msg = _send_strategy_command_file('ALL', 'emergency_stop')
-        if ok:
-            if '恢复' in msg:
-                any_resumed = True
-            else:
-                any_stopped = True
-            results.append(msg)
+        results.append('已停止(文件)' if action == 'stop' else '已恢复(文件)')
 
     ts = datetime.now().strftime("%H:%M:%S")
     if not results:
@@ -2471,29 +3512,25 @@ def on_emergency_stop_click(n_clicks, all_min_ask):
                 [no_update] * n_rows, [no_update] * n_rows)
 
     summary = ', '.join(results)
-    if any_stopped:
+    if action == 'stop':
         status_msg = html.Span(f'已停止！ {summary} ({ts})',
                                style={'color': '#FF4444', 'fontWeight': 'bold'})
-        # 清除所有条件单状态 + 归零 Ask 输入框
         entry_statuses = [html.Span(f'条件单已取消 ({ts})', style={'color': '#FF8800', 'fontSize': '11px'})
                           for _ in range(n_rows)]
         ask_values = [None for _ in range(n_rows)]
         return status_msg, entry_statuses, ask_values
-    elif any_resumed:
-        status_msg = html.Span(f'已恢复 {summary} ({ts})',
-                               style={'color': '#00FF88'})
+    else:
+        status_msg = html.Span(f'已恢复运行 {summary} ({ts})',
+                               style={'color': '#00FF88', 'fontWeight': 'bold'})
         return status_msg, [no_update] * n_rows, [no_update] * n_rows
-
-    return (html.Span(f'{summary} ({ts})', style={'color': '#FFD700'}),
-            [no_update] * n_rows, [no_update] * n_rows)
 
 
 @app.callback(
     Output({'type': 'emergency-status', 'index': MATCH}, 'children'),
     Output({'type': 'trade-entry-status', 'index': MATCH}, 'children', allow_duplicate=True),
-    Output({'type': 'min-ask-sum', 'index': MATCH}, 'value', allow_duplicate=True),
+    Output({'type': 'entry-condition-sum', 'index': MATCH}, 'value', allow_duplicate=True),
     Output({'type': 'trade-close-status', 'index': MATCH}, 'children', allow_duplicate=True),
-    Output({'type': 'max-bid-sum', 'index': MATCH}, 'value', allow_duplicate=True),
+    Output({'type': 'close-condition-sum', 'index': MATCH}, 'value', allow_duplicate=True),
     Input({'type': 'emergency-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     prevent_initial_call=True,
@@ -2513,31 +3550,103 @@ def on_row_emergency_stop(n_clicks, pair_json):
         if not product:
             return html.Span('无法识别品种', style={'color': '#FF4444'}), no_update, no_update, no_update, no_update
 
-        ok, msg = _send_strategy_command(product, 'emergency_stop')
+        # 感知状态：文件优先（最可靠），HTTP辅助
+        es_path = os.path.join(_STATE_DIR, '.emergency_stop')
+        is_stopped = os.path.exists(es_path)
+        if not is_stopped:
+            status = _get_strategy_status(product)
+            is_stopped = bool(status and status.get('emergency_stopped'))
+        action = 'resume' if is_stopped else 'stop'
+
+        # 同步文件状态
+        try:
+            if action == 'stop':
+                with open(es_path, 'w') as _f:
+                    _f.write(datetime.now().isoformat())
+            else:
+                if os.path.exists(es_path):
+                    os.unlink(es_path)
+        except Exception:
+            pass
+
+        ok, msg = _send_strategy_command(product, 'emergency_stop', {'action': action})
         ts = datetime.now().strftime("%H:%M:%S")
         if ok:
-            if '恢复' in msg:
-                return (html.Span(f'{product}已恢复 ({ts})', style={'color': '#00FF88'}),
-                        no_update, no_update, no_update, no_update)
-            else:
+            if action == 'stop':
                 cancelled = html.Span(f'条件单已取消 ({ts})',
                                       style={'color': '#FF8800', 'fontSize': '11px'})
                 return (html.Span(f'{product}已停止 ({ts})',
                                   style={'color': '#FF4444', 'fontWeight': 'bold'}),
                         cancelled, None, cancelled, None)
+            else:
+                return (html.Span(f'{product}已恢复 ({ts})',
+                                  style={'color': '#00FF88', 'fontWeight': 'bold'}),
+                        no_update, no_update, no_update, no_update)
         else:
-            return (html.Span(f'{product}停止失败: {msg} ({ts})', style={'color': '#FFD700'}),
+            return (html.Span(f'{product}操作失败: {msg} ({ts})', style={'color': '#FFD700'}),
                     no_update, no_update, no_update, no_update)
     except Exception as e:
         return html.Span(f'错误: {e}', style={'color': '#FF4444'}), no_update, no_update, no_update, no_update
 
 
 @app.callback(
-    Output({'type': 'trade-pair-select', 'index': ALL}, 'options'),
-    Input('pairs-store', 'data'),
+    Output({'type': 'force-close-status', 'index': MATCH}, 'children'),
+    Output({'type': 'force-close-btn', 'index': MATCH}, 'style'),
+    Input({'type': 'force-close-btn', 'index': MATCH}, 'n_clicks'),
+    State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
+    prevent_initial_call=True,
 )
-def update_trade_pair_options(pairs):
-    """根据工作台期权对列表更新所有交易行下拉选项"""
+def on_force_close_toggle(n_clicks, pair_json):
+    """切换收盘前强平开关"""
+    btn_enabled = {'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
+                   'backgroundColor': '#1a3a1a', 'color': '#00FF88',
+                   'border': '1px solid #00FF88', 'borderRadius': '4px', 'fontWeight': 'bold'}
+    btn_disabled = {'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
+                    'backgroundColor': '#4a3a00', 'color': '#FF8800',
+                    'border': '1px solid #FF8800', 'borderRadius': '4px', 'fontWeight': 'bold'}
+    if not n_clicks:
+        return no_update, no_update
+    if not pair_json:
+        return html.Span('请先选择期权对', style={'color': '#FF4444'}), no_update
+    try:
+        pair = json.loads(pair_json)
+        product = _extract_product(pair['call'])
+        if not product:
+            return html.Span('无法识别品种', style={'color': '#FF4444'}), no_update
+
+        ok, msg = _send_strategy_command(product, 'force_close_toggle')
+        if ok:
+            # 读取配置中的强平时间（02:00:00 是占位符，用 scheduler 默认值）
+            cfg = _load_commodity_config(product)
+            tp = cfg.get('trading_params', {})
+            fc_night = tp.get('force_close_start_night', '22:49:00')
+            fc_day = tp.get('force_close_start_day', '14:49:00')
+            if not fc_night or fc_night == '02:00:00':
+                fc_night = '22:49:00'
+            if not fc_day or fc_day == '02:00:00':
+                fc_day = '14:49:00'
+            fc_text = f'夜{fc_night[:5]}/日{fc_day[:5]}'
+
+            if '启用' in msg:
+                return (html.Span(f'{product}强平已启用 {fc_text}', style={'color': '#00FF88'}),
+                        btn_enabled)
+            else:
+                return (html.Span(f'{product}强平已禁用', style={'color': '#FF8800', 'fontWeight': 'bold'}),
+                        btn_disabled)
+        else:
+            return html.Span(f'{product}切换失败: {msg}', style={'color': '#FFD700'}), no_update
+    except Exception as e:
+        return html.Span(f'错误: {e}', style={'color': '#FF4444'}), no_update
+
+
+@app.callback(
+    Output({'type': 'trade-pair-select', 'index': ALL}, 'options'),
+    Output({'type': 'trade-pair-select', 'index': ALL}, 'value'),
+    Input('pairs-store', 'data'),
+    State('trade-state', 'data'),
+)
+def update_trade_pair_options(pairs, trade_state):
+    """根据工作台期权对列表更新所有交易行下拉选项，并恢复选中值"""
     if not pairs:
         options = []
     else:
@@ -2547,10 +3656,30 @@ def update_trade_pair_options(pairs):
             label = f'{call_sym} + {put_sym}'
             value = json.dumps({'call': call_sym, 'put': put_sym})
             options.append({'label': label, 'value': value})
-    # 返回列表长度需要匹配ALL的组件数
     from dash import callback_context
-    n_outputs = len(callback_context.outputs_list)
-    return [options] * max(n_outputs, 1)
+    n_outputs = len(callback_context.outputs_list[0])
+    # 恢复选中值
+    saved_selections = (trade_state or {}).get('selections', [])
+    valid_values = {o['value'] for o in options}
+    values = []
+    for i in range(n_outputs):
+        if i < len(saved_selections) and saved_selections[i] in valid_values:
+            values.append(saved_selections[i])
+        else:
+            values.append(no_update)
+    return [options] * max(n_outputs, 1), values
+
+
+@app.callback(
+    Output('trade-state', 'data'),
+    Input({'type': 'trade-pair-select', 'index': ALL}, 'value'),
+    prevent_initial_call=True,
+)
+def save_trade_selections(all_values):
+    """选择配对时自动保存到文件，刷新后恢复"""
+    state = {'selections': list(all_values or [])}
+    _save_trade_state(state)
+    return state
 
 
 _LOAD_READY_SECONDS = 35  # 策略启动后等待秒数
@@ -2649,16 +3778,39 @@ def update_load_status(_, loading_state, all_pairs):
 
 
 @app.callback(
+    Output({'type': 'entry-condition-label', 'index': MATCH}, 'children'),
+    Input({'type': 'entry-direction', 'index': MATCH}, 'value'),
+    prevent_initial_call=True,
+)
+def update_entry_condition_label(direction):
+    """进仓方向变化时更新条件标签：卖出→Ask≥，买入→Bid≤"""
+    return 'Bid≤' if direction == 'buy' else 'Ask≥'
+
+
+@app.callback(
+    Output({'type': 'close-condition-label', 'index': MATCH}, 'children'),
+    Input({'type': 'close-direction', 'index': MATCH}, 'value'),
+    prevent_initial_call=True,
+)
+def update_close_condition_label(direction):
+    """平仓方向变化时更新条件标签：卖出平→Ask≥，买入平→Bid≤"""
+    return 'Ask≥' if direction == 'sell_close' else 'Bid≤'
+
+
+@app.callback(
     Output({'type': 'trade-entry-status', 'index': MATCH}, 'children'),
     Input({'type': 'trade-entry-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     State({'type': 'trade-volume', 'index': MATCH}, 'value'),
-    State({'type': 'min-ask-sum', 'index': MATCH}, 'value'),
+    State({'type': 'entry-condition-sum', 'index': MATCH}, 'value'),
+    State({'type': 'entry-direction', 'index': MATCH}, 'value'),
+    State({'type': 'entry-split-toggle', 'index': MATCH}, 'value'),
     State('loading-state', 'data'),
     prevent_initial_call=True,
 )
-def on_trade_entry_click(n_clicks, pair_json, volume, min_ask_sum, loading_state):
-    """卖出进仓按钮：POST /entry 到策略 HTTP API"""
+def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direction, split_toggle, loading_state):
+    """进仓按钮：POST /entry 到策略 HTTP API，支持卖出/买入方向"""
+    print(f"[DEBUG 进仓] n_clicks={n_clicks}, entry_direction={entry_direction!r}, volume={volume}, split={split_toggle}")
     if not n_clicks:
         return no_update
     if not pair_json:
@@ -2689,27 +3841,36 @@ def on_trade_entry_click(n_clicks, pair_json, volume, min_ask_sum, loading_state
             remain = int(_LOAD_READY_SECONDS - (time.time() - load_time))
             return html.Span(f'{product}策略加载中，还需{remain}秒', style={'color': '#FFD700'})
 
+        direction = entry_direction or 'sell'
+        dir_label = '买入' if direction == 'buy' else '卖出'
+        use_split = split_toggle and 'split' in split_toggle
+        rounds = _smart_round_volumes(int(volume)) if use_split else [int(volume)]
         payload = {
             'call': pair['call'],
             'put': pair['put'],
             'volume': int(volume),
-            'direction': 'sell',
+            'direction': direction,
+            'round_volumes': rounds,
         }
-        # 条件进仓：Ask之和 >= min_ask_sum 时才执行
-        if min_ask_sum and min_ask_sum > 0:
-            payload['min_ask_sum'] = float(min_ask_sum)
+        # 条件进仓：卖出→Ask≥，买入→Bid≤
+        if condition_sum and condition_sum > 0:
+            if direction == 'buy':
+                payload['max_bid_sum'] = float(condition_sum)
+            else:
+                payload['min_ask_sum'] = float(condition_sum)
 
         ok, msg = _send_strategy_command(product, 'entry', payload)
         if ok:
-            rounds = _smart_round_volumes(int(volume))
             ts = datetime.now().strftime("%H:%M:%S")
-            if min_ask_sum and min_ask_sum > 0:
+            if condition_sum and condition_sum > 0:
+                cond_label = f'Bid≤{condition_sum}' if direction == 'buy' else f'Ask≥{condition_sum}'
                 return html.Span(
-                    f'条件挂单 Ask≥{min_ask_sum} 卖出各{volume}手 '
+                    f'条件挂单 {cond_label} {dir_label}各{volume}手 '
                     f'{pair["call"]}+{pair["put"]} ({ts})',
                     style={'color': '#FFD700'})
+            split_info = f' 分{len(rounds)}轮{rounds}' if len(rounds) > 1 else ''
             return html.Span(
-                f'已发送 卖出各{volume}手 分{len(rounds)}轮{rounds} '
+                f'已发送 {dir_label}各{volume}手{split_info} '
                 f'{pair["call"]}+{pair["put"]} ({ts})',
                 style={'color': '#00FF88'})
         else:
@@ -2723,11 +3884,13 @@ def on_trade_entry_click(n_clicks, pair_json, volume, min_ask_sum, loading_state
     Input({'type': 'trade-close-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     State({'type': 'close-volume', 'index': MATCH}, 'value'),
-    State({'type': 'max-bid-sum', 'index': MATCH}, 'value'),
+    State({'type': 'close-condition-sum', 'index': MATCH}, 'value'),
+    State({'type': 'close-direction', 'index': MATCH}, 'value'),
+    State({'type': 'close-split-toggle', 'index': MATCH}, 'value'),
     prevent_initial_call=True,
 )
-def on_trade_close_click(n_clicks, pair_json, volume, max_bid_sum):
-    """买入平仓按钮：POST /close 到策略 HTTP API"""
+def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direction, split_toggle):
+    """平仓按钮：POST /close 到策略 HTTP API，支持买入/卖出方向"""
     if not n_clicks:
         return no_update
     if not pair_json:
@@ -2750,28 +3913,37 @@ def on_trade_close_click(n_clicks, pair_json, volume, max_bid_sum):
         if _es:
             return html.Span('系统已紧急停止', style={'color': '#FF4444'})
 
+        direction = close_direction or 'buy_close'
+        dir_label = '卖出' if direction == 'sell_close' else '买入'
+        use_split = split_toggle and 'split' in split_toggle
+        rounds = _smart_round_volumes(int(volume), mode='exit') if use_split else [int(volume)]
         payload = {
             'call': pair['call'],
             'put': pair['put'],
             'volume': int(volume),
-            'direction': 'buy_close',
+            'direction': direction,
+            'round_volumes': rounds,
         }
-        # 条件平仓：Bid之和 <= max_bid_sum 时才执行
-        if max_bid_sum and max_bid_sum > 0:
-            payload['max_bid_sum'] = float(max_bid_sum)
+        # 条件平仓：买入平→Bid≤，卖出平→Ask≥
+        if condition_sum and condition_sum > 0:
+            if direction == 'sell_close':
+                payload['min_ask_sum'] = float(condition_sum)
+            else:
+                payload['max_bid_sum'] = float(condition_sum)
 
         ok, msg = _send_strategy_command(product, 'close', payload)
         if ok:
-            rounds = _smart_round_volumes(int(volume))
             ts = datetime.now().strftime("%H:%M:%S")
-            if max_bid_sum and max_bid_sum > 0:
+            if condition_sum and condition_sum > 0:
+                cond_label = f'Ask≥{condition_sum}' if direction == 'sell_close' else f'Bid≤{condition_sum}'
                 return html.Span(
-                    f'条件平仓 Bid≤{max_bid_sum} 平仓各{volume}手 '
+                    f'条件平仓 {cond_label} {dir_label}平仓各{volume}手 '
                     f'{pair["call"]}+{pair["put"]} ({ts})',
                     style={'color': '#FFD700'})
+            split_info = f' 分{len(rounds)}轮{rounds}' if len(rounds) > 1 else ''
             return html.Span(
-                f'已发送 平仓各{volume}手 分{len(rounds)}轮{rounds} '
-                f'({datetime.now().strftime("%H:%M:%S")})',
+                f'已发送 {dir_label}平仓各{volume}手{split_info} '
+                f'({ts})',
                 style={'color': '#FF6B6B'})
         else:
             return html.Span(f'发送失败: {msg}', style={'color': '#FF4444'})
@@ -2811,14 +3983,20 @@ def manage_trade_rows(add_clicks, remove_clicks, current_rows, row_count):
 
 
 @app.callback(
-    Output('charts-container', 'children'),
     Output('account-bar', 'children'),
+    Input('account-timer', 'n_intervals'),
+)
+def update_account_bar(_):
+    return _build_account_bar()
+
+
+@app.callback(
+    Output('charts-container', 'children'),
     Input('pairs-store', 'data'),
     Input('timer', 'n_intervals'),
 )
 def render_charts(pairs, _):
     manual_pairs = pairs or []
-    account_bar = _build_account_bar()
     try:
         auto_pairs_raw = auto_select_pairs()
     except Exception:
@@ -2832,10 +4010,38 @@ def render_charts(pairs, _):
             manual_futures.add(fs)
     auto_pairs = [ap for ap in auto_pairs_raw if ap['futures_sym'] not in manual_futures][:20]
 
+    # 注入今日计划精选的OTM宽跨推荐（Top5，排除已有品种）
+    # 懒初始化：如果还没点过今日计划，自动触发一次v6匹配
+    if not _v6_recommended_pairs:
+        try:
+            toggle_plan(1)  # 填充 _v6_recommended_pairs
+        except Exception:
+            pass
+    existing_futures = manual_futures | {ap['futures_sym'] for ap in auto_pairs}
+    for vp in _v6_recommended_pairs[:5]:
+        _d = re.search(r'(\d{3,4})$', vp['contract'])
+        if not _d:
+            continue
+        _digits = _d.group(1)
+        if vp['ex'] == 'CZCE':
+            fut_sym = f"{vp['prod'].upper()}{_digits[-3:]}"
+        else:
+            fut_sym = f"{vp['prod'].lower()}{_digits}"
+        if fut_sym in existing_futures:
+            continue
+        auto_pairs.insert(0, {
+            'call': vp['call_sym'], 'put': vp['put_sym'],
+            'product': vp['prod'], 'month': vp['contract'][-4:],
+            'score': vp['composite'], 'price_sum': vp['psum'],
+            'futures_sym': fut_sym,
+            'v6_tag': f"v6 Sh{vp['sharpe']:.0f} WR{vp['wr']:.0f}%",
+        })
+        existing_futures.add(fut_sym)
+
     if not manual_pairs and not auto_pairs:
         return html.Div('暂无数据，等待数据采集...',
                          style={'color': '#666', 'padding': '50px', 'textAlign': 'center',
-                                'fontSize': '16px'}), account_bar
+                                'fontSize': '16px'})
 
     # ---- 构建所有图表和摘要 ----
     manual_items = []
@@ -2868,8 +4074,62 @@ def render_charts(pairs, _):
     normal_auto = [(idx, ap, fig, info) for idx, ap, fig, info in auto_items
                     if not info.get('double_rise', {}).get('alert')]
 
+    # ---- 预警历史记录 & 回归追踪 ----
+    for idx, pair, fig, info, cc, pc in manual_items:
+        call_sym, put_sym = pair[0], pair[1]
+        dr = info.get('double_rise', {})
+        boll_mid = dr.get('boll_middle', 0)
+        s = info.get('sum')
+        if dr.get('alert'):
+            record_alert(call_sym, put_sym, info.get('futures_sym'), dr, s or 0, boll_mid)
+        elif s is not None and boll_mid > 0:
+            check_alert_resolved(call_sym, put_sym, s, boll_mid)
+
+    for idx, ap, fig, info in auto_items:
+        call_sym, put_sym = ap.get('call', ''), ap.get('put', '')
+        dr = info.get('double_rise', {})
+        boll_mid = dr.get('boll_middle', 0)
+        s = info.get('sum')
+        if dr.get('alert'):
+            record_alert(call_sym, put_sym, ap.get('product', '?'), dr, s or 0, boll_mid)
+        elif s is not None and boll_mid > 0:
+            check_alert_resolved(call_sym, put_sym, s, boll_mid)
+
+    # ---- 补充回归检查：不在当前监控列表中的活跃预警，主动从DB查价格 ----
+    checked_keys = set()
+    for _, pair, _, info, _, _ in manual_items:
+        checked_keys.add(f'{pair[0]}|{pair[1]}')
+    for _, ap, _, info in auto_items:
+        checked_keys.add(f'{ap.get("call","")}|{ap.get("put","")}')
+
+    unchecked = {k: v for k, v in _alert_active.items() if k not in checked_keys and not v.get('resolved')}
+    if unchecked:
+        try:
+            _adb = get_db()
+            _acur = _adb.cursor()
+            for akey, arec in list(unchecked.items()):
+                csym, psym = arec.get('call_sym', ''), arec.get('put_sym', '')
+                boll_mid = arec.get('boll_middle', 0)
+                if not csym or not psym or boll_mid <= 0:
+                    continue
+                _acur.execute(_LATEST_PRICE_SQL, (csym,))
+                cr = _acur.fetchone()
+                _acur.execute(_LATEST_PRICE_SQL, (psym,))
+                pr = _acur.fetchone()
+                if cr and pr and cr[0] > 0 and pr[0] > 0:
+                    cur_sum = cr[0] + pr[0]
+                    check_alert_resolved(csym, psym, cur_sum, boll_mid)
+        except Exception as _ae:
+            print(f'[alert_history] 补充回归检查失败: {_ae}')
+
     # ---- Gamma/Strangle 每日检查 (暂时禁用排查渲染问题) ----
     scorecard_panel, scorecard_nav_items = None, []
+
+    # 预计算：警报的索引集合（供导航栏和图表区共用）
+    alert_manual_indices = {item[0] for item in alert_manual}
+    alert_auto_indices = {item[0] for item in alert_auto}
+    non_alert_auto = [(idx, ap, fig, info) for idx, ap, fig, info in auto_items
+                       if idx not in alert_auto_indices]
 
     # ---- 左侧导航栏 ----
     nav_style = {'display': 'block', 'padding': '8px 12px', 'textDecoration': 'none',
@@ -2921,22 +4181,27 @@ def render_charts(pairs, _):
             'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
             'borderBottom': '1px solid #e94560',
             'marginTop': '6px' if all_alerts else '0'}))
-        for idx, pair, fig, info, cc, pc in normal_manual:
+        for idx, pair, fig, info, cc, pc in manual_items:
             fs = info.get('futures_sym') or '?'
             s = info.get('sum')
+            is_alert = idx in alert_manual_indices
+            color = '#FF4444' if is_alert else '#FFD700'
+            anchor = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
             nav.append(html.A([
-                html.Div(fs, style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FFD700'}),
+                html.Div(fs, style={'fontWeight': 'bold', 'fontSize': '13px', 'color': color}),
                 html.Div(f'{s:.1f}' if s else '--', style={'fontSize': '11px', 'color': '#aaa'}),
-            ], href=f'#m-chart-{idx}', className='nav-item', style=nav_style))
+            ], href=f'#{anchor}', className='nav-item', style=nav_style))
 
-    if normal_auto:
+    if non_alert_auto:
         nav.append(html.Div('智能推荐', style={
             'padding': '8px 12px', 'color': '#00FF88', 'fontSize': '11px',
             'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
             'borderBottom': '1px solid #00FF88', 'marginTop': '6px'}))
-        for idx, ap, fig, info in normal_auto:
+        for idx, ap, fig, info in non_alert_auto:
+            tag = ' v6' if ap.get('v6_tag') else ''
+            label_color = '#FF69B4' if tag else '#00FF88'
             nav.append(html.A([
-                html.Div(ap['product'], style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#00FF88'}),
+                html.Div(f'{ap["product"]}{tag}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': label_color}),
                 html.Div(f'{ap["score"]:.1f}分  {ap["price_sum"]:.0f}',
                          style={'fontSize': '11px', 'color': '#aaa'}),
             ], href=f'#a-chart-{idx}', className='nav-item', style=nav_style))
@@ -2990,7 +4255,7 @@ def render_charts(pairs, _):
                 'padding': '2px 8px', 'fontSize': '14px', 'fontWeight': 'bold', 'marginLeft': '6px'}))
         border_color = '#FF4444' if is_alert else '#2a2a4a'
         div_id = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
-        header_parts.extend(_make_advisory_spans(call_sym))
+        header_parts.extend(_make_advisory_spans(call_sym, put_sym))
         card_children = [
             html.Div(header_parts, style={'padding': '10px 20px', 'backgroundColor': '#1a1a2e'}),
             dcc.Graph(figure=fig, config=graph_cfg),
@@ -3009,6 +4274,11 @@ def render_charts(pairs, _):
             html.Span(f'  {ap["score"]:.1f}分',
                        style={'color': '#FFD700', 'fontSize': '13px', 'marginLeft': '10px'}),
         ]
+        if ap.get('v6_tag'):
+            header_parts.append(html.Span(
+                f'  {ap["v6_tag"]}',
+                style={'color': '#FF69B4', 'fontSize': '12px', 'marginLeft': '8px',
+                       'backgroundColor': '#2a1a2a', 'padding': '2px 6px', 'borderRadius': '3px'}))
         if is_alert:
             boll_info = f'  突破上轨{dr.get("boll_upper", 0):.0f}' if dr.get('method') == 'bollinger' else ''
             header_parts.append(html.Span(
@@ -3021,7 +4291,7 @@ def render_charts(pairs, _):
             'padding': '2px 8px', 'fontSize': '14px', 'fontWeight': 'bold', 'marginLeft': '6px'}))
         border_color = '#FF4444' if is_alert else '#2a2a4a'
         div_id = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
-        header_parts.extend(_make_advisory_spans(ap['call']))
+        header_parts.extend(_make_advisory_spans(ap['call'], ap.get('put')))
         card_children = [
             html.Div(header_parts, style={'padding': '10px 20px', 'backgroundColor': '#1a1a2e'}),
             dcc.Graph(figure=fig, config=graph_cfg),
@@ -3063,35 +4333,274 @@ def render_charts(pairs, _):
 
         for item in all_alerts:
             if len(item) == 6:
-                charts.append(_manual_card(*item, is_alert=True))
+                pass  # 手动对在自选区统一渲染（带警报样式）
             else:
                 charts.append(_auto_card(*item, is_alert=True))
 
-    # 2) 自选区（非警报）
-    for idx, pair, fig, info, cc, pc in normal_manual:
-        charts.append(_manual_card(idx, pair, fig, info, cc, pc))
+    # 2) 自选区（所有手动对，有警报的标红）
+    for idx, pair, fig, info, cc, pc in manual_items:
+        is_alert = idx in alert_manual_indices
+        charts.append(_manual_card(idx, pair, fig, info, cc, pc, is_alert=is_alert))
 
-    # 3) 智能推荐区（非警报）
-    if normal_auto:
+    # 3) 智能推荐区（排除已在警报区渲染的）
+    if non_alert_auto:
         charts.append(html.Div([
             html.Span('智能推荐', style={'color': '#00FF88', 'fontSize': '15px', 'fontWeight': 'bold'}),
             html.Span('  基于trade2026评分自动选对', style={'color': '#666', 'fontSize': '12px'}),
         ], style={'padding': '12px 20px', 'backgroundColor': '#0a1628',
                   'borderTop': '3px solid #00FF88', 'marginTop': '10px'}))
 
-        for idx, ap, fig, info in normal_auto:
+        for idx, ap, fig, info in non_alert_auto:
             charts.append(_auto_card(idx, ap, fig, info))
 
     charts_area = html.Div(charts, style={'flex': '1', 'minWidth': '0'})
 
     charts_layout = html.Div([sidebar, charts_area],
                               style={'display': 'flex', 'alignItems': 'flex-start', 'padding': '8px'})
-    return charts_layout, account_bar
+    return charts_layout
+
+
+# ============ 价差Z-Score监控 ============
+# 强相关品种对，按回测夏普排序（来自B031）
+_SPREAD_PAIRS = [
+    ('RB', 'HC', '螺纹钢', '热卷', 0.88, 11.55),
+    ('RU', 'NR', '天然橡胶', '20号胶', 0.84, 7.82),
+    ('J', 'JM', '焦炭', '焦煤', 0.73, 6.86),
+    ('TA', 'PF', 'PTA', '短纤', 0.84, 5.61),
+    ('PP', 'L', '聚丙烯', 'LLDPE', 0.80, 4.46),
+    ('CF', 'CY', '棉花', '棉纱', 0.72, 4.42),
+    ('I', 'RB', '铁矿石', '螺纹钢', 0.68, 3.97),
+    ('SC', 'LU', '原油', '低硫燃料油', 0.78, 3.07),
+    ('M', 'RM', '豆粕', '菜粕', 0.59, 2.25),
+    ('CU', 'ZN', '铜', '锌', 0.72, 1.25),
+    ('AU', 'AG', '黄金', '白银', 0.76, 0.29),
+    ('P', 'Y', '棕榈油', '豆油', 0.82, 0.99),
+]
+
+
+def _get_futures_prices(code, n_minutes=150):
+    """从CTP数据库获取期货品种最近N分钟的收盘价"""
+    try:
+        db = get_db()
+        cur = db.cursor()
+        # 精确匹配：品种代码+纯数字月份（如 rb2510, AG2506, cu2604）
+        # 避免 J 匹配到 JD/JM, P 匹配到 PF/PP/PK, M 匹配到 MA/MO 等
+        import re as _re
+        code_lower = code.lower()
+        code_upper = code.upper()
+        cur.execute("SELECT DISTINCT symbol FROM dbbardata ORDER BY symbol")
+        all_symbols = [r[0] for r in cur.fetchall()]
+        # 期货pattern: 精确品种代码 + 纯数字(3-4位月份) + 可选F后缀
+        pat = _re.compile(
+            r'^(' + _re.escape(code_lower) + r'|' + _re.escape(code_upper) + r')(\d{3,4})F?$',
+            _re.IGNORECASE)
+        futures_syms = [s for s in all_symbols if pat.match(s)]
+
+        if not futures_syms:
+            return None
+
+        # 取最近交易的合约
+        best_sym = None
+        best_time = None
+        for sym in futures_syms[-5:]:  # 检查最后几个
+            cur.execute(
+                "SELECT MAX(datetime) FROM dbbardata WHERE symbol = ?",
+                (sym,))
+            row = cur.fetchone()
+            if row and row[0]:
+                if best_time is None or row[0] > best_time:
+                    best_time = row[0]
+                    best_sym = sym
+
+        if not best_sym:
+            return None
+
+        # 取最近N分钟数据
+        cur.execute(
+            "SELECT datetime, close_price FROM dbbardata "
+            "WHERE symbol = ? ORDER BY datetime DESC LIMIT ?",
+            (best_sym, n_minutes))
+        rows = cur.fetchall()
+        if len(rows) < 30:
+            return None
+
+        import pandas as _pd
+        df = _pd.DataFrame(rows, columns=['datetime', 'close'])
+        df['datetime'] = _pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+        df['close'] = df['close'].astype(float)
+        return df, best_sym
+
+    except Exception:
+        return None
+
+
+def _calc_spread_zscore(code_a, code_b, window=120):
+    """计算两个品种的实时Z-Score"""
+    result_a = _get_futures_prices(code_a, n_minutes=window + 50)
+    result_b = _get_futures_prices(code_b, n_minutes=window + 50)
+
+    if result_a is None or result_b is None:
+        return None
+
+    df_a, sym_a = result_a
+    df_b, sym_b = result_b
+
+    import pandas as _pd
+    merged = _pd.merge(df_a, df_b, on='datetime', suffixes=('_A', '_B'))
+    if len(merged) < window:
+        return None
+
+    merged['ratio'] = merged['close_A'] / merged['close_B']
+    merged['ratio_mean'] = merged['ratio'].rolling(window).mean()
+    merged['ratio_std'] = merged['ratio'].rolling(window).std()
+    merged['z'] = (merged['ratio'] - merged['ratio_mean']) / merged['ratio_std']
+
+    last = merged.dropna(subset=['z']).iloc[-1] if len(merged.dropna(subset=['z'])) > 0 else None
+    if last is None:
+        return None
+
+    # 最近的Z-Score趋势（最后10根）
+    recent = merged.dropna(subset=['z']).tail(10)
+    z_trend = recent['z'].diff().mean() if len(recent) > 1 else 0
+
+    return {
+        'z': float(last['z']),
+        'ratio': float(last['ratio']),
+        'ratio_mean': float(last['ratio_mean']),
+        'price_a': float(last['close_A']),
+        'price_b': float(last['close_B']),
+        'sym_a': sym_a,
+        'sym_b': sym_b,
+        'z_trend': float(z_trend),
+        'n_bars': len(merged),
+        'last_time': str(last['datetime']),
+    }
+
+
+def _build_spread_panel():
+    """构建价差Z-Score监控面板"""
+    rows = []
+    n_extreme = 0
+    n_ok = 0
+    n_fail = 0
+
+    for code_a, code_b, name_a, name_b, corr, sharpe in _SPREAD_PAIRS:
+        result = _calc_spread_zscore(code_a, code_b)
+
+        if result is None:
+            n_fail += 1
+            rows.append(html.Tr([
+                html.Td(f'{name_a}↔{name_b}', style={'color': '#666'}),
+                html.Td(f'{corr:.2f}', style={'color': '#666', 'textAlign': 'center'}),
+                html.Td('无数据', colSpan='6', style={'color': '#444', 'textAlign': 'center'}),
+            ], style={'backgroundColor': '#0d1117', 'borderBottom': '1px solid #1a1a3e'}))
+            continue
+
+        z = result['z']
+        abs_z = abs(z)
+
+        # 颜色编码
+        if abs_z >= 2.0:
+            z_color = '#f44336'  # 红
+            status = '偏离'
+            n_extreme += 1
+        elif abs_z >= 1.5:
+            z_color = '#ff9800'  # 橙
+            status = '警戒'
+        elif abs_z >= 1.0:
+            z_color = '#ffeb3b'  # 黄
+            status = '注意'
+        else:
+            z_color = '#4caf50'  # 绿
+            status = '正常'
+            n_ok += 1
+
+        # Z趋势箭头
+        trend = result['z_trend']
+        if trend > 0.05:
+            trend_arrow = '↑'
+            trend_color = '#f44336' if z > 0 else '#4caf50'  # 偏离加剧/回归
+        elif trend < -0.05:
+            trend_arrow = '↓'
+            trend_color = '#4caf50' if z > 0 else '#f44336'
+        else:
+            trend_arrow = '→'
+            trend_color = '#888'
+
+        # 哪个偏贵
+        if z > 0.5:
+            bias = f'{name_a}偏贵'
+            bias_color = '#ff6b6b'
+        elif z < -0.5:
+            bias = f'{name_b}偏贵'
+            bias_color = '#ff6b6b'
+        else:
+            bias = '均衡'
+            bias_color = '#4caf50'
+
+        row_bg = '#1a0a0a' if abs_z >= 2.0 else '#1a1a0a' if abs_z >= 1.5 else '#0d1117'
+
+        rows.append(html.Tr([
+            html.Td(f'{name_a}↔{name_b}', style={
+                'color': '#fff', 'fontWeight': 'bold', 'fontSize': '13px'}),
+            html.Td(f'{corr:.2f}', style={
+                'color': '#888', 'textAlign': 'center', 'fontSize': '12px'}),
+            html.Td(f'{z:+.2f}', style={
+                'color': z_color, 'fontWeight': 'bold', 'textAlign': 'center',
+                'fontSize': '16px'}),
+            html.Td(f'{trend_arrow}', style={
+                'color': trend_color, 'textAlign': 'center', 'fontSize': '16px'}),
+            html.Td(status, style={
+                'color': z_color, 'textAlign': 'center', 'fontSize': '12px'}),
+            html.Td(bias, style={
+                'color': bias_color, 'textAlign': 'center', 'fontSize': '12px'}),
+            html.Td(f'{result["price_a"]:.0f}/{result["price_b"]:.0f}', style={
+                'color': '#888', 'textAlign': 'center', 'fontSize': '11px'}),
+            html.Td(result['last_time'][-8:], style={
+                'color': '#555', 'textAlign': 'right', 'fontSize': '11px'}),
+        ], style={'backgroundColor': row_bg, 'borderBottom': '1px solid #1a1a3e'}))
+
+    # 表头
+    header = html.Tr([
+        html.Th('品种对', style={'width': '130px'}),
+        html.Th('r', style={'width': '45px', 'textAlign': 'center'}),
+        html.Th('Z-Score', style={'width': '80px', 'textAlign': 'center'}),
+        html.Th('趋势', style={'width': '40px', 'textAlign': 'center'}),
+        html.Th('状态', style={'width': '50px', 'textAlign': 'center'}),
+        html.Th('偏向', style={'width': '80px', 'textAlign': 'center'}),
+        html.Th('价格A/B', style={'width': '100px', 'textAlign': 'center'}),
+        html.Th('时间', style={'width': '70px', 'textAlign': 'right'}),
+    ], style={'backgroundColor': '#1a1a3e', 'color': '#bb86fc', 'fontSize': '12px'})
+
+    table = html.Table(
+        [html.Thead(header), html.Tbody(rows)],
+        style={'width': '100%', 'borderCollapse': 'collapse', 'fontSize': '13px'})
+
+    # 统计摘要
+    summary = f'{n_extreme}个偏离  {n_ok}个正常  {n_fail}个无数据'
+
+    panel = html.Div([
+        html.Div([
+            html.Span('价差Z-Score监控', style={
+                'color': '#bb86fc', 'fontSize': '15px', 'fontWeight': 'bold'}),
+            html.Span(f'  {summary}', style={'color': '#666', 'fontSize': '12px'}),
+            html.Span('  |Z|≥2偏离  1.5警戒  1.0注意  <1正常', style={
+                'color': '#444', 'fontSize': '11px', 'marginLeft': '15px'}),
+        ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
+        html.Div(table, style={'padding': '5px 25px'}),
+        html.Div([
+            html.Span('滚动窗口120分钟 | B030: Z>2后30分钟90%+回归 | '
+                       'B031: 配对交易毛利可观但成本不可行',
+                       style={'color': '#444', 'fontSize': '11px'}),
+        ], style={'padding': '8px 25px', 'borderTop': '1px solid #1a1a3e'}),
+    ])
+
+    return panel
 
 
 NEWS_CACHE = os.path.expanduser('~/Scripts/news_cache.md')
 NEWS_FETCHER = os.path.expanduser('~/Scripts/news_auto_fetch.py')
-NEWS_MAX_AGE = 3 * 3600  # 3小时过期
 
 
 def _news_cache_age():
@@ -3101,19 +4610,23 @@ def _news_cache_age():
     return time.time() - os.path.getmtime(NEWS_CACHE)
 
 
-def _auto_refresh_news():
-    """如果缓存超过3小时，后台自动刷新"""
-    age = _news_cache_age()
-    if age > NEWS_MAX_AGE:
+def _news_hourly_fetcher():
+    """后台线程: 每整点自动运行 news_auto_fetch.py"""
+    import subprocess
+    while True:
+        now = datetime.now()
+        # 计算到下一个整点的秒数
+        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        wait = (next_hour - now).total_seconds()
+        time.sleep(wait)
+        # 整点到了，执行抓取
         try:
-            import subprocess
-            subprocess.Popen(
+            subprocess.run(
                 ['/usr/bin/python3', NEWS_FETCHER],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=60)
         except Exception:
             pass
-        return True  # 正在刷新
-    return False
 
 
 def _render_news_content():
@@ -3127,17 +4640,31 @@ def _render_news_content():
     except Exception:
         return '', '读取失败', None
 
-    updated = ''
+    # 跳过内嵌时间戳行（不可靠），统一用文件mtime
     if content.startswith('<!-- updated:'):
-        first_line = content.split('\n', 1)[0]
-        updated = first_line.replace('<!-- updated:', '').replace('-->', '').strip()
         content = content.split('\n', 1)[1] if '\n' in content else ''
+    # 用文件修改时间作为唯一时间来源
+    mtime = os.path.getmtime(NEWS_CACHE)
+    updated = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
 
     if not content.strip():
         return '', updated, None
 
+    # 分离自动抓取内容和 /news 分析区块
+    analysis_marker = '<!-- ANALYSIS -->'
+    main_content = content
+    analysis_content = ''
+    if analysis_marker in content:
+        idx = content.index(analysis_marker)
+        main_content = content[:idx]
+        analysis_content = content[idx + len(analysis_marker):]
+        # 去掉结束标记
+        end_marker = '<!-- /ANALYSIS -->'
+        if end_marker in analysis_content:
+            analysis_content = analysis_content[:analysis_content.index(end_marker)]
+
     lines = []
-    for line in content.split('\n'):
+    for line in main_content.split('\n'):
         stripped = line.strip()
         if stripped.startswith('## '):
             lines.append(html.H3(stripped[3:], style={
@@ -3149,6 +4676,34 @@ def _render_news_content():
         elif stripped:
             lines.append(html.Div(stripped, style={
                 'color': '#ddd', 'fontSize': '13px', 'lineHeight': '1.6', 'margin': '2px 0'}))
+
+    # 渲染 /news 分析区块（交易提示等）
+    if analysis_content.strip():
+        lines.append(html.Hr(style={'borderColor': '#4fc3f7', 'margin': '16px 0'}))
+        for line in analysis_content.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith('## '):
+                lines.append(html.H3(stripped[3:], style={
+                    'color': '#ff9800', 'margin': '14px 0 6px', 'fontSize': '15px',
+                    'borderBottom': '1px solid #3a2a1a', 'paddingBottom': '4px'}))
+            elif stripped.startswith('**') and stripped.endswith('**'):
+                lines.append(html.Div(stripped.strip('*'), style={
+                    'color': '#FFD700', 'fontWeight': 'bold', 'fontSize': '13px', 'margin': '6px 0'}))
+            elif stripped.startswith('- ') or stripped.startswith('* '):
+                lines.append(html.Div('• ' + stripped[2:], style={
+                    'color': '#e0e0e0', 'fontSize': '13px', 'lineHeight': '1.6',
+                    'margin': '2px 0', 'paddingLeft': '12px'}))
+            elif any(stripped.startswith(c) for c in ['⚠️', '⚡', '📊', '🔥', '🎯', '🤖']):
+                lines.append(html.Div(stripped, style={
+                    'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '13px',
+                    'margin': '8px 0', 'padding': '6px 10px',
+                    'backgroundColor': 'rgba(255,152,0,0.1)', 'borderRadius': '4px',
+                    'borderLeft': '3px solid #ff9800'}))
+            else:
+                lines.append(html.Div(stripped, style={
+                    'color': '#ddd', 'fontSize': '13px', 'lineHeight': '1.6', 'margin': '2px 0'}))
 
     body = html.Div(lines, style={
         'padding': '10px 25px', 'maxHeight': '70vh', 'overflowY': 'auto'})
@@ -3162,22 +4717,15 @@ def _render_news_content():
     prevent_initial_call=True,
 )
 def toggle_news(n_clicks):
-    """切换资讯面板显示/隐藏，缓存超过3小时自动刷新"""
+    """切换资讯面板显示/隐藏（数据来源: /news技能 或 整点自动采集）"""
     if not n_clicks or n_clicks % 2 == 0:
         return no_update, {'display': 'none'}
-
-    # 检查是否需要刷新
-    refreshing = _auto_refresh_news()
 
     content, updated, body = _render_news_content()
 
     if body is None:
-        if refreshing:
-            body = html.Div('正在自动抓取最新资讯，请稍后再点...',
-                             style={'color': '#4fc3f7', 'padding': '30px', 'textAlign': 'center'})
-        else:
-            body = html.Div('暂无资讯缓存。请在 Claude Code 中运行 /news 生成资讯。',
-                             style={'color': '#888', 'padding': '30px', 'textAlign': 'center'})
+        body = html.Div('暂无资讯。数据来源: /news技能手动更新 或 整点自动采集。',
+                         style={'color': '#888', 'padding': '30px', 'textAlign': 'center'})
 
     age = _news_cache_age()
     age_text = ''
@@ -3193,13 +4741,11 @@ def toggle_news(n_clicks):
     if age_text:
         header_text += f' ({age_text})'
 
-    refresh_note = '  (已触发自动刷新)' if refreshing else ''
-
     panel = html.Div([
         html.Div([
             html.Span('每日资讯', style={'color': '#4fc3f7', 'fontSize': '15px', 'fontWeight': 'bold'}),
             html.Span(f'  {header_text}', style={'color': '#666', 'fontSize': '12px'}),
-            html.Span(refresh_note, style={'color': '#00FF88', 'fontSize': '11px'}),
+            html.Span('  整点自动更新 | /news手动更新', style={'color': '#444', 'fontSize': '11px'}),
         ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
         body,
     ])
@@ -3249,129 +4795,1135 @@ def toggle_vrp(n_clicks):
     prevent_initial_call=True,
 )
 def toggle_plan(n_clicks):
-    """今日交易计划面板"""
+    """今日交易计划面板 — 8维度综合评分实时计算版"""
     if not n_clicks or n_clicks % 2 == 0:
         return no_update, {'display': 'none'}
 
-    plan_path = os.path.join(os.path.dirname(__file__), 'trading_plan_data.json')
+    import math
+    # 从CTP dashboard读取实际账户权益，未连接时回退50万
+    _dash = _load_dashboard()
+    _acc = _dash.get('account') if _dash else None
+    account = _acc.get('balance', 500000) if _acc and _acc.get('balance', 0) > 0 else 500000
+    _acc_source = 'CTP' if _acc and _acc.get('balance', 0) > 0 else '默认'
+    today_d = datetime.now().date()
+    today_str = today_d.strftime('%Y-%m-%d')
+    now_time = datetime.now().strftime('%H:%M')
+    weekday = datetime.now().weekday()  # 0=Mon, 4=Fri
+
+    # === 1. 遍历v6品种，计算DTE，匹配桶 ===
+    matched = []
+    for prod, info in _V6_CONFIG.items():
+        ex = info['ex']
+        months = info.get('months', list(range(1, 13)))
+        for mo_off in range(0, 8):
+            yr, mo = today_d.year, today_d.month + mo_off
+            if mo > 12:
+                yr += 1; mo -= 12
+            if mo not in months:
+                continue
+            exp = _official_expiry(ex, yr, mo, _trading_cal, product_code=prod.upper())
+            if not exp:
+                continue
+            dte = (exp - today_d).days
+            if dte < 1 or dte > 200:
+                continue
+            for bname, blo, bhi in _DTE_RANGES:
+                if blo <= dte <= bhi and bname in info:
+                    params = info[bname]
+                    contract = f'{prod}{yr % 100:02d}{mo:02d}'
+                    matched.append({
+                        'prod': prod, 'name': info['name'], 'ex': ex,
+                        'contract': contract, 'dte': dte, 'bucket': bname,
+                        'sharpe': params['sharpe'], 'wr': params['wr'],
+                        'entry': params['entry'], 'tp': params['tp'],
+                        'sl': params['sl'], 'n': params['n'],
+                    })
+                    break
+
+    # === 2. 查DB: 期货价格 + 期货日K线(用于近期波动计算) ===
+    db = get_db()
+    cur = db.cursor()
+    three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d 00:00:00')
+    twenty_days_ago = (datetime.now() - timedelta(days=25)).strftime('%Y-%m-%d 00:00:00')
+
+    # 最新价格
+    cur.execute("""SELECT b.symbol, b.close_price FROM dbbardata b
+        INNER JOIN (SELECT symbol, MAX(datetime) as max_dt FROM dbbardata
+            WHERE datetime >= ? GROUP BY symbol) m
+        ON b.symbol = m.symbol AND b.datetime = m.max_dt
+    """, (three_days_ago,))
+    px_cache = {sym: px for sym, px in cur.fetchall() if px and px > 0}
+
+    # 日级高低收(用于ATR计算) — 从1min聚合日K
+    cur.execute("""SELECT symbol, DATE(datetime) as d,
+        MAX(close_price) as high, MIN(close_price) as low, MAX(close_price) as close
+        FROM dbbardata WHERE datetime >= ? AND close_price > 0
+        GROUP BY symbol, DATE(datetime)
+        ORDER BY symbol, d""", (twenty_days_ago,))
+    daily_bars = {}  # {symbol: [(date, high, low, close), ...]}
+    for sym, d, h, l, c in cur.fetchall():
+        daily_bars.setdefault(sym, []).append((d, h, l, c))
+
+    # === 3. VRP信号 ===
+    vrp_data = {}
     try:
-        with open(plan_path) as f:
-            plan_data = json.load(f)
-    except Exception as e:
-        return html.Div(f'加载失败: {e}', style={'color': '#f44', 'padding': '20px'}), {
-            'display': 'block', 'backgroundColor': '#111827',
-            'borderBottom': '3px solid #ff9800', 'marginBottom': '5px'}
+        vrp_results = scan_vrp()
+        for i, r in enumerate(vrp_results):
+            vrp_data[r['product']] = {
+                'rank': i + 1, 'vrp': r['vrp'], 'iv': r['iv'], 'rv': r['rv'],
+                'vrp_pct': r.get('vrp_pct', 0),
+            }
+    except Exception:
+        pass
 
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    day_plan = plan_data.get('days', {}).get(today_str)
+    # === 4. 新闻/经济日历 — 品种事件检测 ===
+    _NEWS_KEYWORDS = {
+        'AU': ['黄金','gold','贵金属'], 'AG': ['白银','silver','贵金属'],
+        'CU': ['铜','copper'], 'AL': ['铝','alumin'], 'ZN': ['锌','zinc'],
+        'NI': ['镍','nickel'], 'SN': ['锡','tin'],
+        'SC': ['原油','crude','oil','能源'], 'FU': ['燃油','fuel'],
+        'P': ['棕榈','palm'], 'Y': ['豆油','soy oil'], 'OI': ['菜油','rapeseed'],
+        'M': ['豆粕','soybean meal'], 'RM': ['菜粕','rapeseed meal'],
+        'CF': ['棉花','cotton'], 'SR': ['白糖','sugar'],
+        'RU': ['橡胶','rubber'], 'SA': ['纯碱','soda ash'],
+        'FG': ['玻璃','glass'], 'MA': ['甲醇','methanol'],
+        'TA': ['PTA','聚酯'], 'EB': ['苯乙烯','styrene'],
+        'I': ['铁矿','iron ore'], 'RB': ['螺纹','rebar'],
+        'LC': ['碳酸锂','lithium'], 'SI': ['工业硅','silicon'],
+    }
+    news_affected = set()  # 今日有新闻提及的品种
+    try:
+        if os.path.exists(NEWS_CACHE):
+            with open(NEWS_CACHE, 'r', encoding='utf-8') as f:
+                news_text = f.read().lower()
+            for prod, keywords in _NEWS_KEYWORDS.items():
+                if any(kw.lower() in news_text for kw in keywords):
+                    news_affected.add(prod)
+    except Exception:
+        pass
 
-    if not day_plan:
-        # 找最近的有数据的交易日
-        from datetime import timedelta as _td
-        for delta in range(1, 8):
-            alt = (datetime.now() - _td(days=delta)).strftime('%Y-%m-%d')
-            if alt in plan_data.get('days', {}):
-                day_plan = plan_data['days'][alt]
-                today_str = alt + ' (最近交易日)'
-                break
+    # 经济日历
+    eco_affected = set()  # 今日有经济事件影响的品种
+    try:
+        eco_path = os.path.join(os.path.dirname(__file__), 'economic_calendar.json')
+        if os.path.exists(eco_path):
+            with open(eco_path) as f:
+                eco_cal = json.load(f)
+            for evt in eco_cal.get('events', []):
+                if evt.get('date') == today_str and evt.get('level') == 'high':
+                    affects = evt.get('affects', [])
+                    if 'all' in affects:
+                        eco_affected.update(_V6_CONFIG.keys())
+                    else:
+                        eco_affected.update(a.upper() for a in affects)
+    except Exception:
+        pass
 
-    if not day_plan:
-        return html.Div('今日无交易计划数据', style={'color': '#888', 'padding': '20px'}), {
-            'display': 'block', 'backgroundColor': '#111827',
-            'borderBottom': '3px solid #ff9800', 'marginBottom': '5px'}
+    # === 5. 计算近期波动因子(ATR ratio) ===
+    def _calc_atr_ratio(sym):
+        """近3天ATR / 20天ATR, <1表示近期平静"""
+        bars = daily_bars.get(sym, [])
+        if len(bars) < 5:
+            return 1.0  # 数据不足，中性
+        # 计算True Range (简化: high - low)
+        trs = [h - l for _, h, l, c in bars if h > l]
+        if len(trs) < 5:
+            return 1.0
+        atr_3 = sum(trs[-3:]) / min(3, len(trs[-3:]))
+        atr_20 = sum(trs) / len(trs)
+        if atr_20 <= 0:
+            return 1.0
+        return atr_3 / atr_20
 
-    account = plan_data.get('account', 500000)
-    picks = day_plan.get('picks', [])
+    # === 6. 综合评分 + 保证金 ===
+    picks = []
+    for m in matched:
+        prod, ex = m['prod'], m['ex']
+        _yymm = re.search(r'(\d{3,4})$', m['contract'])
+        if not _yymm:
+            continue
+        digits = _yymm.group(1)
+        fut_sym = f'{prod.upper()}{digits[-3:]}' if ex == 'CZCE' else f'{prod.lower()}{digits}'
+        fut_px = px_cache.get(fut_sym)
+        if not fut_px:
+            continue
 
-    # 构建表格
-    header = html.Tr([
-        html.Th('', style={'width': '30px'}),
-        html.Th('品种', style={'width': '80px'}),
-        html.Th('合约', style={'width': '80px'}),
-        html.Th('DTE', style={'width': '50px', 'textAlign': 'center'}),
-        html.Th('DTE桶', style={'width': '60px', 'textAlign': 'center'}),
-        html.Th('手数', style={'width': '50px', 'textAlign': 'center'}),
-        html.Th('保证金', style={'width': '80px', 'textAlign': 'right'}),
-        html.Th('占比', style={'width': '50px', 'textAlign': 'center'}),
-        html.Th('桶Sharpe', style={'width': '70px', 'textAlign': 'center'}),
-        html.Th('桶胜率', style={'width': '60px', 'textAlign': 'center'}),
-        html.Th('桶PnL', style={'width': '60px', 'textAlign': 'center'}),
-        html.Th('回测Sharpe', style={'width': '80px', 'textAlign': 'center'}),
-        html.Th('瓶颈额(万)', style={'width': '80px', 'textAlign': 'right'}),
-    ], style={'backgroundColor': '#1a1a3e', 'color': '#4fc3f7', 'fontSize': '12px'})
+        # 保证金
+        mult = _MULTIPLIER.get(prod, 10)
+        mgn_rate = _MARGIN_RATE.get(prod, 0.10)
+        margin_per_lot = fut_px * mult * mgn_rate
+        if margin_per_lot <= 0:
+            continue
 
-    rows = []
-    for i, p in enumerate(picks):
-        is_opt = p.get('is_optimal', False)
-        opt_mark = '★' if is_opt else ''
-        row_bg = '#1a2a1a' if is_opt else '#0d1117'
-        dte = p.get('dte', 0)
-        dte_color = '#f44336' if dte <= 5 else '#ff9800' if dte <= 10 else '#4caf50'
+        # --- 8维度评分 ---
+        base_sharpe = m['sharpe']  # [1] V6 Sharpe (5-43)
 
-        b_sh = p.get('b_sharpe', 0)
-        sh_color = '#00e676' if b_sh >= 1.0 else '#4fc3f7' if b_sh >= 0.5 else '#ff9800' if b_sh >= 0 else '#f44336'
+        # [2] VRP因子
+        vrp_info = vrp_data.get(prod)
+        if vrp_info and vrp_info['rank'] <= 3:
+            vrp_factor = 1.3
+            vrp_label = f"Top{vrp_info['rank']}"
+        elif vrp_info and vrp_info['rank'] <= 10:
+            vrp_factor = 1.1
+            vrp_label = f"#{vrp_info['rank']}"
+        elif vrp_info:
+            vrp_factor = 1.0
+            vrp_label = f"#{vrp_info['rank']}"
+        else:
+            vrp_factor = 0.9  # 无VRP数据轻微降权
+            vrp_label = '-'
 
-        b_wr = p.get('b_wr', 0)
-        wr_color = '#00e676' if b_wr >= 0.85 else '#4fc3f7' if b_wr >= 0.7 else '#ff9800'
+        # [3] 新闻/事件因子
+        has_news = prod in news_affected
+        has_eco = prod in eco_affected
+        if has_eco:
+            news_factor = 0.5   # 高级经济事件→大幅降权
+            news_label = '经济事件'
+        elif has_news:
+            news_factor = 0.7   # 有新闻提及→适度降权
+            news_label = '有新闻'
+        else:
+            news_factor = 1.0
+            news_label = '平静'
 
-        b_pnl = p.get('b_pnl', 0)
-        pnl_color = '#00e676' if b_pnl > 0.1 else '#4fc3f7' if b_pnl > 0 else '#f44336'
+        # [4] 近期波动因子
+        atr_ratio = _calc_atr_ratio(fut_sym)
+        if atr_ratio < 0.8:
+            vol_factor = 1.2    # 近期平静→卖方友好
+            vol_label = '平静'
+        elif atr_ratio <= 1.2:
+            vol_factor = 1.0
+            vol_label = '正常'
+        else:
+            vol_factor = 0.7    # 近期波动大→降权
+            vol_label = '波动'
 
-        liq = p.get('liq_wan', 0)
-        liq_color = '#00e676' if liq >= 1000 else '#ff9800' if liq >= 100 else '#f44336'
+        # [5] 流动性(期货日成交量)
+        bars = daily_bars.get(fut_sym, [])
+        # 无法从聚合日K直接得到日成交量，用bar数近似(每天约240根1min bar)
+        recent_bars = len([b for b in bars if b[0] >= (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')])
+        if recent_bars >= 600:      # ~2.5天×240bar
+            liq_factor = 1.0
+            liq_label = '充足'
+        elif recent_bars >= 200:
+            liq_factor = 0.85
+            liq_label = '一般'
+        else:
+            liq_factor = 0.7
+            liq_label = '薄'
 
-        rows.append(html.Tr([
-            html.Td(opt_mark, style={'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '16px'}),
-            html.Td(f"{p.get('ex','')}.{p.get('prod','')}", style={'color': '#fff', 'fontWeight': 'bold'}),
-            html.Td(p.get('contract', ''), style={'color': '#aaa'}),
-            html.Td(str(dte), style={'textAlign': 'center', 'color': dte_color, 'fontWeight': 'bold'}),
-            html.Td(p.get('bucket', ''), style={'textAlign': 'center', 'color': '#aaa'}),
-            html.Td(str(p.get('lots', 0)), style={'textAlign': 'center', 'color': '#fff', 'fontWeight': 'bold', 'fontSize': '15px'}),
-            html.Td(f"{p.get('margin', 0):,.0f}", style={'textAlign': 'right', 'color': '#4fc3f7'}),
-            html.Td(f"{p.get('pct', 0):.0%}", style={'textAlign': 'center', 'color': '#aaa'}),
-            html.Td(f"{b_sh:.2f}", style={'textAlign': 'center', 'color': sh_color, 'fontWeight': 'bold'}),
-            html.Td(f"{b_wr:.0%}", style={'textAlign': 'center', 'color': wr_color}),
-            html.Td(f"{b_pnl:+.1%}", style={'textAlign': 'center', 'color': pnl_color}),
-            html.Td(f"{p.get('bt_sharpe', 0):.3f}", style={'textAlign': 'center', 'color': '#aaa'}),
-            html.Td(f"{liq:,.0f}", style={'textAlign': 'right', 'color': liq_color}),
-        ], style={'backgroundColor': row_bg, 'borderBottom': '1px solid #1a1a3e'}))
+        # [6] 周度效应 (B018/B019)
+        if weekday == 4 and prod == 'P' and m['dte'] <= 7:
+            wday_factor = 1.3   # 周五+P+DTE≤7 特别加分
+            wday_label = '周五P★'
+        elif weekday == 4:
+            wday_factor = 1.05  # 周五略加(周末theta)
+            wday_label = '周五'
+        else:
+            wday_factor = 1.0
+            wday_label = ''
 
-    total_mgn = day_plan.get('total_margin', 0)
-    n_opt = day_plan.get('n_optimal', 0)
+        # [7] DTE甜蜜区: 在品种最优桶=1.0, 非最优桶=0.85
+        # (每品种可能有多个桶匹配，最高Sharpe的桶为最优)
+        _prod_cfg = _V6_CONFIG.get(prod, {})
+        prod_best_sharpe = max((_prod_cfg[bn]['sharpe'] for bn, _, _ in _DTE_RANGES
+                                if bn in _prod_cfg),
+                               default=base_sharpe)
+        dte_sweet = 1.0 if base_sharpe >= prod_best_sharpe else 0.85
 
-    summary_row = html.Tr([
+        # [8] 胜率加权: 高胜率品种更可靠
+        wr_factor = 0.85 + 0.15 * (m['wr'] / 100.0)  # 80%→0.97, 95%→0.99, 100%→1.0
+
+        # === 综合分 ===
+        composite = (base_sharpe * vrp_factor * news_factor * vol_factor
+                     * liq_factor * wday_factor * dte_sweet * wr_factor)
+
+        m.update({
+            'fut_px': fut_px, 'fut_sym': fut_sym,
+            'margin_per_lot': margin_per_lot,
+            'composite': composite,
+            'vrp_factor': vrp_factor, 'vrp_label': vrp_label,
+            'news_factor': news_factor, 'news_label': news_label,
+            'vol_factor': vol_factor, 'vol_label': vol_label, 'atr_ratio': atr_ratio,
+            'liq_factor': liq_factor, 'liq_label': liq_label,
+            'wday_factor': wday_factor, 'wday_label': wday_label,
+            'dte_sweet': dte_sweet, 'wr_factor': wr_factor,
+        })
+        picks.append(m)
+
+    # 按综合分降序
+    picks.sort(key=lambda x: x['composite'], reverse=True)
+
+    # === 时段过滤：只显示当前可交易的品种+入场方式 ===
+    session_label, night_only = _get_session_context()
+    all_picks_count = len(picks)
+    if night_only:
+        # 晚间：品种必须有夜盘 AND 入场方式必须是 night_*
+        picks = [p for p in picks
+                 if p['prod'].upper() not in _NO_NIGHT_SESSION
+                 and str(p.get('entry', '')).startswith('night')]
+    filtered_count = all_picks_count - len(picks)
+
+    # 标记每品种最优合约
+    seen_prods = set()
+    for p in picks:
+        if p['prod'] not in seen_prods:
+            p['is_best'] = True
+            seen_prods.add(p['prod'])
+        else:
+            p['is_best'] = False
+
+    # === 仓位分配（全局预算约束） ===
+    budget = account * 0.6  # 总资金60%为可用预算
+    per_prod_cap = account * 0.05  # 单品种上限5%
+    remaining = budget
+    for p in picks:
+        if remaining <= 0:
+            p['lots'] = 0
+            p['total_margin'] = 0
+            p['pct'] = 0
+            continue
+        mgn = p['margin_per_lot']
+        if mgn <= 0:
+            p['lots'] = 0
+            p['total_margin'] = 0
+            p['pct'] = 0
+            continue
+        max_lots_budget = int(remaining / mgn)
+        max_lots_cap = max(1, int(per_prod_cap / mgn))
+        lots = min(max_lots_budget, max_lots_cap)
+        lots = max(lots, 0)
+        p['lots'] = lots
+        p['total_margin'] = mgn * lots
+        p['pct'] = p['total_margin'] / account
+        remaining -= p['total_margin']
+
+    # 评分说明
+    factor_desc = []
+    n_vrp = sum(1 for p in picks if p['vrp_factor'] >= 1.1)
+    n_news = sum(1 for p in picks if p['news_factor'] < 1.0)
+    n_calm = sum(1 for p in picks if p['vol_factor'] >= 1.2)
+    factor_desc.append(f'VRP加分{n_vrp}个')
+    if n_news:
+        factor_desc.append(f'新闻降权{n_news}个')
+    if n_calm:
+        factor_desc.append(f'近期平静{n_calm}个')
+    if weekday == 4:
+        factor_desc.append('周五效应')
+
+    plan_sections = []
+    filter_note = f'  已过滤{filtered_count}个非当前时段品种' if filtered_count > 0 else ''
+
+    # === 日内OTM宽跨卖出 — v6参数查表 (引用模块级 _V6_CONFIG) ===
+    _v6 = _V6_CONFIG
+    _entry_labels = _ENTRY_LABELS
+    _dte_ranges = _DTE_RANGES
+
+    # 计算各品种当前DTE → 匹配最优参数
+    today_d_v6 = datetime.now().date()
+    _get_exp = _official_expiry
+    _cal_v6 = _trading_cal
+
+    matched = []  # [(品种code, 中文, 交易所, 合约, DTE, DTE桶, params_dict)]
+    for prod, info in _v6.items():
+        ex = info['ex']
+        months = info.get('months', list(range(1, 13)))
+        for mo_off in range(0, 8):
+            yr, mo = today_d_v6.year, today_d_v6.month + mo_off
+            if mo > 12:
+                yr += 1; mo -= 12
+            if mo not in months:
+                continue
+            exp = _get_exp(ex, yr, mo, _cal_v6, product_code=prod.upper())
+            if not exp:
+                continue
+            dte = (exp - today_d_v6).days
+            if dte < 1 or dte > 200:
+                continue
+            # 找匹配的DTE桶
+            for bucket_name, blo, bhi in _dte_ranges:
+                if blo <= dte <= bhi and bucket_name in info:
+                    params = info[bucket_name]
+                    contract = f'{prod}{yr % 100:02d}{mo:02d}'
+                    matched.append((prod, info['name'], ex, contract, dte, bucket_name,
+                                    params['sharpe'], params['wr'], params['entry'],
+                                    params['tp'], params['sl'], params['n']))
+                    break
+
+    # 按Sharpe降序排列
+    matched.sort(key=lambda x: x[6], reverse=True)
+
+    # === 实时行情增强：查DB找ATM期权对，过滤出可交易机会 ===
+    db = get_db()
+    cur = db.cursor()
+
+    # 批量获取所有期权合约最新价格和成交量
+    cur.execute("""SELECT b.symbol, b.close_price, b.volume FROM dbbardata b
+        INNER JOIN (SELECT symbol, MAX(datetime) as max_dt FROM dbbardata
+            WHERE datetime >= ? AND NOT (
+                (CAST(substr(datetime,12,2) AS INTEGER) = 15 AND CAST(substr(datetime,15,2) AS INTEGER) >= 5)
+                OR (CAST(substr(datetime,12,2) AS INTEGER) BETWEEN 16 AND 19)
+                OR (CAST(substr(datetime,12,2) AS INTEGER) = 20 AND CAST(substr(datetime,15,2) AS INTEGER) < 55))
+            GROUP BY symbol) m ON b.symbol = m.symbol AND b.datetime = m.max_dt
+    """, ((datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d 00:00:00'),))
+    _px_cache = {}
+    for sym, px, vol in cur.fetchall():
+        _px_cache[sym] = (px, vol or 0)
+
+    actionable = []  # 可交易的机会
+    for prod, cn, ex, contract, dte, bucket, sharpe, wr, entry, tp, sl, n in matched:
+        # 查期货价格（CZCE用3位月份大写，其他用4位月份小写）
+        # contract='CF2604' → yymm='2604'
+        _yymm = re.search(r'(\d{3,4})$', contract)
+        if not _yymm:
+            continue
+        _digits = _yymm.group(1)
+        if ex == 'CZCE':
+            # CZCE: CF604 (1位年+2位月)
+            fut_sym = f'{prod.upper()}{_digits[-3:]}'
+        else:
+            # 其他: ag2604 (小写+4位)
+            fut_sym = f'{prod.lower()}{_digits}'
+        fut_px_row = _px_cache.get(fut_sym)
+        if not fut_px_row or fut_px_row[0] <= 0:
+            continue
+        fut_px = fut_px_row[0]
+
+        # 找所有该合约的Call和Put
+        # 生成月份匹配集合（兼容CZCE 3位 vs 其他4位格式）
+        # contract = 'CF2604' → 匹配 '2604' 和 '604'
+        contract_mo4 = contract[-4:]  # '2604'
+        contract_mo3 = contract[-3:]  # '604'
+        valid_months = {contract_mo4, contract_mo3}
+
+        calls, puts = [], []
+        for sym, (px, vol) in _px_cache.items():
+            parsed = _parse_contract(sym)
+            if not parsed:
+                continue
+            p, mo, opt_type, strike = parsed
+            if p != prod.upper():
+                continue
+            if mo not in valid_months:
+                continue
+            if px <= 0:
+                continue
+            if opt_type == 'C':
+                calls.append((sym, px, vol, strike))
+            elif opt_type == 'P':
+                puts.append((sym, px, vol, strike))
+
+        if not calls or not puts:
+            continue
+
+        # OTM宽跨：Call行权价>期货价(虚值)，Put行权价<期货价(虚值)
+        otm_calls = [(s, p, v, k) for s, p, v, k in calls if k > fut_px and p > 0]
+        otm_puts = [(s, p, v, k) for s, p, v, k in puts if k < fut_px and p > 0]
+
+        if not otm_calls or not otm_puts:
+            continue
+
+        # 按虚值度排序（离期货价从近到远）
+        otm_calls.sort(key=lambda x: x[3] - fut_px)
+        otm_puts.sort(key=lambda x: fut_px - x[3])
+
+        # 搜索最优宽跨对（近虚值前10档 × 前10档）
+        best_pair = None
+        for c_sym, c_px, c_vol, c_k in otm_calls[:10]:
+            for p_sym, p_px, p_vol, p_k in otm_puts[:10]:
+                if c_px <= 0 or p_px <= 0:
+                    continue
+                psum = c_px + p_px
+                if psum < 4:
+                    continue  # 权利金太低，手续费占比过大
+                ratio = max(c_px, p_px) / min(c_px, p_px)
+                # 行权价虚值度
+                c_otm_pct = (c_k - fut_px) / fut_px
+                p_otm_pct = (fut_px - p_k) / fut_px
+                if c_otm_pct < 0.02 or p_otm_pct < 0.02:
+                    continue  # 太接近ATM，不是宽跨
+                if c_otm_pct > 0.15 or p_otm_pct > 0.15:
+                    continue  # 太深度虚值
+                total_vol = c_vol + p_vol
+                # === 评分：价格对称 × 成交额 × 最低权利金 ===
+                import math as _math
+                # 1. 价格对称性：两腿权利金越接近越好
+                if ratio > 2.5:
+                    continue
+                price_sym = max(0, 1.0 - (ratio - 1.0) * 0.6)  # 1.0→1.0, 1.5→0.7, 2.0→0.4
+                # 2. 瓶颈腿成交额
+                _min_to = min(c_px * c_vol, p_px * p_vol)
+                vol_score = max(0, min((_math.log10(max(_min_to, 10)) - 4.0) / 1.1, 1.0))
+                # 3. 单腿最低权利金
+                min_px_score = 1.0 if min(c_px, p_px) >= 4 else 0.5 if min(c_px, p_px) >= 2 else 0.1
+                composite = sharpe * price_sym * (0.15 + 0.85 * vol_score) * min_px_score
+                if best_pair is None or composite > best_pair['composite']:
+                    best_pair = {
+                        'prod': prod, 'cn': cn, 'ex': ex, 'contract': contract,
+                        'dte': dte, 'bucket': bucket, 'sharpe': sharpe, 'wr': wr,
+                        'entry': entry, 'tp': tp, 'sl': sl, 'n': n,
+                        'call_sym': c_sym, 'put_sym': p_sym,
+                        'call_px': c_px, 'put_px': p_px,
+                        'call_k': c_k, 'put_k': p_k,
+                        'call_vol': c_vol, 'put_vol': p_vol,
+                        'fut_px': fut_px, 'psum': psum, 'ratio': ratio,
+                        'total_vol': total_vol, 'composite': composite,
+                    }
+        if best_pair:
+            # 计算正确的期权卖出保证金
+            _mult = _MULTIPLIER.get(best_pair['prod'], 10)
+            _mgn_r = _MARGIN_RATE.get(best_pair['prod'], 0.10)
+            _margin = _calc_strangle_margin(
+                best_pair['call_px'], best_pair['put_px'],
+                best_pair['call_k'], best_pair['put_k'],
+                best_pair['fut_px'], _mult, _mgn_r)
+            best_pair['margin_per_lot'] = _margin
+            best_pair['mult'] = _mult
+            actionable.append(best_pair)
+
+    # 按综合得分排序，取前20
+    actionable.sort(key=lambda x: x['composite'], reverse=True)
+    # 时段过滤：与上面的8维度表保持一致（品种+入场方式双重过滤）
+    if night_only:
+        actionable = [a for a in actionable
+                      if a['prod'].upper() not in _NO_NIGHT_SESSION
+                      and str(a.get('entry', '')).startswith('night')]
+    top_picks = actionable[:20]
+
+    # 计算建议手数和总保证金（全局预算约束）
+    _otm_budget = account * 0.6
+    _otm_per_cap = account * 0.05
+    _otm_remaining = _otm_budget
+    _otm_total_margin = 0
+    for p in top_picks:
+        mgn = p['margin_per_lot']
+        if mgn <= 0 or _otm_remaining <= 0:
+            p['lots'] = 0
+            p['total_margin'] = 0
+            continue
+        max_budget = int(_otm_remaining / mgn)
+        max_cap = max(1, int(_otm_per_cap / mgn))
+        p['lots'] = min(max_budget, max_cap)
+        p['total_margin'] = mgn * p['lots']
+        _otm_remaining -= p['total_margin']
+        _otm_total_margin += p['total_margin']
+
+    # 存入全局变量，供智能推荐使用
+    global _v6_recommended_pairs
+    _v6_recommended_pairs = top_picks
+
+    # === 统一交易计划：合并8D评分 + 实际期权对 + 信念标签 ===
+    # 8D分数查询表
+    pick_lookup = {}
+    for p in picks:
+        key = (p['prod'], p['contract'])
+        if key not in pick_lookup:
+            pick_lookup[key] = p
+
+    # 信念系统标签
+    belief_tags = {}  # (prod, contract) -> [tag_strings]
+    for p in picks:
+        prod_upper = p['prod'].upper()
+        key = (p['prod'], p['contract'])
+        dte = p.get('dte', 999)
+        if weekday == 4 and prod_upper == 'P' and dte <= 7:
+            belief_tags.setdefault(key, []).append('B018周五')
+        if prod_upper == 'AO' and 5 <= dte <= 19:
+            belief_tags.setdefault(key, []).append('B038夜Scalp')
+        if prod_upper == 'CF' and 30 <= dte <= 60:
+            belief_tags.setdefault(key, []).append('B021')
+        if prod_upper == 'SA' and 25 <= dte <= 60:
+            belief_tags.setdefault(key, []).append('B021')
+
+    # 合并: actionable + 8D分数 + 信念标签
+    unified = []
+    for a in top_picks:
+        key = (a['prod'], a['contract'])
+        pd8 = pick_lookup.get(key, {})
+        u = {**a}
+        u['composite_8d'] = pd8.get('composite', a.get('sharpe', 0))
+        u['vrp_label'] = pd8.get('vrp_label', '-')
+        u['vrp_factor'] = pd8.get('vrp_factor', 1.0)
+        u['news_label'] = pd8.get('news_label', '平静')
+        u['news_factor'] = pd8.get('news_factor', 1.0)
+        u['vol_label'] = pd8.get('vol_label', '正常')
+        u['vol_factor'] = pd8.get('vol_factor', 1.0)
+        u['liq_label'] = pd8.get('liq_label', '-')
+        u['wday_label'] = pd8.get('wday_label', '')
+        u['belief'] = belief_tags.get(key, [])
+        # 手数用8D的(考虑了仓位分配)，若无则用OTM的
+        u['lots_final'] = pd8.get('lots', a.get('lots', 1))
+        unified.append(u)
+
+    unified.sort(key=lambda x: x['composite_8d'], reverse=True)
+
+    # === 渲染统一交易计划表 ===
+    u_hdr = html.Tr([
+        html.Th('#', style={'width': '22px', 'padding': '6px 3px'}),
+        html.Th('品种', style={'width': '65px', 'padding': '6px 4px'}),
+        html.Th('期权对', style={'width': '170px', 'padding': '6px 4px'}),
+        html.Th('C价', style={'width': '42px', 'textAlign': 'right', 'padding': '6px 3px'}),
+        html.Th('P价', style={'width': '42px', 'textAlign': 'right', 'padding': '6px 3px'}),
+        html.Th('权金和', style={'width': '48px', 'textAlign': 'right', 'padding': '6px 3px'}),
+        html.Th('DTE', style={'width': '32px', 'textAlign': 'center', 'padding': '6px 3px'}),
+        html.Th('综合分', style={'width': '50px', 'textAlign': 'center', 'padding': '6px 3px'}),
+        html.Th('VRP', style={'width': '38px', 'textAlign': 'center', 'padding': '6px 3px'}),
+        html.Th('环境', style={'width': '65px', 'textAlign': 'center', 'padding': '6px 3px'}),
+        html.Th('TP/SL', style={'width': '62px', 'textAlign': 'center', 'padding': '6px 3px'}),
+        html.Th('手/保证金', style={'width': '80px', 'textAlign': 'right', 'padding': '6px 3px'}),
+        html.Th('信号', style={'width': '60px', 'textAlign': 'center', 'padding': '6px 3px'}),
+    ], style={'backgroundColor': '#1a1a3e', 'color': '#4fc3f7', 'fontSize': '11px'})
+
+    u_rows = []
+    u_total_margin = 0
+    u_total_lots = 0
+    for i, u in enumerate(unified):
+        dte_c = '#f44336' if u['dte'] <= 7 else '#ff9800' if u['dte'] <= 14 else '#4caf50'
+        cs = u['composite_8d']
+        cs_c = '#00e676' if cs >= 30 else '#4fc3f7' if cs >= 15 else '#ff9800' if cs >= 8 else '#f44336'
+        vrp_c = '#00e676' if u['vrp_factor'] >= 1.3 else '#4fc3f7' if u['vrp_factor'] >= 1.1 else '#888'
+        news_c = '#f44336' if u['news_factor'] <= 0.5 else '#ff9800' if u['news_factor'] <= 0.7 else '#4caf50'
+        vol_c = '#4caf50' if u['vol_factor'] >= 1.2 else '#888' if u['vol_factor'] >= 1.0 else '#f44336'
+        ratio_c = '#00e676' if u['ratio'] <= 1.3 else '#4fc3f7' if u['ratio'] <= 1.8 else '#ff9800'
+        tp_l = f'{u["tp"]:.1f}θ' if u['tp'] < 900 else '无'
+        sl_l = f'{u["sl"]:.0f}x' if u['sl'] < 900 else '无'
+        bg = '#0d1a0d' if i < 5 else '#0d1117'
+        rank_c = '#FFD700' if i < 3 else '#00FF88' if i < 5 else '#aaa'
+
+        lots = u['lots_final']
+        mgn = u.get('margin_per_lot', 0)
+        u_total_margin += mgn * lots
+        u_total_lots += lots
+
+        # 环境标签：新闻+波动 组合显示
+        env_parts = []
+        if u['news_label'] != '平静':
+            env_parts.append(u['news_label'])
+        if u['vol_label'] != '正常':
+            env_parts.append(u['vol_label'])
+        if u.get('wday_label'):
+            env_parts.append(u['wday_label'])
+        env_text = '/'.join(env_parts) if env_parts else '正常'
+
+        # 信号标签
+        belief_text = ' '.join(u['belief']) if u['belief'] else ''
+
+        name_text = u.get('cn', u['prod'])
+
+        u_rows.append(html.Tr([
+            html.Td(f'{i+1}', style={'color': rank_c, 'fontWeight': 'bold', 'textAlign': 'center', 'padding': '4px 3px'}),
+            html.Td(name_text, style={'color': '#fff' if i < 5 else '#aaa', 'fontWeight': 'bold' if i < 5 else 'normal', 'fontSize': '12px', 'padding': '4px'}),
+            html.Td([
+                html.Span(f'C{u["call_k"]:.0f}', style={'color': '#00BFFF'}),
+                html.Span('+', style={'color': '#555'}),
+                html.Span(f'P{u["put_k"]:.0f}', style={'color': '#FF6B6B'}),
+                html.Span(f' ({(u["call_k"]-u["fut_px"])/u["fut_px"]*100:.0f}%/{(u["fut_px"]-u["put_k"])/u["fut_px"]*100:.0f}%)',
+                           style={'color': '#666', 'fontSize': '10px'}),
+            ], style={'fontSize': '11px', 'padding': '4px'}),
+            html.Td(f'{u["call_px"]:.0f}', style={'textAlign': 'right', 'color': '#00BFFF', 'padding': '4px 3px'}),
+            html.Td(f'{u["put_px"]:.0f}', style={'textAlign': 'right', 'color': '#FF6B6B', 'padding': '4px 3px'}),
+            html.Td(f'{u["psum"]:.0f}', style={'textAlign': 'right', 'color': '#FFD700', 'fontWeight': 'bold', 'padding': '4px 3px'}),
+            html.Td(str(u['dte']), style={'textAlign': 'center', 'color': dte_c, 'fontWeight': 'bold', 'padding': '4px 3px'}),
+            html.Td(f'{cs:.1f}', style={'textAlign': 'center', 'color': cs_c, 'fontWeight': 'bold', 'fontSize': '13px', 'padding': '4px 3px'}),
+            html.Td(u['vrp_label'], style={'textAlign': 'center', 'color': vrp_c, 'fontSize': '11px', 'padding': '4px 3px'}),
+            html.Td(env_text, style={'textAlign': 'center', 'color': news_c if u['news_factor'] < 1.0 else vol_c, 'fontSize': '10px', 'padding': '4px 3px'}),
+            html.Td(f'{tp_l}/{sl_l}', style={'textAlign': 'center', 'color': '#888', 'fontSize': '11px', 'padding': '4px 3px'}),
+            html.Td(f'{lots}手/{mgn*lots/10000:.1f}万', style={'textAlign': 'right', 'color': '#4fc3f7', 'fontSize': '11px', 'padding': '4px 3px'}),
+            html.Td(belief_text, style={'textAlign': 'center', 'color': '#FFD700', 'fontSize': '10px', 'fontWeight': 'bold', 'padding': '4px 3px'}),
+        ], style={'backgroundColor': bg, 'borderBottom': '1px solid #1a1a3e'}))
+
+    u_total_pct = u_total_margin / account if account > 0 else 0
+    u_summary = html.Tr([
         html.Td(''),
-        html.Td(f'{len(picks)}品种', style={'color': '#ff9800', 'fontWeight': 'bold'}),
-        html.Td(f'{n_opt}个最优DTE', style={'color': '#ff9800'}),
+        html.Td(f'{len(unified)}个可交易', style={'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '11px'}),
+        html.Td(''), html.Td(''), html.Td(''), html.Td(''), html.Td(''), html.Td(''),
+        html.Td(''), html.Td(''), html.Td(''),
+        html.Td(f'{u_total_lots}手/{u_total_margin/10000:.1f}万({u_total_pct:.0%})',
+                 style={'textAlign': 'right', 'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '11px'}),
         html.Td(''),
-        html.Td(''),
-        html.Td(''),
-        html.Td(f'{total_mgn:,.0f}', style={'textAlign': 'right', 'color': '#ff9800', 'fontWeight': 'bold'}),
-        html.Td(f'{day_plan.get("total_pct", 0):.0%}', style={'textAlign': 'center', 'color': '#ff9800'}),
-        html.Td(''), html.Td(''), html.Td(''), html.Td(''), html.Td(''),
     ], style={'backgroundColor': '#2a1a0a', 'borderTop': '2px solid #ff9800'})
 
-    table = html.Table(
-        [html.Thead(header), html.Tbody(rows + [summary_row])],
-        style={'width': '100%', 'borderCollapse': 'collapse', 'fontSize': '13px'})
+    u_table = html.Table(
+        [html.Thead(u_hdr), html.Tbody(u_rows + [u_summary])],
+        style={'width': '100%', 'borderCollapse': 'collapse', 'fontSize': '12px'})
 
-    panel = html.Div([
-        html.Div([
-            html.Span('今日交易计划', style={'color': '#ff9800', 'fontSize': '15px', 'fontWeight': 'bold'}),
-            html.Span(f'  {today_str}  账户{account/10000:.0f}万  ★=最优DTE窗口',
-                       style={'color': '#666', 'fontSize': '12px'}),
-        ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
-        html.Div(table, style={'padding': '5px 20px', 'overflowX': 'auto'}),
-        html.Div([
-            html.Span('操作: 21:00夜盘开仓卖出宽跨 → 次日14:50平仓 | ', style={'color': '#666', 'fontSize': '11px'}),
-            html.Span('★品种优先重仓, 瓶颈额<100万品种注意滑点', style={'color': '#ff9800', 'fontSize': '11px'}),
-        ], style={'padding': '8px 25px'}),
-    ])
+    # 无匹配期权对的品种（在DTE窗口内但无行情数据）
+    paired_prods = {(u['prod'], u['contract']) for u in unified}
+    no_pair = [p for p in picks if (p['prod'], p['contract']) not in paired_prods and p.get('is_best')]
+    no_pair_text = ''
+    if no_pair:
+        names = [f'{p["name"]}({p["contract"]})' for p in no_pair[:8]]
+        no_pair_text = f'  另有{len(no_pair)}品种在窗口内但无期权行情: {", ".join(names)}'
+
+    if unified:
+        plan_sections.extend([
+            html.Div([
+                html.Span(session_label, style={'color': '#ff9800', 'fontSize': '15px', 'fontWeight': 'bold'}),
+                html.Span(f'  {today_str} {now_time}  账户{account/10000:.1f}万({_acc_source})',
+                           style={'color': '#666', 'fontSize': '12px'}),
+                html.Span(filter_note, style={'color': '#4fc3f7', 'fontSize': '11px'}) if filter_note else None,
+            ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
+            html.Div(u_table, style={'padding': '5px 15px', 'overflowX': 'auto'}),
+            html.Div([
+                html.Span(f'综合分=Sharpe×VRP×新闻×波动×流动性×周度×DTE甜蜜区×胜率 | {" | ".join(factor_desc)}',
+                           style={'color': '#555', 'fontSize': '10px'}),
+                html.Span(no_pair_text, style={'color': '#666', 'fontSize': '10px'}) if no_pair_text else None,
+            ], style={'padding': '6px 25px'}),
+        ])
+    else:
+        plan_sections.append(html.Div('当前无可交易的宽跨机会',
+            style={'color': '#888', 'padding': '30px', 'textAlign': 'center'}))
+
+    panel = html.Div(plan_sections)
+
+    # === 知识库信念驱动的智能提醒 (官方到期日历) ===
+    today_d = datetime.now().date()
+    is_friday = datetime.now().weekday() == 4
+
+    # 到期日计算使用模块级统一函数 calc_expiry / _official_expiry
+    _get_expiry = _official_expiry
+    _cal = _trading_cal
+
+    # 各品种合约月份 + 交易所映射 + 夜盘标识 (CTP验证)
+    # 格式: (交易所, 中文名, 合约月份, DTE下限, DTE上限, Sharpe, 胜率, 参数, 有夜盘)
+    _prod_info = {
+        # Tier1 (Sharpe≥0.5)
+        'jd':  ('DCE',  '鸡蛋',     list(range(1,13)),    3,7,   1.028, '93.9%', 'TP3%/SL0',       False),
+        'sn':  ('SHFE', '锡',       list(range(1,13)),    7,10,  0.966, '85.9%', 'TP7%/SL0',       True),
+        'ps':  ('GFEX', '瓶片',     list(range(1,13)),    20,25, 0.904, '92.3%', 'TP3%/SL0',       False),
+        'OI':  ('CZCE', '菜油',     [1,3,5,7,9,11],      10,15, 0.808, '95.2%', 'TP3%/SL5',       True),
+        'lg':  ('DCE',  '液化气',   list(range(1,13)),    50,60, 0.783, '93.3%', 'TP3%/SL5',       False),
+        'lh':  ('DCE',  '生猪',     [1,3,5,7,9,11],      3,7,   0.737, '80.0%', 'TPx2/SL2.5',     False),
+        'ao':  ('SHFE', '氧化铝',   list(range(1,13)),    7,10,  0.660, '92.3%', 'TP3%/SL0',       True),
+        'AP':  ('CZCE', '苹果',     [1,3,5,10,11],       15,20, 0.651, '65.9%', 'TP15%/SL0',      False),
+        'PK':  ('CZCE', '花生',     list(range(1,13)),    10,15, 0.634, '81.2%', 'TP3%/SL5',       False),
+        'SR':  ('CZCE', '白糖',     [1,3,5,7,9,11],      7,10,  0.633, '90.1%', 'TP3%/SL3',       True),
+        'CJ':  ('CZCE', '红枣',     [1,3,5,7,9,11],      15,20, 0.628, '71.8%', 'TP15%/SL0',      False),
+        'SM':  ('CZCE', '锰硅',     list(range(1,13)),    7,10,  0.602, '76.6%', 'TPx1.5/SL2.5',   False),
+        'br':  ('SHFE', '丁二烯橡胶', list(range(1,13)),  3,7,   0.532, '86.5%', 'TP7%/SL0',       True),
+        # B021特殊策略 (DTE长周期入场)
+        'CF':  ('CZCE', '棉花',     [1,3,5,7,9,11],      30,60, 0.366, '100%@30-60', 'B021:TP7%/SL2.1', True),
+        'SA':  ('CZCE', '纯碱',     list(range(1,13)),    25,60, 0.470, '95-100%', 'B021:不设止盈止损', True),
+    }
+
+    alerts = []  # (priority, html_element)
+    existing_prods = {p.get('prod', '').upper() for p in picks}
+
+    # --- 扫描所有品种的DTE窗口 ---
+    for prod, (ex, cn, months, dte_lo, dte_hi, sharpe, wr, params, has_night) in _prod_info.items():
+        # 时段过滤：夜盘时段跳过无夜盘品种
+        if night_only and not has_night:
+            continue
+        for mo_off in range(0, 8):
+            yr, mo = today_d.year, today_d.month + mo_off
+            if mo > 12:
+                yr += 1; mo -= 12
+            if mo not in months:
+                continue
+            exp = _get_expiry(ex, yr, mo, _cal, product_code=prod.upper())
+            if not exp:
+                continue
+            dte = (exp - today_d).days
+            if dte < 1 or dte > 70:
+                continue
+            contract = f'{prod}{yr % 100:02d}{mo:02d}'
+            in_plan = prod.upper() in existing_prods
+            in_window = dte_lo <= dte <= dte_hi
+            # 即将进入: DTE从上方接近窗口(DTE > dte_hi, 1-3天内降至dte_hi)
+            approaching = not in_window and (0 < (dte - dte_hi) <= 3)
+            # 刚过窗口: DTE已低于下限(窗口已过,不再提醒)
+            passed = dte < dte_lo
+
+            # 生成操作建议时间（基于当前时刻）
+            def _action_hint(has_night_, is_friday_):
+                _h = datetime.now().hour
+                if 9 <= _h < 15:
+                    # 日盘中 → 现在就可以交易
+                    return '现在可交易'
+                elif 21 <= _h or _h < 3:
+                    # 夜盘中
+                    if has_night_:
+                        return '现在可交易'
+                    else:
+                        return '明日日盘9:00卖出'
+                else:
+                    # 收盘后
+                    if has_night_:
+                        if is_friday_:
+                            return '今晚21:00卖出'
+                        return '今晚21:00卖出'
+                    else:
+                        if is_friday_:
+                            return '周一日盘9:00卖出'
+                        return '明日日盘9:00卖出'
+
+            night_tag = '' if has_night else ' [无夜盘]'
+
+            # 在最优窗口 + 不在计划中
+            if in_window and not in_plan:
+                tier = 'Tier1' if sharpe >= 0.5 else 'B021'
+                action = _action_hint(has_night, is_friday)
+                alerts.append((1, html.Div([
+                    html.Span(f'{cn}({ex}.{prod}) ', style={
+                        'color': '#ff4444', 'fontWeight': 'bold', 'fontSize': '13px'}),
+                    html.Span(f'{contract} DTE={dte}天 到期{exp}', style={
+                        'color': '#FFD700', 'fontWeight': 'bold'}),
+                    html.Span(f' — {tier}最优区({dte_lo}-{dte_hi}天)', style={
+                        'color': '#00FF88'}),
+                    html.Span(f' → {action}{night_tag}', style={
+                        'color': '#00BFFF', 'fontWeight': 'bold'}),
+                    html.Div(f'  Sharpe={sharpe:.3f} 胜率{wr} {params}', style={
+                        'color': '#aaa', 'fontSize': '11px', 'marginLeft': '20px'}),
+                ], style={'marginBottom': '6px'})))
+
+            # 即将进入窗口 (DTE略高于上限, 1-3天后进入) + Tier1
+            elif approaching and not in_plan and sharpe >= 0.5:
+                days_to = dte - dte_hi
+                entry_d = today_d + timedelta(days=days_to)
+                # 进入窗口那天的操作建议
+                entry_weekday = entry_d.weekday()  # 0=Mon ... 4=Fri
+                if entry_weekday >= 5:  # 周末顺延到周一
+                    entry_d = entry_d + timedelta(days=(7 - entry_weekday))
+                if has_night and entry_d.weekday() < 5:
+                    when = f'{entry_d}(周{["一","二","三","四","五"][entry_d.weekday()]})晚21:00卖出'
+                else:
+                    when = f'{entry_d}(周{["一","二","三","四","五"][min(entry_d.weekday(),4)]})日盘9:00卖出'
+                alerts.append((2, html.Div([
+                    html.Span(f'{cn}({ex}.{prod}) ', style={
+                        'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '13px'}),
+                    html.Span(f'{contract} DTE={dte}天→最优{dte_lo}-{dte_hi}', style={
+                        'color': '#FFD700'}),
+                    html.Span(f' — {when}{night_tag}', style={
+                        'color': '#4fc3f7'}),
+                    html.Div(f'  Sharpe={sharpe:.3f} 胜率{wr}', style={
+                        'color': '#888', 'fontSize': '11px', 'marginLeft': '20px'}),
+                ], style={'marginBottom': '4px'})))
+
+    # --- B038: AO氧化铝 夜盘后半段Scalp (每个交易日) ---
+    ao_lines = []
+    for mo_off in range(0, 6):
+        yr, mo = today_d.year, today_d.month + mo_off
+        if mo > 12:
+            yr += 1; mo -= 12
+        exp = _get_expiry('SHFE', yr, mo, _cal, product_code='AO')
+        if not exp:
+            continue
+        dte = (exp - today_d).days
+        contract = f'ao{yr % 100:02d}{mo:02d}'
+        if 0 < dte <= 30:
+            if 5 <= dte <= 19:
+                ao_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — ★可交易: 胜率83-100%/均PnL+1.5~7.5%',
+                    style={'color': '#00FF88', 'fontSize': '12px', 'fontWeight': 'bold'}))
+            elif dte <= 4:
+                ao_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — DTE过短,波动大,谨慎',
+                    style={'color': '#ff9800', 'fontSize': '12px'}))
+            else:
+                ao_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — DTE偏长: θ衰减慢,TP触发率仍可但收益偏低',
+                    style={'color': '#aaa', 'fontSize': '12px'}))
+    if ao_lines:
+        alerts.append((1, html.Div([
+            html.Span('氧化铝(SHFE.AO) 夜盘后半段Scalp ', style={
+                'color': '#ff4444', 'fontWeight': 'bold', 'fontSize': '13px'}),
+            html.Span('B038 conf=0.82 | 23:15卖出宽跨→00:50强平 | θ止盈+腿比止损', style={
+                'color': '#666', 'fontSize': '11px'}),
+            *ao_lines,
+            html.Div('策略: 23:15进仓 → TP=权利金÷DTE×0.5 → 无需止损(腿比天然平衡) → 00:50强平 | 入场腿比≤3x', style={
+                'color': '#ff9800', 'fontSize': '11px', 'marginTop': '4px'}),
+            html.Div('DTE5-10天最优 | 不持仓过夜 | 23:00后流动性下降但AO仍可交易至01:00', style={
+                'color': '#888', 'fontSize': '11px'}),
+        ], style={'marginBottom': '6px'})))
+
+    # --- B018: 棕榈油周五夜盘Scalp ---
+    if is_friday:
+        p_lines = []
+        for mo_off in range(0, 4):
+            yr, mo = today_d.year, today_d.month + mo_off
+            if mo > 12:
+                yr += 1; mo -= 12
+            exp = _get_expiry('DCE', yr, mo, _cal, product_code='P')
+            if not exp:
+                continue
+            dte = (exp - today_d).days
+            contract = f'p{yr % 100:02d}{mo:02d}'
+            if 0 < dte <= 7:
+                p_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — B018最优区: 89%胜率/+23%PnL',
+                    style={'color': '#00FF88', 'fontSize': '12px', 'fontWeight': 'bold'}))
+            elif 0 < dte <= 14:
+                p_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — B018可用区: ~75%胜率',
+                    style={'color': '#FFD700', 'fontSize': '12px'}))
+        if p_lines:
+            alerts.append((1, html.Div([
+                html.Span('棕榈油(DCE.p) 周五夜盘Scalp ', style={
+                    'color': '#ff4444', 'fontWeight': 'bold', 'fontSize': '13px'}),
+                html.Span('B018 conf=0.83 | 周五夜盘胜率显著高于周一~四(89% vs 75%)', style={
+                    'color': '#666', 'fontSize': '11px'}),
+                *p_lines,
+                html.Div('策略: 周五21:05卖出→22:55平仓(当晚了结,不持过周末)', style={
+                    'color': '#ff9800', 'fontSize': '11px', 'marginTop': '4px'}),
+                html.Div('条件: 总权金3-30, 两腿深OTM, ratio 0.5-2.0', style={
+                    'color': '#888', 'fontSize': '11px'}),
+            ], style={'marginBottom': '6px'})))
+
+    # --- 周五提示: 持仓过周末需承受周一开盘gap风险 ---
+    if is_friday:
+        low_dte_names = [f"{p.get('cn','')}" for p in picks if p.get('dte', 99) <= 10]
+        if low_dte_names:
+            alerts.append((5, html.Div([
+                html.Span('周五持仓提示: ', style={
+                    'color': '#ff9800', 'fontWeight': 'bold', 'fontSize': '12px'}),
+                html.Span(f'低DTE品种({",".join(low_dte_names)})若持过周末,周一9:00存在gap风险,但theta也在周末自然衰减',
+                           style={'color': '#aaa', 'fontSize': '11px'}),
+            ])))
+
+    # 日历来源标注
+    cal_note = '官方日历(含节假日+AP/CJ/PX特殊规则)'
+
+    # 组装提醒面板
+    if alerts:
+        alerts.sort(key=lambda x: x[0])
+        alert_items = [a[1] for a in alerts]
+        n_critical = sum(1 for a in alerts if a[0] <= 1)
+        n_upcoming = sum(1 for a in alerts if a[0] == 2)
+        header_parts = []
+        if n_critical:
+            header_parts.append(f'{n_critical}个窗口内机会')
+        if n_upcoming:
+            header_parts.append(f'{n_upcoming}个即将进入')
+        header_text = f'知识库信念提醒 ({" + ".join(header_parts)})' if header_parts else '知识库信念提醒'
+
+        alert_panel = html.Div([
+            html.Div([
+                html.Span(header_text, style={
+                    'color': '#ff4444' if n_critical else '#FFD700',
+                    'fontSize': '14px', 'fontWeight': 'bold'}),
+                html.Span(f'  B018/B021/B023 | {cal_note}', style={
+                    'color': '#666', 'fontSize': '11px'}),
+                html.Span('  [周五]' if is_friday else '', style={
+                    'color': '#00FF88', 'fontSize': '12px', 'fontWeight': 'bold'}),
+            ], style={'marginBottom': '8px'}),
+            *alert_items,
+        ], style={'padding': '12px 25px',
+                  'borderTop': f'2px solid {"#ff4444" if n_critical else "#FFD700"}',
+                  'backgroundColor': '#1a0a0a' if n_critical else '#1a1a0a'})
+        panel.children.append(alert_panel)
 
     return panel, {
         'display': 'block', 'backgroundColor': '#111827',
         'borderBottom': '3px solid #ff9800', 'marginBottom': '5px',
     }
+
+
+@app.callback(
+    Output('spread-panel', 'children'),
+    Output('spread-panel', 'style'),
+    Input('spread-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_spread(n_clicks):
+    """切换价差Z-Score监控面板"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    panel = _build_spread_panel()
+    return panel, {
+        'display': 'block', 'backgroundColor': '#111827',
+        'borderBottom': '3px solid #bb86fc', 'marginBottom': '5px',
+    }
+
+
+@app.callback(
+    Output('alert-stats-panel', 'children'),
+    Output('alert-stats-panel', 'style'),
+    Input('alert-stats-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_alert_stats(n_clicks):
+    """切换预警回归统计面板"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    panel = _build_alert_stats_panel()
+    return panel, {
+        'display': 'block', 'backgroundColor': '#1a1a0a',
+        'borderBottom': '3px solid #FFD700', 'marginBottom': '5px',
+    }
+
+
+def _build_alert_stats_panel():
+    """构建预警统计面板（含回归+未回归，无幸存者偏差）"""
+    alert_stats = get_alert_stats()
+    active_count = len(_alert_active)
+    children = []
+
+    # 标题
+    if not alert_stats:
+        total_n, resolved_n, unresolved_n, rate = 0, 0, 0, 0
+    else:
+        total_n = alert_stats['total']
+        resolved_n = alert_stats['resolved']
+        unresolved_n = alert_stats['unresolved']
+        rate = alert_stats['resolve_rate']
+    children.append(html.Div([
+        html.Span('预警统计（全样本）', style={'color': '#FFD700', 'fontSize': '16px', 'fontWeight': 'bold'}),
+        html.Span(f'  总计 {total_n} | 回归 {resolved_n} | 未回归 {unresolved_n} | '
+                  f'回归率 {rate:.0f}% | 活跃 {active_count}',
+                   style={'color': '#888', 'fontSize': '12px', 'marginLeft': '12px'}),
+    ], style={'marginBottom': '10px'}))
+
+    if not alert_stats and active_count == 0:
+        children.append(html.Div('暂无预警记录。盘中产生布林线预警后会自动记录并持久保存。',
+                                  style={'color': '#666', 'fontSize': '13px', 'padding': '20px 0'}))
+        return html.Div(children, style={'padding': '16px 24px'})
+
+    if alert_stats:
+        # 核心指标卡片
+        cards = [
+            ('回归率', rate, '%', '#00e676' if rate >= 80 else '#FFD700'),
+            ('总样本', total_n, '', '#4fc3f7'),
+            ('未回归', unresolved_n, '', '#FF4444' if unresolved_n > 0 else '#888'),
+        ]
+        if alert_stats.get('avg_minutes') is not None:
+            cards += [
+                ('平均回归', alert_stats['avg_minutes'], '分钟', '#FFD700'),
+                ('中位数', alert_stats['median_minutes'], '分钟', '#FFD700'),
+                ('P25', alert_stats['p25_minutes'], '分钟', '#FFD700'),
+                ('P75', alert_stats['p75_minutes'], '分钟', '#FFD700'),
+                ('最快', alert_stats['min_minutes'], '分钟', '#FFD700'),
+                ('最慢', alert_stats['max_minutes'], '分钟', '#FFD700'),
+            ]
+        if alert_stats.get('avg_deviation') is not None:
+            cards += [
+                ('平均偏离', alert_stats['avg_deviation'], '%', '#FF8888'),
+                ('平均峰值偏离', alert_stats['avg_peak_deviation'], '%', '#FF8888'),
+            ]
+
+        card_divs = []
+        for label, val, unit, color in cards:
+            card_divs.append(html.Div([
+                html.Div(f'{val:.0f}{unit}', style={
+                    'fontSize': '20px', 'fontWeight': 'bold', 'color': color}),
+                html.Div(label, style={'fontSize': '11px', 'color': '#888'}),
+            ], style={'textAlign': 'center', 'padding': '10px 16px', 'backgroundColor': '#1a1a2e',
+                      'borderRadius': '6px', 'minWidth': '90px'}))
+        children.append(html.Div(card_divs, style={
+            'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '14px'}))
+
+        # 品种汇总（一行一个品种）
+        if alert_stats.get('by_product'):
+            prod_items = sorted(alert_stats['by_product'].items(),
+                                key=lambda x: x[1]['total'], reverse=True)
+            rows = []
+            th_style = {'color': '#666', 'padding': '4px 12px', 'textAlign': 'left'}
+            for p, d in prod_items:
+                avg_str = f'{d["avg_min"]:.0f}分钟' if d.get('avg_min') is not None else '-'
+                med_str = f'{d["median_min"]:.0f}分钟' if d.get('median_min') is not None else '-'
+                rate_color = '#00e676' if d['resolve_rate'] >= 80 else '#FFD700' if d['resolve_rate'] >= 50 else '#FF4444'
+                rows.append(html.Tr([
+                    html.Td(p, style={'color': '#FFD700', 'fontWeight': 'bold', 'padding': '4px 12px'}),
+                    html.Td(f'{d["total"]}', style={'color': '#aaa', 'padding': '4px 12px'}),
+                    html.Td(f'{d["resolved"]}', style={'color': '#00e676', 'padding': '4px 12px'}),
+                    html.Td(f'{d["unresolved"]}', style={'color': '#FF4444' if d["unresolved"] else '#aaa', 'padding': '4px 12px'}),
+                    html.Td(f'{d["resolve_rate"]:.0f}%', style={'color': rate_color, 'fontWeight': 'bold', 'padding': '4px 12px'}),
+                    html.Td(avg_str, style={'color': '#aaa', 'padding': '4px 12px'}),
+                    html.Td(med_str, style={'color': '#aaa', 'padding': '4px 12px'}),
+                ]))
+            children.append(html.Div([
+                html.Div('品种汇总', style={'color': '#FFD700', 'fontSize': '13px', 'fontWeight': 'bold',
+                                         'marginBottom': '6px'}),
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th('品种', style=th_style), html.Th('总计', style=th_style),
+                        html.Th('回归', style=th_style), html.Th('未回归', style=th_style),
+                        html.Th('回归率', style=th_style), html.Th('平均', style=th_style),
+                        html.Th('中位', style=th_style),
+                    ])),
+                    html.Tbody(rows),
+                ], style={'fontSize': '12px'}),
+            ], style={'marginBottom': '14px'}))
+
+        # 全部记录明细（每条带期权对）
+        if alert_stats.get('recent'):
+            rec_rows = []
+            for r in alert_stats['recent'][:30]:
+                is_resolved = r.get('resolved', False)
+                if is_resolved:
+                    status = html.Span(f'{r.get("resolve_minutes", 0):.0f}分钟',
+                                       style={'color': '#00e676', 'fontWeight': 'bold'})
+                    sum_text = f'{r["alert_sum"]:.0f} -> {r.get("resolve_sum", 0):.0f}'
+                else:
+                    status = html.Span('未回归', style={'color': '#FF4444', 'fontWeight': 'bold'})
+                    last = r.get('last_sum', r['alert_sum'])
+                    sum_text = f'{r["alert_sum"]:.0f} -> {last:.0f}'
+                pair_text = f'{r.get("call_sym", "?")} + {r.get("put_sym", "?")}'
+                rec_rows.append(html.Tr([
+                    html.Td(r['futures_sym'], style={'color': '#FFD700', 'padding': '3px 10px'}),
+                    html.Td(pair_text, style={'color': '#8888ff', 'padding': '3px 10px', 'fontSize': '11px'}),
+                    html.Td(r['alert_time'][-14:], style={'color': '#aaa', 'padding': '3px 10px', 'fontSize': '11px'}),
+                    html.Td(sum_text, style={'color': '#aaa', 'padding': '3px 10px'}),
+                    html.Td(f'+{r.get("peak_deviation", 0)*100:.1f}%',
+                             style={'color': '#FF8888', 'padding': '3px 10px'}),
+                    html.Td(status, style={'padding': '3px 10px'}),
+                ]))
+            children.append(html.Div([
+                html.Div('最近记录', style={'color': '#FFD700', 'fontSize': '13px', 'fontWeight': 'bold',
+                                         'marginBottom': '6px'}),
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th('品种', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('期权对', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('时间', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('Sum变化', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('峰值偏离', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('结果', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    ])),
+                    html.Tbody(rec_rows),
+                ], style={'fontSize': '12px'}),
+            ], style={'marginBottom': '14px'}))
+
+    # 当前活跃预警
+    if _alert_active:
+        active_rows = []
+        now = datetime.now()
+        for key, rec in _alert_active.items():
+            try:
+                t0 = datetime.strptime(rec['alert_time'], '%Y-%m-%d %H:%M:%S')
+                elapsed = f'{(now - t0).total_seconds() / 60:.0f}分钟'
+            except Exception:
+                elapsed = '?'
+            pair_text = f'{rec.get("call_sym", "?")} + {rec.get("put_sym", "?")}'
+            active_rows.append(html.Tr([
+                html.Td(rec['futures_sym'], style={'color': '#FF4444', 'fontWeight': 'bold', 'padding': '3px 10px'}),
+                html.Td(pair_text, style={'color': '#8888ff', 'padding': '3px 10px', 'fontSize': '11px'}),
+                html.Td(rec['alert_time'][-8:], style={'color': '#FF8888', 'padding': '3px 10px'}),
+                html.Td(elapsed, style={'color': '#FF8888', 'padding': '3px 10px'}),
+                html.Td(f'{rec["alert_sum"]:.0f}', style={'color': '#aaa', 'padding': '3px 10px'}),
+                html.Td(f'{rec["peak_sum"]:.0f}', style={'color': '#FF8888', 'padding': '3px 10px'}),
+                html.Td(f'+{rec.get("alert_deviation", 0)*100:.1f}%',
+                         style={'color': '#FF8888', 'padding': '3px 10px'}),
+            ]))
+        children.append(html.Div([
+            html.Div(f'当前活跃预警 ({len(_alert_active)})', style={
+                'color': '#FF4444', 'fontSize': '13px', 'fontWeight': 'bold', 'marginBottom': '6px'}),
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th('品种', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('期权对', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('触发', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('已持续', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('触发Sum', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('峰值Sum', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                    html.Th('偏离', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                ])),
+                html.Tbody(active_rows),
+            ], style={'fontSize': '12px'}),
+        ]))
+
+    return html.Div(children, style={'padding': '16px 24px'})
 
 
 @app.server.route('/diag')
@@ -3427,4 +5979,10 @@ if __name__ == '__main__':
         pc = pair[3] if len(pair) > 3 else 1.0
         coeff_info = f' (C×{cc:g}, P×{pc:g})' if cc != 1.0 or pc != 1.0 else ''
         print(f'  {c} + {p}{coeff_info}')
+
+    # 启动资讯整点自动采集线程
+    _news_thread = threading.Thread(target=_news_hourly_fetcher, daemon=True)
+    _news_thread.start()
+    print('资讯自动采集: 每整点更新')
+
     app.run(host='0.0.0.0', port=PORT, debug=False)

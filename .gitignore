@@ -35,3 +35,21 @@ auto_news.log
 .vscode/
 *.swp
 *.swo
+
+# Claude internal
+.claude/
+
+# Generated reports & results
+*_report.html
+*_results.json
+multi_trade_results/
+multi_trade_results_v2/
+
+# Runtime state & data
+alert_history.db
+alert_history.json
+trade_state.json
+data/
+
+# Backups
+*_backup_*.py

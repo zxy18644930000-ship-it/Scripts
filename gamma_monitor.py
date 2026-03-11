@@ -67,6 +67,7 @@ class GreeksResult:
     gamma: float = 0.0
     theta: float = 0.0        # 每天
     vega: float = 0.0         # 每1%IV变动
+    volga: float = 0.0        # 每1%IV变动时Vega的变化量
     iv: float = 0.0           # 隐含波动率
 
 
@@ -92,8 +93,10 @@ class PairGreeks:
     net_gamma: float = 0.0       # Call Gamma + Put Gamma（永远为正）
     net_theta: float = 0.0       # Call Theta + Put Theta（卖出时为正收入）
     net_vega: float = 0.0        # Call Vega + Put Vega
+    net_volga: float = 0.0       # Call Volga + Put Volga
     # 关键比率
     theta_gamma_ratio: float = 0.0   # |Theta| / Gamma，越高越安全
+    volga_vega_ratio: float = 0.0    # |Volga| / Vega，越高 IV 变动风险越大
     gex: float = 0.0                  # Gamma Exposure（元）
     # 评估
     signal: str = ''             # SAFE / CAUTION / DANGER
@@ -150,7 +153,11 @@ def black76_greeks(F: float, K: float, T: float, sigma: float,
     result.theta = theta_annual / 365.0
 
     # Vega（每1%IV变动 = sigma变0.01时价格变多少）
-    result.vega = discount * F * sqrt_T * pdf_d1 * 0.01
+    vega_unit = discount * F * sqrt_T * pdf_d1  # per unit sigma
+    result.vega = vega_unit * 0.01
+
+    # Volga = dVega/dsigma（每1%IV变动时Vega的变化量）
+    result.volga = vega_unit * d1 * d2 / sigma * 0.01
 
     return result
 
@@ -401,6 +408,10 @@ def calculate_pair_greeks(call_sym: str, put_sym: str,
     net_gamma = cg.gamma + pg.gamma  # 永远为正
     net_theta = cg.theta + pg.theta  # 时间衰减（负数 = 买方成本 / 卖方收入）
     net_vega = cg.vega + pg.vega
+    net_volga = cg.volga + pg.volga
+
+    # Volga/Vega 比率（越高表示 IV 变动时 Vega 膨胀越快，卖方风险越大）
+    volga_vega_ratio = abs(net_volga) / net_vega if net_vega > 1e-10 else 0.0
 
     # Theta/Gamma 比率
     # 对卖出方：Theta 收入（取绝对值）/ Gamma 风险
@@ -427,13 +438,21 @@ def calculate_pair_greeks(call_sym: str, put_sym: str,
     # 评估信号
     if theta_gamma_ratio >= RATIO_SAFE:
         signal = 'SAFE'
-        reason = f'Theta/Gamma比={theta_gamma_ratio:.1f}，期货需波动{breakeven_pct:.1f}%才亏'
+        reason = f'T/G比={theta_gamma_ratio:.1f}，期货需波动{breakeven_pct:.1f}%才亏'
     elif theta_gamma_ratio >= RATIO_CAUTION:
         signal = 'CAUTION'
-        reason = f'Theta/Gamma比={theta_gamma_ratio:.1f}，盈亏平衡{breakeven_pct:.1f}%，注意风控'
+        reason = f'T/G比={theta_gamma_ratio:.1f}，盈亏平衡{breakeven_pct:.1f}%，注意风控'
     else:
         signal = 'DANGER'
-        reason = f'Theta/Gamma比={theta_gamma_ratio:.1f}，仅{breakeven_pct:.1f}%波动即亏损，不建议卖出'
+        reason = f'T/G比={theta_gamma_ratio:.1f}，仅{breakeven_pct:.1f}%波动即亏损，不建议卖出'
+
+    # Volga 补充警告（即使 T/G 安全，Volga 高也有 IV 爆炸风险）
+    if volga_vega_ratio > 30:
+        reason += f'  ⚠Volga/Vega={volga_vega_ratio:.0f}(爆发区!)'
+        if signal == 'SAFE':
+            signal = 'CAUTION'
+    elif volga_vega_ratio > 15:
+        reason += f'  Volga/Vega={volga_vega_ratio:.0f}(偏高)'
 
     return PairGreeks(
         call_sym=call_sym,
@@ -453,7 +472,9 @@ def calculate_pair_greeks(call_sym: str, put_sym: str,
         net_gamma=net_gamma,
         net_theta=net_theta,
         net_vega=net_vega,
+        net_volga=net_volga,
         theta_gamma_ratio=theta_gamma_ratio,
+        volga_vega_ratio=volga_vega_ratio,
         gex=gex,
         signal=signal,
         reason=reason,
@@ -586,14 +607,19 @@ def print_pair_greeks(pg: PairGreeks):
     print(f"  {'Gamma':>12} {pg.call_greeks.gamma:>12.6f} {pg.put_greeks.gamma:>12.6f} {pg.net_gamma:>12.6f}")
     print(f"  {'Theta/天':>12} {pg.call_greeks.theta:>12.4f} {pg.put_greeks.theta:>12.4f} {pg.net_theta:>12.4f}")
     print(f"  {'Vega/1%':>12} {pg.call_greeks.vega:>12.4f} {pg.put_greeks.vega:>12.4f} {pg.net_vega:>12.4f}")
+    print(f"  {'Volga/1%':>12} {pg.call_greeks.volga:>12.4f} {pg.put_greeks.volga:>12.4f} {pg.net_volga:>12.4f}")
 
     print(f"\n  {'─'*50}")
     print(f"  虚值度(Call): {(pg.call_strike - pg.futures_price)/pg.futures_price*100:+.1f}%")
     print(f"  虚值度(Put):  {(pg.futures_price - pg.put_strike)/pg.futures_price*100:+.1f}%")
 
+    # Volga/Vega 颜色
+    vv_color = '\033[91m' if pg.volga_vega_ratio > 30 else '\033[93m' if pg.volga_vega_ratio > 15 else '\033[92m'
+
     print(f"\n  ┌────────────────────────────────────────────────┐")
     print(f"  │ {color}信号: {pg.signal}{reset}{'':>{42-len(pg.signal)}}│")
     print(f"  │ Theta/Gamma 比率: {pg.theta_gamma_ratio:>8.1f}{'':>20}│")
+    print(f"  │ {vv_color}Volga/Vega 比率:  {pg.volga_vega_ratio:>8.1f}{reset}{'':>20}│")
 
     # 盈亏平衡
     if pg.net_gamma > 1e-15:
@@ -760,6 +786,13 @@ def create_dash_app():
                                 html.Td(f'{pg.put_greeks.vega:.4f}', style={'textAlign': 'right'}),
                                 html.Td(f'{pg.net_vega:.4f}', style={'textAlign': 'right', 'fontWeight': 'bold'}),
                             ]),
+                            html.Tr([
+                                html.Td('Volga/1%', style={'color': '#b388ff'}),
+                                html.Td(f'{pg.call_greeks.volga:.4f}', style={'textAlign': 'right'}),
+                                html.Td(f'{pg.put_greeks.volga:.4f}', style={'textAlign': 'right'}),
+                                html.Td(f'{pg.net_volga:.4f}', style={'textAlign': 'right', 'fontWeight': 'bold',
+                                         'color': '#b388ff'}),
+                            ]),
                         ]),
                     ], style={'width': '100%', 'color': '#ddd', 'fontSize': '13px',
                               'borderCollapse': 'collapse'}),
@@ -769,7 +802,7 @@ def create_dash_app():
                 html.Div([
                     html.Div([
                         html.Div([
-                            html.Div('Theta/Gamma 比率', style={'color': '#888', 'fontSize': '11px'}),
+                            html.Div('T/G 比率', style={'color': '#888', 'fontSize': '11px'}),
                             html.Div(f'{pg.theta_gamma_ratio:.1f}',
                                      style={'color': sc['text'], 'fontSize': '28px', 'fontWeight': 'bold'}),
                         ], style={'display': 'inline-block', 'width': '30%', 'textAlign': 'center'}),
@@ -777,13 +810,21 @@ def create_dash_app():
                             html.Div('盈亏平衡波动', style={'color': '#888', 'fontSize': '11px'}),
                             html.Div(be_text,
                                      style={'color': '#fff', 'fontSize': '18px', 'fontWeight': 'bold'}),
-                        ], style={'display': 'inline-block', 'width': '35%', 'textAlign': 'center'}),
+                        ], style={'display': 'inline-block', 'width': '30%', 'textAlign': 'center'}),
+                        html.Div([
+                            html.Div('Volga/Vega', style={'color': '#888', 'fontSize': '11px'}),
+                            html.Div(f'{pg.volga_vega_ratio:.1f}',
+                                     style={'color': '#ff4444' if pg.volga_vega_ratio > 30
+                                            else '#ffd700' if pg.volga_vega_ratio > 15
+                                            else '#00ff88',
+                                            'fontSize': '18px', 'fontWeight': 'bold'}),
+                        ], style={'display': 'inline-block', 'width': '20%', 'textAlign': 'center'}),
                         html.Div([
                             html.Div('GEX (1手)', style={'color': '#888', 'fontSize': '11px'}),
                             html.Div(f'{pg.gex:.0f}元',
                                      style={'color': '#ff8800' if abs(pg.gex) > GEX_WARNING else '#fff',
                                             'fontSize': '18px', 'fontWeight': 'bold'}),
-                        ], style={'display': 'inline-block', 'width': '35%', 'textAlign': 'center'}),
+                        ], style={'display': 'inline-block', 'width': '20%', 'textAlign': 'center'}),
                     ]),
                     html.Div(pg.reason, style={'color': '#aaa', 'fontSize': '12px',
                                                 'textAlign': 'center', 'marginTop': '8px'}),

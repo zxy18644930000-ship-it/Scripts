@@ -576,10 +576,36 @@ class CTPDataCollector:
             self.main_engine.subscribe(req, "CTP")
             self._subscribed.add(c.vt_symbol)
 
+        # ---- 阶段3: 额外订阅无期权的纯期货品种（价差监控用） ----
+        _EXTRA_FUTURES = {'HC', 'NR', 'CY', 'LU', 'J'}  # 无期权但价差监控需要
+        extra_futures = []
+        already_subscribed_products = set(option_products)
+        for c in all_contracts:
+            prefix = extract_product_prefix(c.symbol)
+            if prefix in _EXTRA_FUTURES and prefix not in already_subscribed_products:
+                if c.product == Product.FUTURES:
+                    month = self._extract_month(c.symbol)
+                    if month:
+                        extra_futures.append(c)
+        # 每个品种只取近月2个
+        from itertools import groupby
+        extra_dedup = []
+        extra_futures.sort(key=lambda c: (extract_product_prefix(c.symbol), c.symbol))
+        for prod, group in groupby(extra_futures, key=lambda c: extract_product_prefix(c.symbol)):
+            contracts_list = sorted(group, key=lambda c: self._extract_month(c.symbol))
+            for c in contracts_list[:2]:
+                req = SubscribeRequest(symbol=c.symbol, exchange=c.exchange)
+                self.main_engine.subscribe(req, "CTP")
+                self._subscribed.add(c.vt_symbol)
+                extra_dedup.append(c)
+        if extra_dedup:
+            logger.info(f"阶段3: 额外订阅 {len(extra_dedup)} 个纯期货 "
+                        f"({', '.join(set(extract_product_prefix(c.symbol) for c in extra_dedup))})")
+
         # ---- 统计 ----
         opt_by_prod = Counter(extract_product_prefix(c.symbol) for c in selected_options)
         logger.info(f"阶段2: 订阅 {len(selected_options)} 个期权")
-        logger.info(f"总计: {len(selected_futures)}期货 + {len(selected_options)}期权 "
+        logger.info(f"总计: {len(selected_futures)+len(extra_dedup)}期货 + {len(selected_options)}期权 "
                     f"= {len(self._subscribed)}合约")
         for prod in sorted(opt_by_prod.keys()):
             logger.info(f"  {prod}: {opt_by_prod[prod]}期权")

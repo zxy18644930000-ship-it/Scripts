@@ -160,8 +160,22 @@ def generate_news():
 
     content = '\n'.join(lines) + '\n'
 
+    # 保留 /news 技能写入的分析区块
+    analysis_block = ''
+    if os.path.exists(NEWS_CACHE):
+        try:
+            with open(NEWS_CACHE, 'r', encoding='utf-8') as f:
+                old = f.read()
+            marker = '<!-- ANALYSIS -->'
+            if marker in old:
+                analysis_block = old[old.index(marker):]
+        except Exception:
+            pass
+
     with open(NEWS_CACHE, 'w', encoding='utf-8') as f:
         f.write(content)
+        if analysis_block:
+            f.write('\n' + analysis_block)
 
     return True
 
