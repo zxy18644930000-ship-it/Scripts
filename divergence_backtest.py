@@ -550,17 +550,33 @@ def run_product(exchange, product):
         print(f"  文件损坏: {e}")
         return None
 
-    # 读取全量数据
-    print(f"  读取数据...", end="", flush=True)
-    chunks = []
-    for batch in pf.iter_batches(batch_size=1000000, columns=['datetime', 'symbol', 'close', 'volume']):
-        chunks.append(batch.to_pandas())
-    all_df = pd.concat(chunks, ignore_index=True)
-    del chunks
+    # 读取数据 (大文件只取最近3年)
+    n_rows = pf.metadata.num_rows
+    max_rows = 80_000_000  # 超过8000万行只取最近3年
+    print(f"  读取数据({n_rows/1e6:.0f}M行)...", end="", flush=True)
+
+    import pyarrow as pa
+    cols = ['datetime', 'symbol', 'close', 'volume']
+
+    if n_rows > max_rows:
+        # 大文件: 用pyarrow filter只读最近3年
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=3*365)
+        table = pq.read_table(path, columns=cols,
+                              filters=[('datetime', '>=', cutoff)])
+        all_df = table.to_pandas()
+        del table
+        print(f" [截断至{cutoff.date()}]", end="")
+    else:
+        chunks = []
+        for batch in pf.iter_batches(batch_size=1000000, columns=cols):
+            chunks.append(batch.to_pandas())
+        all_df = pd.concat(chunks, ignore_index=True)
+        del chunks
+
     gc.collect()
     all_df['date'] = all_df['datetime'].dt.date
     dates = sorted(all_df['date'].unique())
-    print(f" {len(all_df)}行 / {len(dates)}天")
+    print(f" {len(all_df)/1e6:.1f}M行 / {len(dates)}天")
 
     tick_size = detect_tick_size(all_df.head(5000)['close'].dropna().values)
     print(f"  tick_size={tick_size}")
@@ -609,27 +625,49 @@ def main():
     print(f"IV阈值: {IV_THRESHOLD} | Sum最小变动: {MIN_SUM_MOVE}")
     print("=" * 60)
 
+    # 品种-交易所映射
+    EX_MAP = {
+        'cu': 'SHFE', 'al': 'SHFE', 'zn': 'SHFE', 'ag': 'SHFE', 'au': 'SHFE',
+        'ru': 'SHFE', 'br': 'SHFE', 'ao': 'SHFE', 'pb': 'SHFE', 'rb': 'SHFE',
+        'ni': 'SHFE', 'sn': 'SHFE', 'ss': 'SHFE', 'sp': 'SHFE', 'wr': 'SHFE',
+        'fu': 'SHFE',
+        'CF': 'CZCE', 'TA': 'CZCE', 'OI': 'CZCE', 'SM': 'CZCE', 'MA': 'CZCE',
+        'RM': 'CZCE', 'SF': 'CZCE', 'SR': 'CZCE', 'AP': 'CZCE', 'PK': 'CZCE',
+        'SA': 'CZCE', 'PX': 'CZCE', 'ZC': 'CZCE', 'PF': 'CZCE', 'FG': 'CZCE',
+        'CJ': 'CZCE', 'UR': 'CZCE', 'SH': 'CZCE', 'CY': 'CZCE',
+        'p': 'DCE', 'y': 'DCE', 'pg': 'DCE', 'm': 'DCE', 'l': 'DCE',
+        'c': 'DCE', 'a': 'DCE', 'lh': 'DCE', 'eg': 'DCE', 'eb': 'DCE',
+        'v': 'DCE', 'pp': 'DCE', 'i': 'DCE', 'j': 'DCE', 'jm': 'DCE',
+        'b': 'DCE', 'cs': 'DCE',
+        'ps': 'GFEX', 'si': 'GFEX', 'lc': 'GFEX',
+        'sc': 'INE', 'lu': 'INE', 'nr': 'INE', 'bc': 'INE',
+    }
+
     # 默认品种或从命令行指定
-    if len(sys.argv) >= 3:
+    if len(sys.argv) >= 2 and sys.argv[1] == 'all':
+        # 全市场模式: 扫描所有交易所的parquet文件
+        targets = []
+        for ex_dir in ['CZCE', 'DCE', 'SHFE', 'INE', 'GFEX']:
+            ex_path = f'{BASE}/{ex_dir}'
+            if not os.path.isdir(ex_path):
+                continue
+            for f in sorted(os.listdir(ex_path)):
+                if f.endswith('.parquet'):
+                    prod = f.replace('.parquet', '')
+                    targets.append((ex_dir, prod))
+        print(f"  全市场模式: {len(targets)}个品种")
+    elif len(sys.argv) >= 3:
         targets = [(sys.argv[2], sys.argv[1])]
     elif len(sys.argv) >= 2:
-        # 自动匹配交易所
         prod = sys.argv[1]
-        ex_map = {'cu': 'SHFE', 'al': 'SHFE', 'zn': 'SHFE', 'ag': 'SHFE', 'au': 'SHFE',
-                   'ru': 'SHFE', 'br': 'SHFE', 'ao': 'SHFE', 'pb': 'SHFE', 'rb': 'SHFE',
-                   'CF': 'CZCE', 'TA': 'CZCE', 'OI': 'CZCE', 'SM': 'CZCE', 'MA': 'CZCE',
-                   'RM': 'CZCE', 'SF': 'CZCE', 'SR': 'CZCE', 'AP': 'CZCE', 'PK': 'CZCE',
-                   'SA': 'CZCE', 'PX': 'CZCE', 'ZC': 'CZCE', 'PF': 'CZCE', 'FG': 'CZCE',
-                   'p': 'DCE', 'y': 'DCE', 'pg': 'DCE', 'm': 'DCE', 'l': 'DCE',
-                   'c': 'DCE', 'a': 'DCE', 'lh': 'DCE', 'eg': 'DCE', 'eb': 'DCE',
-                   'ps': 'GFEX', 'si': 'GFEX', 'sc': 'INE'}
-        ex = ex_map.get(prod, 'SHFE')
+        ex = EX_MAP.get(prod, 'SHFE')
         targets = [(ex, prod)]
     else:
-        # 默认: 流动性最好的几个品种
         targets = [('SHFE', 'cu'), ('DCE', 'pg'), ('CZCE', 'CF')]
 
-    for exchange, product in targets:
+    all_summary = {}
+    for idx, (exchange, product) in enumerate(targets):
+        print(f"\n[{idx+1}/{len(targets)}]", end="")
         try:
             result = run_product(exchange, product)
             if result:
@@ -637,11 +675,40 @@ def main():
                 with open(out_file, 'w') as f:
                     json.dump(result, f, indent=2, default=str, ensure_ascii=False)
                 print(f"  保存: {out_file}")
+                all_summary[f'{exchange}.{product}'] = {
+                    'valid_days': result['valid_days'],
+                    'total_days': result['total_days'],
+                    'best_A_pnl': result['best_A'].get('total_pnl', 0),
+                    'best_A_wr': result['best_A'].get('wr', 0),
+                    'best_A_trades': result['best_A'].get('trades', 0),
+                    'best_A_params': f"LB{result['best_A'].get('lookback','')}/Comp{result['best_A'].get('comp_th','')}/Hold{result['best_A'].get('hold_limit','')}m/TP{result['best_A'].get('tp_mult','')}x/SL{result['best_A'].get('sl_mult','')}x" if result['best_A'] else '',
+                    'best_B_pnl': result['best_B'].get('total_pnl', 0),
+                    'best_B_wr': result['best_B'].get('wr', 0),
+                    'winner': 'A' if result['best_A'].get('total_pnl', 0) > result['best_B'].get('total_pnl', 0) else 'B',
+                }
         except Exception as e:
-            print(f"  ERROR: {e}")
+            print(f"  ERROR {exchange}.{product}: {e}")
             import traceback
             traceback.print_exc()
         gc.collect()
+
+    # 全市场汇总
+    if len(all_summary) > 1:
+        summary_file = f'{OUT_DIR}/_ALL_SUMMARY.json'
+        with open(summary_file, 'w') as f:
+            json.dump(all_summary, f, indent=2, default=str, ensure_ascii=False)
+        print(f"\n{'='*60}")
+        print(f"全市场汇总: {len(all_summary)}品种")
+        a_wins = sum(1 for v in all_summary.values() if v['winner'] == 'A')
+        b_wins = len(all_summary) - a_wins
+        print(f"  策略A(均值回归)胜出: {a_wins}品种")
+        print(f"  策略B(动量)胜出: {b_wins}品种")
+        # Top 10 by A PnL
+        ranked = sorted(all_summary.items(), key=lambda x: x[1]['best_A_pnl'], reverse=True)
+        print(f"\n  Top 10 策略A:")
+        for sym, v in ranked[:10]:
+            print(f"    {sym:15s} PnL={v['best_A_pnl']:>8.0f} WR={v['best_A_wr']:.0f}% {v['best_A_trades']}笔 {v['best_A_params']}")
+        print(f"  保存: {summary_file}")
 
 
 if __name__ == '__main__':

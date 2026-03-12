@@ -4,7 +4,8 @@
     "created": "2026-02-28",
     "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、VRP策略、市场结构、到期日历等，贝叶斯持续更新",
     "product": "全市场商品期权(起源于ag白银)",
-    "update_count": 43
+    "update_count": 44,
+    "last_updated": "2026-03-12"
   },
   "beliefs": [
     {
@@ -1456,6 +1457,24 @@
           "action": "v2 DTE分桶回测完成, confidence 0.82→0.88, 14个Tier1品种, 平均PnL提升97%"
         }
       ]
+    },
+    {
+      "id": "B042",
+      "category": "strategy",
+      "name": "腿背离=均值回归信号(全市场验证)",
+      "description": "当高价腿方向≠Sum方向+IV不动时,背离是均值回归信号,应卖出Sum。全市场52品种回测: 51个A策略(均值回归)胜, 1个B(动量,ad仅3天数据)。Top: lc(28350), sn(13834), cu(7350), ni(6708)。S级: lc, ni。A级: cu/ru/OI/p/ag/br/CF/zn/si/eb/ps/y/pg。",
+      "confidence": 0.95,
+      "evidence": "52品种全市场回测,216组参数网格,DTE15-60,3年数据",
+      "source": "divergence_backtest.py",
+      "actionable": "实盘监控Sum与高价腿方向不一致+IV不动→卖出Sum。LB10/Comp1.0/Hold60m/SL2.0x通用参数",
+      "created": "2026-03-12",
+      "updated": "2026-03-12",
+      "update_count": 0,
+      "tags": [
+        "divergence",
+        "mean-reversion",
+        "all-market"
+      ]
     }
   ],
   "expiration_calendar": {
@@ -1829,6 +1848,11 @@
       "date": "2026-03-10",
       "action": "新增B039(夜盘23:00+ ATM宽跨卖出网格回测)",
       "details": "9品种(AU/AG/CU/AL/ZN/NI/SN/PB/SC)全历史1min回测, v1固定%TP vs v2 theta衰减TP对比. theta衰减6:3胜, 最优tp_coeff=0.3+SL腿比2-3x+进场+45min(23:45). AG Sharpe11.4/WR88%最亮眼"
+    },
+    {
+      "date": "2026-03-12",
+      "action": "新增B042-腿背离均值回归信号全市场验证",
+      "details": "52品种回测,51个A(均值回归)胜/1个B胜(ad仅3天)"
     }
   ]
 }
