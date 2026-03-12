@@ -2897,6 +2897,8 @@ def _build_trade_row(idx):
             'color': '#4fc3f7', 'fontSize': '11px', 'marginLeft': '2px'}),
         html.Span(id={'type': 'trade-entry-status', 'index': idx}, style={
             'color': '#00FF88', 'fontSize': '12px', 'marginLeft': '10px'}),
+        html.Span(id={'type': 'trade-entry-result', 'index': idx}, style={
+            'color': '#00FF88', 'fontSize': '12px'}),
     ]
 
     # 第二行：买入平仓 + 紧急停止
@@ -2938,6 +2940,8 @@ def _build_trade_row(idx):
             'color': '#FF6B6B', 'fontSize': '11px', 'marginLeft': '2px'}),
         html.Span(id={'type': 'trade-close-status', 'index': idx}, style={
             'color': '#FF6B6B', 'fontSize': '12px', 'marginLeft': '10px'}),
+        html.Span(id={'type': 'trade-close-result', 'index': idx}, style={
+            'color': '#FF6B6B', 'fontSize': '12px'}),
         html.Span('│', style={'color': '#333', 'margin': '0 8px'}),
         html.Button('停', id={'type': 'emergency-btn', 'index': idx}, n_clicks=0, style={
             'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
@@ -3369,14 +3373,68 @@ def _send_strategy_command_file(product, endpoint, payload=None):
         return False, str(e)
 
 
-def _start_strategy(product):
-    """自动启动指定品种的策略实例"""
+def _stop_strategy(product):
+    """强力杀死指定品种的旧策略进程（SIGTERM→等待→SIGKILL）"""
     import subprocess as _sp
+    import signal as _sig
+    pc = product.upper()
+    try:
+        result = _sp.run(['pgrep', '-f', f'main.py.*--product.*{pc}'],
+                         capture_output=True, text=True, timeout=3)
+        pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+    except Exception:
+        pids = []
+    if not pids:
+        return 0  # 无旧进程
+    killed = 0
+    for pid in pids:
+        try:
+            pid_int = int(pid)
+            # 1) SIGTERM 优雅关闭
+            os.kill(pid_int, _sig.SIGTERM)
+            # 2) 等最多5秒
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    os.kill(pid_int, 0)  # 检查是否还活着
+                except OSError:
+                    break  # 已退出
+            else:
+                # 3) 还没退出，SIGKILL
+                try:
+                    os.kill(pid_int, _sig.SIGKILL)
+                except OSError:
+                    pass
+            killed += 1
+        except (ValueError, OSError):
+            pass
+    if killed > 0:
+        # 等CTP释放旧会话（SIGKILL后需要更久）
+        time.sleep(3)
+    return killed
+
+
+def _start_strategy_worker(product):
+    """后台线程：先杀旧进程再启动新策略（阻塞操作，勿在回调中直接调用）"""
+    import subprocess as _sp
+    # 先杀旧进程
+    killed = _stop_strategy(product)
+    if killed > 0:
+        # 被SIGKILL的进程需等CTP释放会话
+        time.sleep(25)
     venv_python = os.path.join(_TRADE2026, '.venv/bin/python')
     main_py = os.path.join(_TRADE2026, 'main.py')
     log_file = os.path.join(_STATE_DIR, f'{product.lower()}_auto.log')
     cmd = f'cd {_TRADE2026} && nohup {venv_python} {main_py} live --product {product} --strategy strangle_sell -m auto >> {log_file} 2>&1 &'
     _sp.Popen(cmd, shell=True, cwd=_TRADE2026)
+
+
+def _start_strategy(product):
+    """非阻塞启动策略：后台线程先杀旧进程再启动新的"""
+    import threading
+    log_file = os.path.join(_STATE_DIR, f'{product.lower()}_auto.log')
+    t = threading.Thread(target=_start_strategy_worker, args=(product,), daemon=True)
+    t.start()
     return log_file
 
 
@@ -3529,8 +3587,8 @@ def on_emergency_stop_click(n_clicks, all_min_ask):
     Output({'type': 'emergency-status', 'index': MATCH}, 'children'),
     Output({'type': 'trade-entry-status', 'index': MATCH}, 'children', allow_duplicate=True),
     Output({'type': 'entry-condition-sum', 'index': MATCH}, 'value', allow_duplicate=True),
-    Output({'type': 'trade-close-status', 'index': MATCH}, 'children', allow_duplicate=True),
-    Output({'type': 'close-condition-sum', 'index': MATCH}, 'value', allow_duplicate=True),
+    Output({'type': 'trade-close-status', 'index': MATCH}, 'children'),
+    Output({'type': 'close-condition-sum', 'index': MATCH}, 'value'),
     Input({'type': 'emergency-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     prevent_initial_call=True,
@@ -3717,15 +3775,8 @@ def on_load_click(all_clicks, all_pairs, loading_state):
     if not product:
         return no_update, no_update
 
-    # 已就绪的不重复加载
-    if product in loading_state:
-        elapsed = time.time() - loading_state[product]
-        if elapsed >= _LOAD_READY_SECONDS and _is_strategy_running(product):
-            return no_update, no_update
-
-    # 启动策略
-    if not _is_strategy_running(product):
-        _start_strategy(product)
+    # 始终先杀旧进程再启动新的（解决CTP会话残留问题）
+    _start_strategy(product)
 
     loading_state[product] = time.time()
     return loading_state, False  # 启用load-timer
@@ -3798,17 +3849,16 @@ def update_close_condition_label(direction):
 
 
 @app.callback(
-    Output({'type': 'trade-entry-status', 'index': MATCH}, 'children'),
+    Output({'type': 'trade-entry-result', 'index': MATCH}, 'children'),
     Input({'type': 'trade-entry-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     State({'type': 'trade-volume', 'index': MATCH}, 'value'),
     State({'type': 'entry-condition-sum', 'index': MATCH}, 'value'),
     State({'type': 'entry-direction', 'index': MATCH}, 'value'),
     State({'type': 'entry-split-toggle', 'index': MATCH}, 'value'),
-    State('loading-state', 'data'),
     prevent_initial_call=True,
 )
-def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direction, split_toggle, loading_state):
+def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direction, split_toggle):
     """进仓按钮：POST /entry 到策略 HTTP API，支持卖出/买入方向"""
     print(f"[DEBUG 进仓] n_clicks={n_clicks}, entry_direction={entry_direction!r}, volume={volume}, split={split_toggle}")
     if not n_clicks:
@@ -3835,11 +3885,7 @@ def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direc
         if _es:
             return html.Span('系统已紧急停止，无法进仓', style={'color': '#FF4444'})
 
-        # 检查加载时间
-        load_time = (loading_state or {}).get(product)
-        if load_time and time.time() - load_time < _LOAD_READY_SECONDS:
-            remain = int(_LOAD_READY_SECONDS - (time.time() - load_time))
-            return html.Span(f'{product}策略加载中，还需{remain}秒', style={'color': '#FFD700'})
+        # loading_state检查已移除（Dash 4.0不支持MATCH回调混用普通ID State）
 
         direction = entry_direction or 'sell'
         dir_label = '买入' if direction == 'buy' else '卖出'
@@ -3880,7 +3926,7 @@ def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direc
 
 
 @app.callback(
-    Output({'type': 'trade-close-status', 'index': MATCH}, 'children'),
+    Output({'type': 'trade-close-result', 'index': MATCH}, 'children'),
     Input({'type': 'trade-close-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     State({'type': 'close-volume', 'index': MATCH}, 'value'),
@@ -3891,7 +3937,9 @@ def on_trade_entry_click(n_clicks, pair_json, volume, condition_sum, entry_direc
 )
 def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direction, split_toggle):
     """平仓按钮：POST /close 到策略 HTTP API，支持买入/卖出方向"""
+    print(f'[CLOSE-DEBUG] n_clicks={n_clicks}, pair_json={pair_json!r}, volume={volume}, direction={close_direction}', flush=True)
     if not n_clicks:
+        print('[CLOSE-DEBUG] → no_update (n_clicks falsy)', flush=True)
         return no_update
     if not pair_json:
         return html.Span('请先选择期权对', style={'color': '#FF4444'})
@@ -3902,8 +3950,12 @@ def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direc
         pair = json.loads(pair_json)
         product = _extract_product(pair['call'])
         if not product:
+            print('[CLOSE-DEBUG] → 无法识别品种', flush=True)
             return html.Span('无法识别品种', style={'color': '#FF4444'})
-        if not _is_strategy_running(product):
+        running = _is_strategy_running(product)
+        print(f'[CLOSE-DEBUG] product={product}, running={running}', flush=True)
+        if not running:
+            print(f'[CLOSE-DEBUG] → 策略未运行，返回提示', flush=True)
             return html.Span(f'{product}策略未运行，无法平仓', style={'color': '#FF4444'})
 
         # 检查紧急停止状态（HTTP API 或 fallback 文件）
@@ -3911,6 +3963,7 @@ def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direc
         _es = (status.get('emergency_stopped') if status else
                os.path.exists(os.path.join(_STATE_DIR, '.emergency_stop')))
         if _es:
+            print('[CLOSE-DEBUG] → 系统已紧急停止', flush=True)
             return html.Span('系统已紧急停止', style={'color': '#FF4444'})
 
         direction = close_direction or 'buy_close'
@@ -3932,6 +3985,7 @@ def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direc
                 payload['max_bid_sum'] = float(condition_sum)
 
         ok, msg = _send_strategy_command(product, 'close', payload)
+        print(f'[CLOSE-DEBUG] → send_command ok={ok}, msg={msg}', flush=True)
         if ok:
             ts = datetime.now().strftime("%H:%M:%S")
             if condition_sum and condition_sum > 0:
@@ -3948,6 +4002,9 @@ def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direc
         else:
             return html.Span(f'发送失败: {msg}', style={'color': '#FF4444'})
     except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        print(f'[CLOSE-DEBUG] → 异常: {e}', flush=True)
         return html.Span(f'发送失败: {e}', style={'color': '#FF4444'})
 
 
