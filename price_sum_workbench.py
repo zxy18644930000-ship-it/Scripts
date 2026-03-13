@@ -152,6 +152,9 @@ def calc_dte(product, month_str):
 # tick快照文件路径（交易系统每2秒写入一次）
 _TICK_SNAPSHOT_PATH = os.path.expanduser('~/Downloads/trade2026/state/tick_snapshot.json')
 
+# 背离检测 (B042: 全市场验证, 51/52品种均值回归有效)
+_diverge_signals = {}  # {call_sym|put_sym: diverge_info_dict}
+
 # 各交易所夜盘/日盘收盘时间  (HH:MM)
 _SESSION_CLOSE = {
     'CZCE':    {'night': '23:00', 'day': '15:00'},
@@ -256,6 +259,83 @@ def _load_tick_snapshot():
                 return None
         snap['_age'] = age if ts_str else 999
         return snap
+    except Exception:
+        return None
+
+
+# ============ 背离检测 (B042) ============
+
+def _detect_divergence(call_sym, put_sym, lookback=10):
+    """
+    检测腿背离信号 (B042: 全市场验证, 51/52品种均值回归有效)
+
+    信号: 高价腿方向 ≠ Sum方向 + 补偿比>=1.0 → 均值回归机会(卖出)
+    简化版: 不含IV过滤, 只看方向背离+补偿比
+
+    Returns: dict or None
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        n_bars = lookback + 5
+        bars = {}
+        for sym in [call_sym, put_sym]:
+            cur.execute(
+                "SELECT datetime, close_price FROM dbbardata "
+                "WHERE symbol = ? ORDER BY datetime DESC LIMIT ?",
+                (sym, n_bars))
+            rows = cur.fetchall()
+            if len(rows) < lookback + 1:
+                return None
+            bars[sym] = list(reversed(rows))
+
+        call_bars = bars[call_sym]
+        put_bars = bars[put_sym]
+
+        c_now = call_bars[-1][1]
+        p_now = put_bars[-1][1]
+        c_lb = call_bars[-(lookback + 1)][1]
+        p_lb = put_bars[-(lookback + 1)][1]
+
+        if c_now <= 0 or p_now <= 0 or c_lb <= 0 or p_lb <= 0:
+            return None
+
+        sum_now = c_now + p_now
+        sum_lb = c_lb + p_lb
+
+        high_leg = 'call' if c_now >= p_now else 'put'
+
+        if high_leg == 'call':
+            high_chg = c_now - c_lb
+            low_chg = p_now - p_lb
+        else:
+            high_chg = p_now - p_lb
+            low_chg = c_now - c_lb
+
+        sum_chg = sum_now - sum_lb
+
+        if sum_chg == 0 or high_chg == 0:
+            direction_diverge = False
+        else:
+            direction_diverge = (high_chg < 0) != (sum_chg < 0)
+
+        comp_ratio = abs(low_chg) / abs(high_chg) if abs(high_chg) > 0 else 0
+
+        is_diverge = direction_diverge and comp_ratio >= 1.0
+
+        return {
+            'diverge': is_diverge,
+            'high_leg': high_leg,
+            'high_chg': high_chg,
+            'low_chg': low_chg,
+            'sum_chg': sum_chg,
+            'sum_chg_pct': sum_chg / sum_lb * 100 if sum_lb > 0 else 0,
+            'comp_ratio': comp_ratio,
+            'call_now': c_now,
+            'put_now': p_now,
+            'sum_now': sum_now,
+            'bar_time': call_bars[-1][0],
+        }
     except Exception:
         return None
 
@@ -525,28 +605,78 @@ def _build_exit_timing_banner(manual_pairs):
 
 
 _DASHBOARD_JSON_PATH = os.path.expanduser('~/Downloads/trade2026/state/dashboard.json')
+_DASHBOARD_STATE_DIR = os.path.expanduser('~/Downloads/trade2026/state')
 _STRATEGY_STATE_DIR = os.path.expanduser('~/state')
 
 
 def _load_dashboard():
-    """读取dashboard.json，5分钟内视为有效"""
+    """聚合所有dashboard文件 + 策略日志中的CTP账户数据"""
+    import glob, re as _re
+    best = None
+    best_ts = None
     try:
-        if not os.path.exists(_DASHBOARD_JSON_PATH):
-            return None
-        with open(_DASHBOARD_JSON_PATH, 'r') as f:
-            data = json.load(f)
-        ts_str = data.get('timestamp')
-        if ts_str:
-            ts = datetime.fromisoformat(ts_str)
-            age = (datetime.now() - ts).total_seconds()
-            if age > 300:
-                return None
-            data['_age'] = age
-        else:
-            data['_age'] = 999
-        return data
+        # 收集所有dashboard文件
+        patterns = [
+            os.path.join(_DASHBOARD_STATE_DIR, 'dashboard.json'),
+            os.path.join(_DASHBOARD_STATE_DIR, 'dashboard_*.json'),
+        ]
+        files = []
+        for pat in patterns:
+            files.extend(glob.glob(pat))
+        for fpath in set(files):
+            try:
+                with open(fpath, 'r') as f:
+                    data = json.load(f)
+                ts_str = data.get('timestamp')
+                if not ts_str:
+                    continue
+                ts = datetime.fromisoformat(ts_str)
+                age = (datetime.now() - ts).total_seconds()
+                if age > 300:
+                    continue
+                has_positions = bool(data.get('positions'))
+                if best is None or has_positions or (not best.get('positions') and ts > best_ts):
+                    data['_age'] = age
+                    best = data
+                    best_ts = ts
+            except Exception:
+                continue
     except Exception:
-        return None
+        pass
+
+    # 如果dashboard账户数据缺失或可疑，从策略日志补充最新CTP账户数据
+    if best is None:
+        best = {'_age': 0}
+    acc = best.get('account') or {}
+    if not acc.get('balance') or acc.get('balance', 0) <= 0:
+        try:
+            # 从所有策略日志中找最新的账户资金更新
+            log_pattern = _re.compile(r'账户资金更新: 权益=([\d,]+)\s+可用=([\d,]+)\s+冻结=([\d,]+)')
+            latest_acc = None
+            for logf in glob.glob(os.path.join(_STRATEGY_STATE_DIR, '*_auto.log')):
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['tail', '-100', logf], capture_output=True, text=True, timeout=2
+                    )
+                    for line in reversed(result.stdout.splitlines()):
+                        m = log_pattern.search(line)
+                        if m:
+                            latest_acc = {
+                                'balance': float(m.group(1).replace(',', '')),
+                                'available': float(m.group(2).replace(',', '')),
+                                'frozen': float(m.group(3).replace(',', '')),
+                            }
+                            break
+                    if latest_acc:
+                        break
+                except Exception:
+                    continue
+            if latest_acc:
+                best['account'] = latest_acc
+        except Exception:
+            pass
+    return best if best.get('account') or best.get('health') else None
 
 
 def _load_strategy_positions():
@@ -1761,6 +1891,8 @@ def get_alert_stats():
                    if data['resolved'] else None,
         'median_min': (sorted(r['resolve_minutes'] for r in data['resolved'])[len(data['resolved']) // 2])
                       if data['resolved'] else None,
+        'first_alert_time': min(r.get('alert_time', '') for r in data['resolved'] + data['unresolved']),
+        'last_alert_time': max(r.get('alert_time', '') for r in data['resolved'] + data['unresolved']),
     } for prod, data in by_product.items()}
 
     # 最近记录（全部，不只回归的）
@@ -2997,6 +3129,16 @@ def serve_layout():
             'cursor': 'pointer', 'backgroundColor': '#1a0a3a', 'color': '#bb86fc',
             'border': '1px solid #bb86fc', 'borderRadius': '4px', 'marginTop': '3px',
             'marginRight': '8px'}),
+        html.Button('背离监控', id='diverge-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#3a1a0a', 'color': '#FF6B00',
+            'border': '1px solid #FF6B00', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
+        html.Button('CTP监控', id='ctp-monitor-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#0a2a1a', 'color': '#00DD00',
+            'border': '1px solid #00DD00', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
     ], style={'backgroundColor': '#1a1a2e', 'padding': '15px 25px',
               'borderBottom': '3px solid #e94560'}),
 
@@ -3014,6 +3156,39 @@ def serve_layout():
 
     # 预警统计面板（默认隐藏）
     html.Div(id='alert-stats-panel', style={'display': 'none'}),
+
+    # 背离监控面板（默认隐藏, B042）
+    html.Div([
+        html.Div(id='diverge-panel-content'),
+        html.Div([
+            html.Span('一键卖出: ', style={'color': '#FF6B00', 'fontWeight': 'bold',
+                                        'fontSize': '13px', 'marginRight': '8px'}),
+            dcc.Dropdown(id='diverge-pair-select', options=[], value=None,
+                         placeholder='选择背离信号对...',
+                         style={'width': '280px', 'display': 'inline-block',
+                                'verticalAlign': 'middle'}),
+            html.Span(' 手数: ', style={'color': '#aaa', 'fontSize': '13px',
+                                       'marginLeft': '12px'}),
+            dcc.Input(id='diverge-vol-input', type='number', min=1, max=100, value=1,
+                      style={'width': '60px', 'backgroundColor': '#2a2a4a',
+                             'color': '#fff', 'border': '1px solid #555',
+                             'borderRadius': '4px', 'padding': '4px 8px',
+                             'verticalAlign': 'middle'}),
+            html.Button('卖出', id='diverge-sell-btn', n_clicks=0,
+                        style={'marginLeft': '12px', 'padding': '6px 20px',
+                               'backgroundColor': '#FF4444', 'color': '#fff',
+                               'border': 'none', 'borderRadius': '4px',
+                               'cursor': 'pointer', 'fontWeight': 'bold',
+                               'verticalAlign': 'middle'}),
+            html.Span(id='diverge-sell-result',
+                      style={'marginLeft': '12px', 'fontSize': '13px'}),
+        ], style={'padding': '10px 25px', 'borderTop': '1px solid #333',
+                  'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap',
+                  'gap': '4px'}),
+    ], id='diverge-panel', style={'display': 'none'}),
+
+    # CTP连接监控面板（默认隐藏）
+    html.Div(id='ctp-monitor-panel', style={'display': 'none'}),
 
     # 账户+持仓状态栏（由tick快照动态更新）
     html.Div(id='account-bar'),
@@ -3439,11 +3614,12 @@ def _start_strategy(product):
 
 
 def _smart_round_volumes(total_volume, mode='entry'):
-    """智能分轮：entry=条件单友好少轮次，exit=效率优先拆粗"""
+    """智能分轮：均匀拆分，每轮数量尽量相等"""
     if total_volume <= 0:
         return []
     if total_volume <= 3:
         return [total_volume]
+    # 根据总量决定轮数
     if mode == 'exit':
         if total_volume <= 8:
             per = 3
@@ -3454,17 +3630,17 @@ def _smart_round_volumes(total_volume, mode='entry'):
     else:
         if total_volume <= 6:
             per = 3
-        elif total_volume <= 15:
-            per = 5
         elif total_volume <= 30:
             per = 5
         else:
             per = 10
-    rounds = []
-    rem = total_volume
-    while rem > 0:
-        rounds.append(min(per, rem))
-        rem -= rounds[-1]
+    # 计算轮数，然后均匀分配
+    import math
+    num_rounds = math.ceil(total_volume / per)
+    base = total_volume // num_rounds
+    extra = total_volume % num_rounds
+    # 前extra轮每轮base+1，剩余轮每轮base
+    rounds = [base + 1] * extra + [base] * (num_rounds - extra)
     return rounds
 
 
@@ -4120,6 +4296,37 @@ def render_charts(pairs, _):
             continue
         auto_items.append((i, ap, fig, info))
 
+    # ---- 背离信号检测 (B042) ----
+    global _diverge_signals
+    _diverge_signals = {}
+    for idx, pair, fig, info, cc, pc in manual_items:
+        call_sym, put_sym = pair[0], pair[1]
+        try:
+            div = _detect_divergence(call_sym, put_sym)
+            if div and div['diverge']:
+                key = f'{call_sym}|{put_sym}'
+                div['futures_sym'] = info.get('futures_sym', '?')
+                div['call_sym'] = call_sym
+                div['put_sym'] = put_sym
+                div['pair_type'] = 'manual'
+                _diverge_signals[key] = div
+        except Exception:
+            pass
+
+    for idx, ap, fig, info in auto_items:
+        call_sym, put_sym = ap['call'], ap['put']
+        try:
+            div = _detect_divergence(call_sym, put_sym)
+            if div and div['diverge']:
+                key = f'{call_sym}|{put_sym}'
+                div['futures_sym'] = ap.get('product', info.get('futures_sym', '?'))
+                div['call_sym'] = call_sym
+                div['put_sym'] = put_sym
+                div['pair_type'] = 'auto'
+                _diverge_signals[key] = div
+        except Exception:
+            pass
+
     # ---- 布林线警报检测：收集所有触发警报的项 ----
     alert_manual = [(idx, pair, fig, info, cc, pc) for idx, pair, fig, info, cc, pc in manual_items
                      if info.get('double_rise', {}).get('alert')]
@@ -4231,6 +4438,35 @@ def render_charts(pairs, _):
                     html.Div(f'+{dr.get("sum_chg", 0)*100:.1f}%',
                              style={'fontSize': '11px', 'color': '#FF8888'}),
                 ], href=f'#alert-a-{idx}', className='nav-item', style=nav_style))
+
+    # 背离信号导航 (B042) — 构建 call_sym → anchor 映射
+    _diverge_anchor_map = {}
+    for idx, pair, fig, info, cc, pc in manual_items:
+        cs, ps = pair[0], pair[1]
+        is_alert = idx in alert_manual_indices
+        _diverge_anchor_map[f'{cs}|{ps}'] = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
+    for idx, ap, fig, info in auto_items:
+        cs, ps = ap['call'], ap['put']
+        is_alert = idx in alert_auto_indices
+        _diverge_anchor_map[f'{cs}|{ps}'] = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
+
+    if _diverge_signals:
+        nav.append(html.Div('背离信号', style={
+            'padding': '8px 12px', 'color': '#FF6B00', 'fontSize': '11px',
+            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
+            'borderBottom': '2px solid #FF6B00'}))
+        for dkey, dsig in _diverge_signals.items():
+            fs = dsig.get('futures_sym', '?')
+            anchor = _diverge_anchor_map.get(dkey, 'diverge-banner')
+            cs = dsig.get('call_sym', '?')
+            ps = dsig.get('put_sym', '?')
+            nav.append(html.A([
+                html.Div(f'⚡ {fs}', style={
+                    'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FF6B00'}),
+                html.Div(f'{cs}+{ps}', style={'fontSize': '10px', 'color': '#CC8833'}),
+                html.Div(f'{dsig["comp_ratio"]:.1f}x {dsig["high_leg"][0].upper()}↓',
+                         style={'fontSize': '11px', 'color': '#FF9944'}),
+            ], href=f'#{anchor}', className='nav-item', style=nav_style))
 
     if normal_manual:
         nav.append(html.Div('自选', style={
@@ -4394,10 +4630,41 @@ def render_charts(pairs, _):
             else:
                 charts.append(_auto_card(*item, is_alert=True))
 
+    # 1.5) 背离信号区 (B042)
+    if _diverge_signals:
+        div_products = []
+        for dkey, dsig in _diverge_signals.items():
+            fs = dsig.get('futures_sym', '?')
+            hl = 'C' if dsig['high_leg'] == 'call' else 'P'
+            div_products.append(f'{fs} {hl}↓{dsig["comp_ratio"]:.1f}x')
+
+        charts.append(html.Div([
+            html.Span('⚡ 背离信号  ', style={'color': '#FF6B00', 'fontSize': '17px', 'fontWeight': 'bold'}),
+            html.Span(' | '.join(div_products),
+                       style={'color': '#FF9944', 'fontSize': '14px'}),
+            html.Div('高价腿方向 ≠ Sum方向 + 低价腿过度补偿 → 均值回归卖出机会（B042: 51/52品种验证）',
+                      style={'color': '#FF9944', 'fontSize': '12px', 'marginTop': '4px', 'opacity': '0.8'}),
+        ], id='diverge-banner', style={
+            'padding': '14px 20px', 'backgroundColor': '#3a1a0a',
+            'borderTop': '3px solid #FF6B00', 'borderBottom': '3px solid #FF6B00'}))
+
     # 2) 自选区（所有手动对，有警报的标红）
     for idx, pair, fig, info, cc, pc in manual_items:
         is_alert = idx in alert_manual_indices
         charts.append(_manual_card(idx, pair, fig, info, cc, pc, is_alert=is_alert))
+        # 背离徽章叠加
+        dkey = f'{pair[0]}|{pair[1]}'
+        if dkey in _diverge_signals:
+            dsig = _diverge_signals[dkey]
+            hl = 'C' if dsig['high_leg'] == 'call' else 'P'
+            charts.append(html.Div([
+                html.Span(f'⚡ 背离 {hl}↓{dsig["high_chg"]:.0f} 补偿{dsig["comp_ratio"]:.1f}x',
+                           style={'color': '#FF6B00', 'fontWeight': 'bold', 'fontSize': '12px'}),
+                html.Span(f'  Sum={dsig["sum_now"]:.0f} ({dsig["sum_chg_pct"]:+.1f}%)',
+                           style={'color': '#FF9944', 'fontSize': '12px', 'marginLeft': '10px'}),
+            ], style={'padding': '4px 20px', 'backgroundColor': '#2a1500',
+                      'borderLeft': '3px solid #FF6B00', 'marginTop': '-8px',
+                      'marginBottom': '8px'}))
 
     # 3) 智能推荐区（排除已在警报区渲染的）
     if non_alert_auto:
@@ -4409,6 +4676,19 @@ def render_charts(pairs, _):
 
         for idx, ap, fig, info in non_alert_auto:
             charts.append(_auto_card(idx, ap, fig, info))
+            # 背离徽章叠加
+            dkey = f'{ap["call"]}|{ap["put"]}'
+            if dkey in _diverge_signals:
+                dsig = _diverge_signals[dkey]
+                hl = 'C' if dsig['high_leg'] == 'call' else 'P'
+                charts.append(html.Div([
+                    html.Span(f'⚡ 背离 {hl}↓{dsig["high_chg"]:.0f} 补偿{dsig["comp_ratio"]:.1f}x',
+                               style={'color': '#FF6B00', 'fontWeight': 'bold', 'fontSize': '12px'}),
+                    html.Span(f'  Sum={dsig["sum_now"]:.0f} ({dsig["sum_chg_pct"]:+.1f}%)',
+                               style={'color': '#FF9944', 'fontSize': '12px', 'marginLeft': '10px'}),
+                ], style={'padding': '4px 20px', 'backgroundColor': '#2a1500',
+                          'borderLeft': '3px solid #FF6B00', 'marginTop': '-8px',
+                          'marginBottom': '8px'}))
 
     charts_area = html.Div(charts, style={'flex': '1', 'minWidth': '0'})
 
@@ -5387,6 +5667,8 @@ def toggle_plan(n_clicks):
             belief_tags.setdefault(key, []).append('B018周五')
         if prod_upper == 'AO' and 5 <= dte <= 19:
             belief_tags.setdefault(key, []).append('B038夜Scalp')
+        if prod_upper == 'AG' and 30 <= dte <= 60:
+            belief_tags.setdefault(key, []).append('B042夜Loop')
         if prod_upper == 'CF' and 30 <= dte <= 60:
             belief_tags.setdefault(key, []).append('B021')
         if prod_upper == 'SA' and 25 <= dte <= 60:
@@ -5691,6 +5973,45 @@ def toggle_plan(n_clicks):
                 'color': '#ff9800', 'fontSize': '11px', 'marginTop': '4px'}),
             html.Div('DTE5-10天最优 | 不持仓过夜 | 23:00后流动性下降但AO仍可交易至01:00', style={
                 'color': '#888', 'fontSize': '11px'}),
+            html.Div('⚠ B042v2发现: AO循环做P50仅2tick, 过滤≤3tick后PnL接近零, 刷单风险高, 仅适合单次进出', style={
+                'color': '#f44336', 'fontSize': '11px'}),
+        ], style={'marginBottom': '6px'})))
+
+    # --- B042v2: AG白银 夜盘后半场循环做 (23:15~02:25) ---
+    ag_lines = []
+    for mo_off in range(0, 8):
+        yr, mo = today_d.year, today_d.month + mo_off
+        if mo > 12:
+            yr += 1; mo -= 12
+        exp = _get_expiry('SHFE', yr, mo, _cal, product_code='AG')
+        if not exp:
+            continue
+        dte = (exp - today_d).days
+        contract = f'ag{yr % 100:02d}{mo:02d}'
+        if 0 < dte <= 70:
+            if 30 <= dte <= 60:
+                ag_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — ★黄金区间: Sharpe=7.4/WR=80%/PnL+1.50%',
+                    style={'color': '#00FF88', 'fontSize': '12px', 'fontWeight': 'bold'}))
+            elif 20 <= dte < 30:
+                ag_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — 可交易但非最优(DTE偏短)',
+                    style={'color': '#FFD700', 'fontSize': '12px'}))
+            elif dte > 60:
+                ag_lines.append(html.Div(
+                    f'  {contract} DTE={dte}天 到期{exp} — DTE过长: Sharpe仅0.4,不推荐',
+                    style={'color': '#888', 'fontSize': '12px'}))
+    if ag_lines:
+        alerts.append((1, html.Div([
+            html.Span('白银(SHFE.AG) 夜盘后半场循环做 ', style={
+                'color': '#ff4444', 'fontWeight': 'bold', 'fontSize': '13px'}),
+            html.Span('B042v2 | 23:15入场ATM跨式卖出→TP/SL/FC→冷却5min→再入场 | 每晚~3轮', style={
+                'color': '#666', 'fontSize': '11px'}),
+            *ag_lines,
+            html.Div('策略: 23:15入场ATM跨式 → TP=权利金÷DTE×0.8 → SL=腿比≥5.0x → 02:25强平 | 1手循环', style={
+                'color': '#ff9800', 'fontSize': '11px', 'marginTop': '4px'}),
+            html.Div('回测: Sharpe=7.0(ALL)/7.4(DTE30-60) | 过滤≤3tick后PnL仅衰减11% | P50=4tick真实可靠', style={
+                'color': '#888', 'fontSize': '11px'}),
         ], style={'marginBottom': '6px'})))
 
     # --- B018: 棕榈油周五夜盘Scalp ---
@@ -5879,9 +6200,12 @@ def _build_alert_stats_panel():
             for p, d in prod_items:
                 avg_str = f'{d["avg_min"]:.0f}分钟' if d.get('avg_min') is not None else '-'
                 med_str = f'{d["median_min"]:.0f}分钟' if d.get('median_min') is not None else '-'
+                first_t = d.get('first_alert_time', '')
+                first_str = first_t[-8:] if first_t else '-'  # HH:MM:SS
                 rate_color = '#00e676' if d['resolve_rate'] >= 80 else '#FFD700' if d['resolve_rate'] >= 50 else '#FF4444'
                 rows.append(html.Tr([
                     html.Td(p, style={'color': '#FFD700', 'fontWeight': 'bold', 'padding': '4px 12px'}),
+                    html.Td(first_str, style={'color': '#4fc3f7', 'padding': '4px 12px'}),
                     html.Td(f'{d["total"]}', style={'color': '#aaa', 'padding': '4px 12px'}),
                     html.Td(f'{d["resolved"]}', style={'color': '#00e676', 'padding': '4px 12px'}),
                     html.Td(f'{d["unresolved"]}', style={'color': '#FF4444' if d["unresolved"] else '#aaa', 'padding': '4px 12px'}),
@@ -5894,7 +6218,8 @@ def _build_alert_stats_panel():
                                          'marginBottom': '6px'}),
                 html.Table([
                     html.Thead(html.Tr([
-                        html.Th('品种', style=th_style), html.Th('总计', style=th_style),
+                        html.Th('品种', style=th_style), html.Th('首次预警', style=th_style),
+                        html.Th('总计', style=th_style),
                         html.Th('回归', style=th_style), html.Th('未回归', style=th_style),
                         html.Th('回归率', style=th_style), html.Th('平均', style=th_style),
                         html.Th('中位', style=th_style),
@@ -5933,7 +6258,7 @@ def _build_alert_stats_panel():
                     html.Thead(html.Tr([
                         html.Th('品种', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
                         html.Th('期权对', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
-                        html.Th('时间', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
+                        html.Th('开始预警', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
                         html.Th('Sum变化', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
                         html.Th('峰值偏离', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
                         html.Th('结果', style={'color': '#666', 'padding': '3px 10px', 'textAlign': 'left'}),
@@ -6024,6 +6349,304 @@ def diag_page():
     test();
     </script></body></html>
     """
+
+
+# ============ 背离监控面板 + 一键卖出 (B042) ============
+
+@app.callback(
+    Output('diverge-panel-content', 'children'),
+    Output('diverge-panel', 'style'),
+    Output('diverge-pair-select', 'options'),
+    Output('diverge-pair-select', 'value'),
+    Input('diverge-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_diverge(n_clicks):
+    """切换背离监控面板"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}, no_update, no_update
+
+    signals = _diverge_signals
+    if not signals:
+        content = html.Div([
+            html.Div([
+                html.Span('背离监控 (B042)', style={'color': '#FF6B00', 'fontSize': '16px',
+                                                    'fontWeight': 'bold'}),
+                html.Span('  高价腿方向 ≠ Sum方向 + 补偿比≥1.0 → 均值回归卖出机会',
+                           style={'color': '#888', 'fontSize': '12px', 'marginLeft': '12px'}),
+            ], style={'padding': '10px 25px', 'borderBottom': '1px solid #333'}),
+            html.Div('当前无背离信号。数据来源: 最近10根1分钟K线, 每60秒刷新。',
+                      style={'color': '#666', 'padding': '30px 25px', 'textAlign': 'center'}),
+        ])
+        return content, {
+            'display': 'block', 'backgroundColor': '#1a1008',
+            'borderBottom': '3px solid #FF6B00', 'marginBottom': '5px',
+        }, [], None
+
+    # 构建信号表格
+    th_style = {'color': '#888', 'padding': '6px 12px', 'textAlign': 'left',
+                'borderBottom': '1px solid #333'}
+    rows = []
+    options = []
+    first_val = None
+    for key, sig in signals.items():
+        fs = sig.get('futures_sym', '?')
+        hl = 'Call' if sig['high_leg'] == 'call' else 'Put'
+        hl_color = '#00BFFF' if sig['high_leg'] == 'call' else '#FF6B6B'
+        # 判断策略是否在运行
+        product = _extract_product(sig['call_sym'])
+        running = _is_strategy_running(product)
+        status_span = html.Span('在线', style={'color': '#00FF88', 'fontSize': '11px'}) if running \
+            else html.Span('离线', style={'color': '#666', 'fontSize': '11px'})
+
+        rows.append(html.Tr([
+            html.Td(fs, style={'color': '#FF6B00', 'fontWeight': 'bold', 'padding': '6px 12px'}),
+            html.Td([html.Span(hl, style={'color': hl_color, 'fontWeight': 'bold'}),
+                      html.Span(f' {sig["high_chg"]:+.0f}', style={'color': '#aaa'})],
+                     style={'padding': '6px 12px'}),
+            html.Td(f'{sig["comp_ratio"]:.2f}x', style={
+                'color': '#FFD700' if sig['comp_ratio'] >= 1.5 else '#FF9944',
+                'fontWeight': 'bold', 'padding': '6px 12px'}),
+            html.Td(f'{sig["sum_now"]:.0f}', style={'color': '#FFD700', 'padding': '6px 12px'}),
+            html.Td(f'{sig["sum_chg_pct"]:+.1f}%', style={
+                'color': '#FF4444' if sig['sum_chg_pct'] > 0 else '#00e676',
+                'padding': '6px 12px'}),
+            html.Td(status_span, style={'padding': '6px 12px'}),
+            html.Td(sig.get('bar_time', '')[-8:], style={'color': '#666', 'padding': '6px 12px'}),
+        ]))
+        label = f'{fs} ({sig["call_sym"]} + {sig["put_sym"]})'
+        options.append({'label': label, 'value': key})
+        if first_val is None:
+            first_val = key
+
+    content = html.Div([
+        html.Div([
+            html.Span('背离监控 (B042)', style={'color': '#FF6B00', 'fontSize': '16px',
+                                                'fontWeight': 'bold'}),
+            html.Span(f'  {len(signals)}个信号',
+                       style={'color': '#FF9944', 'fontSize': '13px', 'marginLeft': '12px'}),
+            html.Span('  高价腿↓ + Sum↑ + 补偿≥1.0 → 卖出（均值回归）',
+                       style={'color': '#888', 'fontSize': '12px', 'marginLeft': '12px'}),
+        ], style={'padding': '10px 25px', 'borderBottom': '1px solid #333'}),
+        html.Div([
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th('品种', style=th_style),
+                    html.Th('高价腿', style=th_style),
+                    html.Th('补偿比', style=th_style),
+                    html.Th('Sum', style=th_style),
+                    html.Th('Sum变化', style=th_style),
+                    html.Th('执行器', style=th_style),
+                    html.Th('时间', style=th_style),
+                ])),
+                html.Tbody(rows),
+            ], style={'fontSize': '13px', 'width': '100%'}),
+        ], style={'padding': '10px 25px'}),
+    ])
+
+    return content, {
+        'display': 'block', 'backgroundColor': '#1a1008',
+        'borderBottom': '3px solid #FF6B00', 'marginBottom': '5px',
+    }, options, first_val
+
+
+@app.callback(
+    Output('diverge-sell-result', 'children'),
+    Output('diverge-sell-result', 'style'),
+    Input('diverge-sell-btn', 'n_clicks'),
+    State('diverge-pair-select', 'value'),
+    State('diverge-vol-input', 'value'),
+    prevent_initial_call=True,
+)
+def execute_diverge_sell(n_clicks, pair_key, volume):
+    """一键卖出: 通过trade2026执行器发送进仓指令 (使用algos.decide_price, 不扫单)"""
+    if not n_clicks or not pair_key or not volume:
+        return '请选择信号对和手数', {'color': '#FF4444', 'marginLeft': '12px', 'fontSize': '13px'}
+
+    volume = int(volume)
+    if volume < 1 or volume > 100:
+        return '手数范围: 1-100', {'color': '#FF4444', 'marginLeft': '12px', 'fontSize': '13px'}
+
+    # 解析 call|put
+    parts = pair_key.split('|')
+    if len(parts) != 2:
+        return '信号格式错误', {'color': '#FF4444', 'marginLeft': '12px', 'fontSize': '13px'}
+
+    call_sym, put_sym = parts[0], parts[1]
+    product = _extract_product(call_sym)
+
+    # 通过HTTP API或文件信号发送进仓命令
+    payload = {
+        'call': call_sym,
+        'put': put_sym,
+        'volume': volume,
+        'direction': 'sell',
+        'source': 'divergence_alert',
+    }
+
+    success, msg = _send_strategy_command(product, 'entry', payload)
+
+    if success:
+        result_text = f'已发送 {product} 卖出{volume}手 ({msg})'
+        result_style = {'color': '#00FF88', 'marginLeft': '12px', 'fontSize': '13px',
+                        'fontWeight': 'bold'}
+    else:
+        result_text = f'发送失败: {msg}'
+        result_style = {'color': '#FF4444', 'marginLeft': '12px', 'fontSize': '13px'}
+
+    return result_text, result_style
+
+
+# ==================== CTP 连接监控面板 ====================
+
+def _build_ctp_monitor_content():
+    """构建CTP连接监控面板内容"""
+    import subprocess as _sp
+
+    children = []
+
+    # —— 1. 最近登录错误 ——
+    _ctp_error_path = os.path.expanduser('~/Downloads/trade2026/state/ctp_error.json')
+    error_data = None
+    try:
+        if os.path.exists(_ctp_error_path):
+            with open(_ctp_error_path) as f:
+                error_data = json.load(f)
+    except Exception:
+        pass
+
+    if error_data:
+        ts = error_data.get('timestamp', '')[:19].replace('T', ' ')
+        code = error_data.get('error_code', '?')
+        friendly = error_data.get('friendly_msg', error_data.get('error_msg', '未知'))
+        product = error_data.get('product', '?')
+
+        try:
+            from datetime import datetime as _dt
+            err_time = _dt.fromisoformat(error_data['timestamp'])
+            age_min = (_dt.now() - err_time).total_seconds() / 60
+            is_recent = age_min < 60
+        except Exception:
+            is_recent = False
+
+        err_color = '#FF4444' if is_recent else '#888'
+        err_label = '最近登录失败' if is_recent else '历史登录失败'
+
+        children.append(html.Div([
+            html.Span(f'⚠ {err_label}', style={
+                'color': err_color, 'fontWeight': 'bold', 'fontSize': '14px'}),
+            html.Span(f'  [{ts}] 品种={product} 错误码={code}', style={
+                'color': '#ccc', 'fontSize': '13px', 'marginLeft': '10px'}),
+            html.Br(),
+            html.Span(f'  原因: {friendly}', style={
+                'color': err_color, 'fontSize': '14px', 'fontWeight': 'bold',
+                'marginLeft': '20px'}),
+        ], style={'padding': '8px 0', 'borderBottom': '1px solid #333'}))
+    else:
+        children.append(html.Div(
+            html.Span('CTP 最近无登录错误', style={'color': '#00FF88', 'fontSize': '13px'}),
+            style={'padding': '8px 0', 'borderBottom': '1px solid #333'}
+        ))
+
+    # —— 2. 本机 CTP 进程列表 ——
+    try:
+        ps_out = _sp.check_output(['ps', 'aux'], text=True, timeout=5)
+        procs = []
+        for line in ps_out.strip().split('\n')[1:]:
+            if any(kw in line for kw in ['trade2026', 'ctp_data_collector']):
+                if 'grep' in line or 'price_sum_workbench' in line or '/bin/sh' in line:
+                    continue
+                parts = line.split(None, 10)
+                if len(parts) >= 11:
+                    pid = parts[1]
+                    cpu = parts[2]
+                    mem_kb = parts[5]
+                    try:
+                        mem_mb = f"{int(mem_kb) // 1024}MB"
+                    except ValueError:
+                        mem_mb = mem_kb
+                    started = parts[8]
+                    cmd = parts[10]
+                    if 'ctp_data_collector' in cmd:
+                        label = '数据采集器'
+                        color = '#00DD00'
+                    elif '--product' in cmd:
+                        import re
+                        pm = re.search(r'--product\s+(\w+)', cmd)
+                        label = f'实盘 {pm.group(1)}' if pm else '实盘'
+                        color = '#FFD700'
+                    else:
+                        label = '其他'
+                        color = '#aaa'
+                    procs.append((pid, label, color, cpu, mem_mb, started, cmd))
+    except Exception:
+        procs = []
+
+    children.append(html.Div([
+        html.Span(f'本机 CTP 进程 ({len(procs)}个)', style={
+            'color': '#00BFFF', 'fontWeight': 'bold', 'fontSize': '14px'}),
+    ], style={'padding': '8px 0 4px 0'}))
+
+    if procs:
+        rows = []
+        for pid, label, color, cpu, mem, started, cmd in procs:
+            rows.append(html.Tr([
+                html.Td(pid, style={'color': '#aaa', 'padding': '3px 12px 3px 0'}),
+                html.Td(label, style={'color': color, 'fontWeight': 'bold',
+                                      'padding': '3px 12px 3px 0'}),
+                html.Td(f'CPU {cpu}%', style={'color': '#ccc', 'padding': '3px 12px 3px 0'}),
+                html.Td(mem, style={'color': '#ccc', 'padding': '3px 12px 3px 0'}),
+                html.Td(started, style={'color': '#888', 'padding': '3px 12px 3px 0'}),
+            ]))
+        children.append(html.Table(rows, style={
+            'fontSize': '12px', 'fontFamily': 'monospace', 'marginLeft': '20px'}))
+    else:
+        children.append(html.Span('  无运行中的CTP进程', style={
+            'color': '#888', 'fontSize': '12px', 'marginLeft': '20px'}))
+
+    # —— 3. 会话限制说明 ——
+    # 每个进程算1个CTP连接（TD+MD合计为1个客户端连接）
+    runner_count = sum(1 for _, label, *_ in procs if '实盘' in label)
+    collector_count = sum(1 for _, label, *_ in procs if '采集' in label)
+    total_sessions = runner_count + collector_count
+    warn_color = '#FF4444' if total_sessions >= 5 else '#FFD700' if total_sessions >= 3 else '#00FF88'
+    children.append(html.Div([
+        html.Span(f'本机占用 {total_sessions} 个CTP连接', style={
+            'color': warn_color, 'fontSize': '13px', 'fontWeight': 'bold'}),
+        html.Span(f'  ({runner_count}个实盘 + {collector_count}个采集器)', style={
+            'color': '#aaa', 'fontSize': '12px'}),
+        html.Span('  |  期货公司通常限5-6个连接（含文华财经等外部终端）', style={
+            'color': '#888', 'fontSize': '12px'}),
+    ], style={'padding': '8px 0 4px 0', 'borderTop': '1px solid #333'}))
+
+    children.append(html.Div([
+        html.Span('注: CTP API不支持查询远程会话IP，如需查看所有登录设备请联系期货公司', style={
+            'color': '#666', 'fontSize': '11px', 'fontStyle': 'italic'}),
+    ], style={'padding': '4px 0'}))
+
+    return children
+
+
+@app.callback(
+    Output('ctp-monitor-panel', 'children'),
+    Output('ctp-monitor-panel', 'style'),
+    Input('ctp-monitor-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_ctp_monitor(n_clicks):
+    """切换CTP监控面板"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    content = _build_ctp_monitor_content()
+    panel_style = {
+        'display': 'block',
+        'backgroundColor': '#0f1a0f',
+        'padding': '15px 25px',
+        'borderBottom': '2px solid #00DD00',
+        'marginBottom': '0',
+    }
+    return content, panel_style
 
 
 if __name__ == '__main__':
