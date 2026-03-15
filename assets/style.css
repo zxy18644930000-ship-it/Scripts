@@ -1,6 +1,23 @@
 html { scroll-behavior: smooth; }
 .nav-item:hover { background-color: #2a2a4a !important; border-left-color: #FFD700 !important; }
 
+/* 侧边栏折叠 */
+details > summary { list-style: none; cursor: pointer; user-select: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary .nav-toggle { float: right; font-size: 10px; transition: transform 0.2s; }
+details[open] > summary .nav-toggle { transform: rotate(0deg); }
+details:not([open]) > summary .nav-toggle { transform: rotate(-90deg); }
+/* 侧边栏删除按钮 — 左侧小圆点，hover 变红叉 */
+.nav-del-x { background: none; border: none; color: #444; cursor: pointer;
+             font-size: 11px; padding: 4px 4px 4px 0; opacity: 0.6; line-height: 1;
+             flex-shrink: 0; min-width: 16px; text-align: center; }
+.nav-del-x:hover { opacity: 1 !important; color: #e94560 !important; font-size: 13px !important; }
+/* 隐藏 sidebar 滚动条但保持可滚动 */
+.nav-sidebar { scrollbar-width: thin; scrollbar-color: #333 transparent; }
+.nav-sidebar::-webkit-scrollbar { width: 4px; }
+.nav-sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+.nav-sidebar::-webkit-scrollbar-track { background: transparent; }
+
 /* Dash Dropdown 暗色主题 — 通过 className="dark-dropdown" 挂载 */
 /* 外层容器 */
 .dark-dropdown {

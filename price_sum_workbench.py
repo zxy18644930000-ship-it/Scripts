@@ -292,10 +292,17 @@ def _detect_divergence(call_sym, put_sym, lookback=10):
         call_bars = bars[call_sym]
         put_bars = bars[put_sym]
 
-        c_now = call_bars[-1][1]
-        p_now = put_bars[-1][1]
-        c_lb = call_bars[-(lookback + 1)][1]
-        p_lb = put_bars[-(lookback + 1)][1]
+        # 用3根K线中位数平滑，防止结算价bar污染和单tick噪音
+        def _med3(barlist, idx):
+            """取 barlist[idx-1], barlist[idx], barlist[idx+1] 的中位数"""
+            i = max(1, min(idx, len(barlist) - 2))
+            return sorted([barlist[i-1][1], barlist[i][1], barlist[i+1][1]])[1]
+
+        c_now = _med3(call_bars, len(call_bars) - 2)  # 倒数第2根为中心
+        p_now = _med3(put_bars, len(put_bars) - 2)
+        lb_idx = len(call_bars) - (lookback + 1)
+        c_lb = _med3(call_bars, lb_idx)
+        p_lb = _med3(put_bars, min(lb_idx, len(put_bars) - 2))
 
         if c_now <= 0 or p_now <= 0 or c_lb <= 0 or p_lb <= 0:
             return None
@@ -321,7 +328,13 @@ def _detect_divergence(call_sym, put_sym, lookback=10):
 
         comp_ratio = abs(low_chg) / abs(high_chg) if abs(high_chg) > 0 else 0
 
-        is_diverge = direction_diverge and comp_ratio >= 1.0
+        # 噪音过滤：变化幅度太小的不算背离
+        sum_chg_pct = abs(sum_chg) / sum_lb * 100 if sum_lb > 0 else 0
+        high_price = c_now if high_leg == 'call' else p_now
+        high_chg_pct = abs(high_chg) / high_price * 100 if high_price > 0 else 0
+        too_small = sum_chg_pct < 2.0 or high_chg_pct < 3.0
+
+        is_diverge = direction_diverge and comp_ratio >= 1.0 and not too_small
 
         return {
             'diverge': is_diverge,
@@ -1010,13 +1023,27 @@ def _build_account_bar():
         row2_parts.append(html.Span(f'止损≥{sl_ratio}倍', style={
             **tag_style, 'color': '#FF6B6B', 'backgroundColor': '#FF6B6B22'}))
 
-        # 止盈模式
+        # 止盈模式 — 优先用v6 tp_coeff（theta衰减），回退take_profit_mult（旧版百分比）
         tp_mode = tp.get('take_profit_mode', 'dte_adaptive')
         if tp_mode == 'fixed_pct':
             tp_pct = tp.get('take_profit_fixed_pct', 0.07)
             tp_text = f'止盈{tp_pct:.0%}/天'
         else:
-            tp_mult = tp.get('take_profit_mult', 1.0)
+            # 尝试从v6获取实际tp_coeff（用state里的yymm + calc_dte）
+            v6_tp = None
+            try:
+                from infra.config.commodity_config import get_v6_params
+                sp = state.get('selected_pair', {})
+                yymm = sp.get('call', {}).get('yymm') or sp.get('put', {}).get('yymm', '')
+                if yymm and product:
+                    dte_val = calc_dte(product, yymm)
+                    if dte_val is not None:
+                        v6 = get_v6_params(product, dte_val)
+                        if v6:
+                            v6_tp = v6['tp_coeff']
+            except Exception:
+                pass
+            tp_mult = v6_tp if v6_tp is not None else tp.get('tp_coeff', tp.get('take_profit_mult', 1.0))
             tp_text = f'止盈DTE×{tp_mult}'
         row2_parts.append(html.Span(tp_text, style={
             **tag_style, 'color': '#00FF88', 'backgroundColor': '#00FF8822'}))
@@ -1793,7 +1820,7 @@ def record_alert(call_sym, put_sym, futures_sym, dr_info, sum_now, boll_middle):
     print(f'[alert_history] 新预警(已存盘): {futures_sym} {call_sym}+{put_sym} sum={sum_now:.1f} upper={dr_info.get("boll_upper", 0):.1f}')
 
 
-def check_alert_resolved(call_sym, put_sym, sum_now, boll_middle):
+def check_alert_resolved(call_sym, put_sym, sum_now, boll_middle, boll_upper=None):
     """检查活跃预警是否已回归均值（价格之和回到布林中轨附近）"""
     key = f'{call_sym}|{put_sym}'
     if key not in _alert_active:
@@ -1802,9 +1829,13 @@ def check_alert_resolved(call_sym, put_sym, sum_now, boll_middle):
     if rec['resolved']:
         return
 
-    # 更新最后已知价格（无论是否回归）
+    # 更新最后已知价格和实时布林值（无论是否回归）
     rec['last_sum'] = sum_now
     rec['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if boll_middle > 0:
+        rec['boll_middle'] = boll_middle
+    if boll_upper is not None and boll_upper > 0:
+        rec['boll_upper'] = boll_upper
 
     # 回归条件：价格之和 <= 布林中轨（真正回到均值）
     if sum_now <= boll_middle:
@@ -3189,6 +3220,8 @@ def serve_layout():
 
     # CTP连接监控面板（默认隐藏）
     html.Div(id='ctp-monitor-panel', style={'display': 'none'}),
+    dcc.Store(id='kill-ctp-store'),
+    html.Div(id='kill-ctp-result', style={'display': 'none'}),
 
     # 账户+持仓状态栏（由tick快照动态更新）
     html.Div(id='account-bar'),
@@ -3299,6 +3332,28 @@ app.clientside_callback(
     Input('back-to-top-btn', 'n_clicks'),
     prevent_initial_call=True,
 )
+
+
+# 侧边栏×删除 — 独立callback，避免与modify_pairs的pattern-matching冲突
+@app.callback(
+    Output('pairs-store', 'data', allow_duplicate=True),
+    Output('add-msg', 'children', allow_duplicate=True),
+    Input({'type': 'nav-del-btn', 'index': ALL}, 'n_clicks'),
+    State('pairs-store', 'data'),
+    prevent_initial_call=True,
+)
+def nav_delete_pair(nav_del_clicks, pairs):
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict) or triggered.get('type') != 'nav-del-btn':
+        return no_update, no_update
+    if not nav_del_clicks or not any(c and c > 0 for c in nav_del_clicks):
+        return no_update, no_update
+    idx = triggered['index']
+    if pairs and 0 <= idx < len(pairs):
+        removed = pairs.pop(idx)
+        save_config(pairs)
+        return pairs, f'已删除 {removed[0]}+{removed[1]}'
+    return no_update, no_update
 
 
 @app.callback(
@@ -4288,6 +4343,9 @@ def render_charts(pairs, _):
             fig, info = go.Figure(), {'sum': None, 'futures_sym': None, 'double_rise': {'alert': False}}
         manual_items.append((i, pair, fig, info, cc, pc))
 
+    # 按品种分组排序（同品种放一起）
+    manual_items.sort(key=lambda x: (x[3].get('futures_sym') or 'zzz', x[0]))
+
     auto_items = []
     for i, ap in enumerate(auto_pairs):
         try:
@@ -4343,21 +4401,23 @@ def render_charts(pairs, _):
         call_sym, put_sym = pair[0], pair[1]
         dr = info.get('double_rise', {})
         boll_mid = dr.get('boll_middle', 0)
+        boll_up = dr.get('boll_upper', 0)
         s = info.get('sum')
         if dr.get('alert'):
             record_alert(call_sym, put_sym, info.get('futures_sym'), dr, s or 0, boll_mid)
         elif s is not None and boll_mid > 0:
-            check_alert_resolved(call_sym, put_sym, s, boll_mid)
+            check_alert_resolved(call_sym, put_sym, s, boll_mid, boll_upper=boll_up)
 
     for idx, ap, fig, info in auto_items:
         call_sym, put_sym = ap.get('call', ''), ap.get('put', '')
         dr = info.get('double_rise', {})
         boll_mid = dr.get('boll_middle', 0)
+        boll_up = dr.get('boll_upper', 0)
         s = info.get('sum')
         if dr.get('alert'):
             record_alert(call_sym, put_sym, ap.get('product', '?'), dr, s or 0, boll_mid)
         elif s is not None and boll_mid > 0:
-            check_alert_resolved(call_sym, put_sym, s, boll_mid)
+            check_alert_resolved(call_sym, put_sym, s, boll_mid, boll_upper=boll_up)
 
     # ---- 补充回归检查：不在当前监控列表中的活跃预警，主动从DB查价格 ----
     checked_keys = set()
@@ -4395,112 +4455,152 @@ def render_charts(pairs, _):
     non_alert_auto = [(idx, ap, fig, info) for idx, ap, fig, info in auto_items
                        if idx not in alert_auto_indices]
 
+    # ---- pair_key → 图表 anchor 映射（供导航栏跳转用）----
+    _pair_anchor_map = {}
+    for idx, pair, fig, info, cc, pc in manual_items:
+        cs, ps = pair[0], pair[1]
+        is_alert = idx in alert_manual_indices
+        _pair_anchor_map[f'{cs}|{ps}'] = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
+    for idx, ap, fig, info in auto_items:
+        cs, ps = ap['call'], ap['put']
+        is_alert = idx in alert_auto_indices
+        _pair_anchor_map[f'{cs}|{ps}'] = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
+
     # ---- 左侧导航栏 ----
-    nav_style = {'display': 'block', 'padding': '8px 12px', 'textDecoration': 'none',
-                 'borderLeft': '3px solid transparent', 'cursor': 'pointer'}
+    nav_style = {'padding': '8px 12px', 'textDecoration': 'none',
+                 'borderLeft': '3px solid transparent', 'cursor': 'pointer',
+                 'flex': '1', 'minWidth': '0'}
+    _nav_row = {'display': 'flex', 'alignItems': 'center'}
+    def _shdr(color):
+        return {'padding': '8px 12px', 'color': color, 'fontSize': '11px',
+                'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
+                'borderBottom': f'2px solid {color}'}
     nav = []
 
     # 每日检查导航（sidebar顶部）
     if scorecard_nav_items:
-        nav.append(html.Div('每日检查', style={
-            'padding': '8px 12px', 'color': '#9D4EDD', 'fontSize': '11px',
-            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
-            'borderBottom': '2px solid #9D4EDD'}))
+        _sec = []
         for item in scorecard_nav_items:
-            nav.append(html.A([
+            _sec.append(html.A([
                 html.Div(item['product'], style={
                     'fontWeight': 'bold', 'fontSize': '13px', 'color': item['color']}),
                 html.Div(f'{item["score"]:.1f}分', style={'fontSize': '11px', 'color': '#aaa'}),
-            ], href='#scorecard-panel', className='nav-item', style=nav_style))
+            ], href='#scorecard-panel', className='nav-item', style={**nav_style, 'display': 'block'}))
+        nav.append(html.Details([
+            html.Summary([html.Span('每日检查'), html.Span('▾', className='nav-toggle')],
+                         style=_shdr('#9D4EDD')), *_sec], open=True))
 
-    # 布林线警报导航
+    # 布林线警报导航（包括"回归中"）
     all_alerts = alert_manual + alert_auto
-    if all_alerts:
-        nav.append(html.Div('布林线警报', style={
-            'padding': '8px 12px', 'color': '#FF4444', 'fontSize': '11px',
-            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
-            'borderBottom': '2px solid #FF4444', 'animation': 'none'}))
+    _nav_active_keys = set()
+    for item in all_alerts:
+        if len(item) == 6:
+            _, pair, _, _, _, _ = item
+            _nav_active_keys.add(f'{pair[0]}|{pair[1]}')
+        else:
+            _, ap, _, _ = item
+            _nav_active_keys.add(f'{ap.get("call","")}|{ap.get("put","")}')
+    _nav_retreating = [arec for akey, arec in _alert_active.items()
+                       if not arec.get('resolved') and akey not in _nav_active_keys]
+
+    if all_alerts or _nav_retreating:
+        _sec = []
         for item in all_alerts:
             if len(item) == 6:  # manual
                 idx, pair, fig, info, cc, pc = item
                 fs = info.get('futures_sym') or '?'
                 dr = info.get('double_rise', {})
-                nav.append(html.A([
+                _sec.append(html.A([
                     html.Div(f'⚠ {fs}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FF4444'}),
                     html.Div(f'+{dr.get("sum_chg", 0)*100:.1f}%',
                              style={'fontSize': '11px', 'color': '#FF8888'}),
-                ], href=f'#alert-m-{idx}', className='nav-item', style=nav_style))
+                ], href=f'#alert-m-{idx}', className='nav-item', style={**nav_style, 'display': 'block'}))
             else:  # auto
                 idx, ap, fig, info = item
                 dr = info.get('double_rise', {})
-                nav.append(html.A([
+                _sec.append(html.A([
                     html.Div(f'⚠ {ap["product"]}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FF4444'}),
                     html.Div(f'+{dr.get("sum_chg", 0)*100:.1f}%',
                              style={'fontSize': '11px', 'color': '#FF8888'}),
-                ], href=f'#alert-a-{idx}', className='nav-item', style=nav_style))
+                ], href=f'#alert-a-{idx}', className='nav-item', style={**nav_style, 'display': 'block'}))
+        for arec in _nav_retreating:
+            fs = arec.get('futures_sym', '?')
+            last_s = arec.get('last_sum', 0)
+            mid = arec.get('boll_middle', 0)
+            pct = ((last_s - mid) / mid * 100) if mid > 0 else 0
+            _cs = arec.get('call_sym', '')
+            _ps = arec.get('put_sym', '')
+            _anchor = _pair_anchor_map.get(f'{_cs}|{_ps}', 'alert-stats-panel')
+            _sec.append(html.A([
+                html.Div(f'◎ {fs}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FFCC00'}),
+                html.Div(f'↓ 距中轨+{pct:.1f}%', style={'fontSize': '11px', 'color': '#CC9900'}),
+            ], href=f'#{_anchor}', className='nav-item', style={**nav_style, 'display': 'block'}))
+        nav.append(html.Details([
+            html.Summary([html.Span('布林线警报'), html.Span('▾', className='nav-toggle')],
+                         style=_shdr('#FF4444')), *_sec], open=True))
 
-    # 背离信号导航 (B042) — 构建 call_sym → anchor 映射
-    _diverge_anchor_map = {}
-    for idx, pair, fig, info, cc, pc in manual_items:
-        cs, ps = pair[0], pair[1]
-        is_alert = idx in alert_manual_indices
-        _diverge_anchor_map[f'{cs}|{ps}'] = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
-    for idx, ap, fig, info in auto_items:
-        cs, ps = ap['call'], ap['put']
-        is_alert = idx in alert_auto_indices
-        _diverge_anchor_map[f'{cs}|{ps}'] = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
-
+    # 背离信号导航 (B042) — 复用 _pair_anchor_map
     if _diverge_signals:
-        nav.append(html.Div('背离信号', style={
-            'padding': '8px 12px', 'color': '#FF6B00', 'fontSize': '11px',
-            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
-            'borderBottom': '2px solid #FF6B00'}))
+        _sec = []
         for dkey, dsig in _diverge_signals.items():
             fs = dsig.get('futures_sym', '?')
-            anchor = _diverge_anchor_map.get(dkey, 'diverge-banner')
+            anchor = _pair_anchor_map.get(dkey, 'diverge-banner')
             cs = dsig.get('call_sym', '?')
             ps = dsig.get('put_sym', '?')
-            nav.append(html.A([
+            _sec.append(html.A([
                 html.Div(f'⚡ {fs}', style={
                     'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FF6B00'}),
                 html.Div(f'{cs}+{ps}', style={'fontSize': '10px', 'color': '#CC8833'}),
                 html.Div(f'{dsig["comp_ratio"]:.1f}x {dsig["high_leg"][0].upper()}↓',
                          style={'fontSize': '11px', 'color': '#FF9944'}),
-            ], href=f'#{anchor}', className='nav-item', style=nav_style))
+            ], href=f'#{anchor}', className='nav-item', style={**nav_style, 'display': 'block'}))
+        nav.append(html.Details([
+            html.Summary([html.Span('背离信号'), html.Span('▾', className='nav-toggle')],
+                         style=_shdr('#FF6B00')), *_sec], open=True))
 
     if normal_manual:
-        nav.append(html.Div('自选', style={
-            'padding': '8px 12px', 'color': '#e94560', 'fontSize': '11px',
-            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
-            'borderBottom': '1px solid #e94560',
-            'marginTop': '6px' if all_alerts else '0'}))
+        _sec = []
+        _last_prod = None
         for idx, pair, fig, info, cc, pc in manual_items:
             fs = info.get('futures_sym') or '?'
             s = info.get('sum')
             is_alert = idx in alert_manual_indices
             color = '#FF4444' if is_alert else '#FFD700'
             anchor = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
-            nav.append(html.A([
-                html.Div(fs, style={'fontWeight': 'bold', 'fontSize': '13px', 'color': color}),
-                html.Div(f'{s:.1f}' if s else '--', style={'fontSize': '11px', 'color': '#aaa'}),
-            ], href=f'#{anchor}', className='nav-item', style=nav_style))
+            # 品种分隔线
+            if _last_prod is not None and fs != _last_prod:
+                _sec.append(html.Hr(style={'margin': '2px 8px', 'border': 'none',
+                                           'borderTop': '1px solid #333'}))
+            _last_prod = fs
+            _sec.append(html.Div([
+                html.Button('\u00d7', id={'type': 'nav-del-btn', 'index': idx},
+                            n_clicks=0, className='nav-del-x'),
+                html.A([
+                    html.Div(fs, style={'fontWeight': 'bold', 'fontSize': '13px', 'color': color}),
+                    html.Div(f'{s:.1f}' if s else '--', style={'fontSize': '11px', 'color': '#aaa'}),
+                ], href=f'#{anchor}', className='nav-item', style=nav_style),
+            ], style=_nav_row))
+        nav.append(html.Details([
+            html.Summary([html.Span(f'自选({len(manual_items)})'),
+                          html.Span('▾', className='nav-toggle')],
+                         style=_shdr('#e94560')), *_sec], open=True))
 
     if non_alert_auto:
-        nav.append(html.Div('智能推荐', style={
-            'padding': '8px 12px', 'color': '#00FF88', 'fontSize': '11px',
-            'fontWeight': 'bold', 'textTransform': 'uppercase', 'letterSpacing': '1px',
-            'borderBottom': '1px solid #00FF88', 'marginTop': '6px'}))
+        _sec = []
         for idx, ap, fig, info in non_alert_auto:
             tag = ' v6' if ap.get('v6_tag') else ''
             label_color = '#FF69B4' if tag else '#00FF88'
-            nav.append(html.A([
+            _sec.append(html.A([
                 html.Div(f'{ap["product"]}{tag}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': label_color}),
                 html.Div(f'{ap["score"]:.1f}分  {ap["price_sum"]:.0f}',
                          style={'fontSize': '11px', 'color': '#aaa'}),
-            ], href=f'#a-chart-{idx}', className='nav-item', style=nav_style))
+            ], href=f'#a-chart-{idx}', className='nav-item', style={**nav_style, 'display': 'block'}))
+        nav.append(html.Details([
+            html.Summary([html.Span('智能推荐'), html.Span('▾', className='nav-toggle')],
+                         style=_shdr('#00FF88')), *_sec], open=True))
 
-    sidebar = html.Div(nav, style={
-        'width': '110px', 'minWidth': '110px', 'backgroundColor': '#1a1a2e',
+    sidebar = html.Div(nav, className='nav-sidebar', style={
+        'width': '120px', 'minWidth': '120px', 'backgroundColor': '#1a1a2e',
         'borderRight': '2px solid #2a2a4a', 'position': 'sticky', 'top': '10px',
         'alignSelf': 'flex-start', 'borderRadius': '4px', 'marginRight': '8px',
         'maxHeight': '95vh', 'overflowY': 'auto'})
@@ -4602,7 +4702,8 @@ def render_charts(pairs, _):
     if exit_banner:
         charts.append(exit_banner)
 
-    # 1) 布林线警报区（置顶显示）
+    # 1) 布林线警报区（置顶显示）— 只显示当前仍在突破上轨的（红色）
+    #    "回归中"的预警移到预警统计面板里，不在主页占空间
     if all_alerts:
         alert_products = []
         for item in all_alerts:
@@ -6132,6 +6233,83 @@ def toggle_alert_stats(n_clicks):
     }
 
 
+@app.callback(
+    Output('unresolved-detail-area', 'style'),
+    Input('unresolved-card-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_unresolved_detail(n_clicks):
+    """点击'未回归'卡片，切换未回归明细展开/收起"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return {'display': 'none', 'marginBottom': '14px'}
+    return {'display': 'block', 'marginBottom': '14px'}
+
+
+def _build_unresolved_detail(alert_stats):
+    """构建未回归预警明细列表"""
+    history = _load_alert_history()
+    unresolved = [r for r in history if not r.get('resolved')]
+    if not unresolved:
+        return html.Div('当前没有未回归的预警。', style={'color': '#666', 'padding': '10px'})
+
+    now = datetime.now()
+    th_style = {'color': '#666', 'padding': '4px 10px', 'textAlign': 'left', 'fontSize': '11px'}
+    rows = []
+    for r in unresolved:
+        fs = r.get('futures_sym', '?')
+        cs = r.get('call_sym', '?')
+        ps = r.get('put_sym', '?')
+        alert_sum = r.get('alert_sum', 0)
+        peak_sum = r.get('peak_sum', alert_sum)
+        last_sum = r.get('last_sum', alert_sum)
+        boll_mid = r.get('boll_middle', 0)
+        boll_up = r.get('boll_upper', 0)
+        alert_time = r.get('alert_time', '')
+
+        # 已持续时间
+        try:
+            t0 = datetime.strptime(alert_time, '%Y-%m-%d %H:%M:%S')
+            elapsed = f'{(now - t0).total_seconds() / 60:.0f}分钟'
+        except Exception:
+            elapsed = '?'
+
+        # 当前位置判断：上轨上方（红）还是上轨下方（黄）
+        if boll_up > 0 and last_sum > boll_up:
+            pos_label = html.Span('上轨上方', style={'color': '#FF4444', 'fontWeight': 'bold'})
+        elif boll_mid > 0 and last_sum > boll_mid:
+            pct_to_mid = (last_sum - boll_mid) / boll_mid * 100
+            pos_label = html.Span(f'距中轨 +{pct_to_mid:.1f}%', style={'color': '#FFCC00'})
+        else:
+            pos_label = html.Span('接近中轨', style={'color': '#00e676'})
+
+        rows.append(html.Tr([
+            html.Td(fs, style={'color': '#FF4444', 'fontWeight': 'bold', 'padding': '4px 10px'}),
+            html.Td(f'{cs} + {ps}', style={'color': '#8888ff', 'padding': '4px 10px', 'fontSize': '11px'}),
+            html.Td(alert_time[-8:], style={'color': '#aaa', 'padding': '4px 10px'}),
+            html.Td(elapsed, style={'color': '#FF8888', 'padding': '4px 10px'}),
+            html.Td(f'{alert_sum:.0f}→{peak_sum:.0f}→{last_sum:.0f}', style={'color': '#aaa', 'padding': '4px 10px'}),
+            html.Td(f'{boll_up:.0f}', style={'color': '#FF8888', 'padding': '4px 10px'}),
+            html.Td(f'{boll_mid:.0f}', style={'color': '#FFCC00', 'padding': '4px 10px'}),
+            html.Td(pos_label, style={'padding': '4px 10px'}),
+        ]))
+
+    return html.Div([
+        html.Div(f'未回归预警明细 ({len(unresolved)})', style={
+            'color': '#FF4444', 'fontSize': '13px', 'fontWeight': 'bold', 'marginBottom': '6px'}),
+        html.Table([
+            html.Thead(html.Tr([
+                html.Th('品种', style=th_style), html.Th('期权对', style=th_style),
+                html.Th('触发', style=th_style), html.Th('已持续', style=th_style),
+                html.Th('Sum走势', style=th_style),
+                html.Th('上轨', style=th_style), html.Th('中轨', style=th_style),
+                html.Th('当前位置', style=th_style),
+            ])),
+            html.Tbody(rows),
+        ], style={'fontSize': '12px', 'width': '100%'}),
+    ], style={'backgroundColor': '#1a0a0a', 'borderRadius': '6px', 'padding': '10px',
+              'border': '1px solid #FF4444'})
+
+
 def _build_alert_stats_panel():
     """构建预警统计面板（含回归+未回归，无幸存者偏差）"""
     alert_stats = get_alert_stats()
@@ -6163,7 +6341,7 @@ def _build_alert_stats_panel():
         cards = [
             ('回归率', rate, '%', '#00e676' if rate >= 80 else '#FFD700'),
             ('总样本', total_n, '', '#4fc3f7'),
-            ('未回归', unresolved_n, '', '#FF4444' if unresolved_n > 0 else '#888'),
+            # "未回归"单独处理成可点击按钮
         ]
         if alert_stats.get('avg_minutes') is not None:
             cards += [
@@ -6188,8 +6366,23 @@ def _build_alert_stats_panel():
                 html.Div(label, style={'fontSize': '11px', 'color': '#888'}),
             ], style={'textAlign': 'center', 'padding': '10px 16px', 'backgroundColor': '#1a1a2e',
                       'borderRadius': '6px', 'minWidth': '90px'}))
+        # "未回归"做成可点击按钮
+        unresolved_color = '#FF4444' if unresolved_n > 0 else '#888'
+        card_divs.append(html.Div([
+            html.Div(f'{unresolved_n}', style={
+                'fontSize': '20px', 'fontWeight': 'bold', 'color': unresolved_color}),
+            html.Div('未回归 (点击展开)', style={'fontSize': '11px', 'color': '#888'}),
+        ], id='unresolved-card-btn', n_clicks=0, style={
+            'textAlign': 'center', 'padding': '10px 16px', 'backgroundColor': '#2a1a1a',
+            'borderRadius': '6px', 'minWidth': '90px', 'cursor': 'pointer',
+            'border': f'1px solid {unresolved_color}'}))
         children.append(html.Div(card_divs, style={
             'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '14px'}))
+
+        # "未回归"明细区（默认隐藏，点击展开）
+        unresolved_detail = _build_unresolved_detail(alert_stats)
+        children.append(html.Div(unresolved_detail, id='unresolved-detail-area',
+                                  style={'display': 'none', 'marginBottom': '14px'}))
 
         # 品种汇总（一行一个品种）
         if alert_stats.get('by_product'):
@@ -6597,6 +6790,12 @@ def _build_ctp_monitor_content():
                 html.Td(f'CPU {cpu}%', style={'color': '#ccc', 'padding': '3px 12px 3px 0'}),
                 html.Td(mem, style={'color': '#ccc', 'padding': '3px 12px 3px 0'}),
                 html.Td(started, style={'color': '#888', 'padding': '3px 12px 3px 0'}),
+                html.Td(html.Button('✕', id={'type': 'kill-ctp-btn', 'index': pid},
+                    n_clicks=0, style={
+                    'color': '#FF4444', 'backgroundColor': 'transparent', 'border': '1px solid #FF4444',
+                    'borderRadius': '3px', 'cursor': 'pointer', 'fontSize': '11px',
+                    'padding': '1px 6px', 'lineHeight': '1'}),
+                    style={'padding': '3px 0'}),
             ]))
         children.append(html.Table(rows, style={
             'fontSize': '12px', 'fontFamily': 'monospace', 'marginLeft': '20px'}))
@@ -6631,10 +6830,41 @@ def _build_ctp_monitor_content():
     Output('ctp-monitor-panel', 'children'),
     Output('ctp-monitor-panel', 'style'),
     Input('ctp-monitor-btn', 'n_clicks'),
+    Input('kill-ctp-store', 'data'),
     prevent_initial_call=True,
 )
-def toggle_ctp_monitor(n_clicks):
-    """切换CTP监控面板"""
+def toggle_ctp_monitor(n_clicks, kill_store):
+    """切换CTP监控面板 / kill后刷新"""
+    triggered = ctx.triggered_id
+
+    # kill-ctp-store 触发：先杀进程再刷新面板
+    if triggered == 'kill-ctp-store' and kill_store:
+        import signal
+        pid = int(kill_store['pid'])
+        try:
+            # SIGTERM不够——进程有信号处理器做优雅关闭，可能要数十秒
+            # 先SIGTERM给个机会，0.5秒后SIGKILL强杀
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        import time
+        time.sleep(0.5)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        time.sleep(0.3)
+        content = _build_ctp_monitor_content()
+        panel_style = {
+            'display': 'block',
+            'backgroundColor': '#0f1a0f',
+            'padding': '15px 25px',
+            'borderBottom': '2px solid #00DD00',
+            'marginBottom': '0',
+        }
+        return content, panel_style
+
+    # ctp-monitor-btn 触发：切换显示/隐藏
     if not n_clicks or n_clicks % 2 == 0:
         return no_update, {'display': 'none'}
 
@@ -6647,6 +6877,22 @@ def toggle_ctp_monitor(n_clicks):
         'marginBottom': '0',
     }
     return content, panel_style
+
+
+@app.callback(
+    Output('kill-ctp-store', 'data'),
+    Input({'type': 'kill-ctp-btn', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def on_kill_ctp_click(n_clicks_list):
+    """✕按钮点击 → 将PID写入Store"""
+    if not any(n_clicks_list):
+        return no_update
+    triggered = ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return no_update
+    import time
+    return {'pid': triggered['index'], 'ts': time.time()}
 
 
 if __name__ == '__main__':

@@ -4,8 +4,8 @@
     "created": "2026-02-28",
     "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、VRP策略、市场结构、到期日历等，贝叶斯持续更新",
     "product": "全市场商品期权(起源于ag白银)",
-    "update_count": 44,
-    "last_updated": "2026-03-12"
+    "update_count": 46,
+    "last_updated": "2026-03-15"
   },
   "beliefs": [
     {
@@ -1333,7 +1333,7 @@
       "evidence_for": 734,
       "evidence_against": 0,
       "first_observed": "2026-03-09",
-      "last_updated": "2026-03-10",
+      "last_updated": "2026-03-12",
       "data_points": [
         "回测数据: SHFE AO.parquet全部历史, 734笔交易",
         "最优进仓: 23:15 (开盘2h15m后波动趋稳, Sharpe 4.15)",
@@ -1345,12 +1345,13 @@
         "DTE1-5天 Sharpe仅3.2/胜率38% (太近不稳定), DTE>20 Sharpe<4 (θ太慢)",
         "入场过滤: 进仓腿比≤3.0x, 确保是宽跨而非赌单边",
         "关键洞察: AO上期所夜盘21:00-01:00, 23:00后流动性下降但仍有成交, 适合scalp",
-        "2026-03-10补充验证: DTE15=83.3%胜率/Sharpe24, DTE16=100%/Sharpe71, 与DTE14(75%)无断崖. 真正分界线在DTE20"
+        "2026-03-10补充验证: DTE15=83.3%胜率/Sharpe24, DTE16=100%/Sharpe71, 与DTE14(75%)无断崖. 真正分界线在DTE20",
+        "2026-03-12 B043补充: AO循环做(多次进出/session)P50仅2tick, 过滤≤3tick后PnL从+0.98%→+0.33%(衰减66%). 循环做不适合AO, 维持单次进出策略"
       ],
       "backtest_script": "/tmp/ao_night_scalp_v2.py",
       "backtest_result": "/tmp/ao_night_scalp_v2.json",
       "report": "/tmp/ao_night_scalp_v2_report.html",
-      "note": "TP/SL使用用户原创的θ衰减止盈+腿比止损方法论, 非传统百分比. AO夜盘特性: 双腿极其平衡(腿比几乎不超过2x), 与CF/SA等品种差异显著"
+      "note": "TP/SL使用用户原创的θ衰减止盈+腿比止损方法论, 非传统百分比. AO夜盘特性: 双腿极其平衡(腿比几乎不超过2x), 与CF/SA等品种差异显著. [B043更新] AO仅适合单次scalp, 不宜循环做——循环做的盈利集中在1-2tick, 实盘手续费+滑点会吞噬"
     },
     {
       "id": "B039",
@@ -1475,6 +1476,81 @@
         "mean-reversion",
         "all-market"
       ]
+    },
+    {
+      "id": "B043",
+      "category": "品种策略",
+      "statement": "AG白银夜盘23:00+循环ATM跨式卖出: DTE30-60为黄金区间(Sharpe=7.4/WR=80%/PnL+1.50%), 每晚~3轮. AO氧化铝循环做存在刷单风险(P50仅2tick, 过滤后PnL接近零), 仅适合单次进出不宜循环",
+      "confidence": 0.85,
+      "evidence_for": 2210,
+      "evidence_against": 0,
+      "first_observed": "2026-03-12",
+      "last_updated": "2026-03-12",
+      "data_points": [
+        "回测数据: AG 632夜(2019-2025, 56M行), AO 234夜(2024-2025, 8M行)",
+        "策略: 23:15起入场ATM跨式卖出→TP/SL/FC出场→冷却5min→再入场, 1手循环",
+        "AG最优(ALL): +15m/TP0.8θ/SL5.0x, Sharpe=7.0, WR=79%, PnL=+1.42%, 2210笔/748夜/3.0轮每晚",
+        "AG过滤≤3tick后: WR=75%, PnL=+1.26% — 衰减仅11%, P50=4tick, 真实可靠",
+        "AG DTE30-60: Sharpe=7.4, WR=80%, PnL=+1.50%, 2081笔 — 黄金区间",
+        "AG DTE20-30: 存在但非最优; AG DTE60+: Sharpe=0.4, 几乎无效",
+        "AO最优(ALL): +15m/TP0.8θ/SL3.0x, Sharpe=6.3, WR=70%, PnL=+0.98%",
+        "AO致命缺陷: P50=2tick, 过滤≤3tick后WR=54%/PnL=+0.33%, 多数参数组合PnL转负 — 严重刷单风险",
+        "AO TP0.3θ过滤后: WR=31%, PnL=-0.48% — 完全不可用",
+        "止损越宽越好: SL5.0x > SL3.0x > SL2.0x, 夜盘波动有限误杀少",
+        "入场时机: +15m(23:15)最优, 获得更多交易机会; +30m和+45m Sharpe略低",
+        "TP系数: 0.8θ最优平衡点, 0.3θ太薄(刷单), 0.5θ中等"
+      ],
+      "backtest_script": "/tmp/late_night_loop_v2.py",
+      "backtest_result": "/tmp/late_night_loop_v2.json",
+      "report": "/tmp/late_night_loop_report.html",
+      "note": "与B039互补: B039是单次进出(9品种网格), B043是循环做(AG+AO专项). AG循环做P50=4tick通过真实性检验, AO循环做P50=2tick失败. 实盘建议: AG DTE30-60, 23:15入场, TP0.8θ, SL5.0x(或不设SL), 1手循环做. AO维持B038单次scalp策略, 不宜循环. 跨学科: 频率与质量的tradeoff——AO追求高频但每笔太薄(类似高频做市), AG适中频率但每笔足够厚(类似swing scalp)"
+    },
+    {
+      "id": "ma_tangle_filter",
+      "name": "MA纠缠度宽跨安全过滤器",
+      "description": "1m+5m双时间框架20MA, LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应(趋势亏→纠缠赚)",
+      "confidence": 0.78,
+      "evidence_count": 44,
+      "source": "B043",
+      "last_validated": "2026-03-15",
+      "notes": "OTM宽跨(4-8%虚值)直接验证: 44品种228830笔交易, 28/44(64%)信念成立. 15个品种具有Switch效应(趋势入场亏钱,纠缠入场赚钱). 26个品种双时间框架一致. AG尾部保护59.3x(趋势最差-267% vs 纠缠-28%). OTM比ATM更有效(64% vs 56%)",
+      "parameters": {
+        "ma_1m": 20,
+        "ma_5m": 20,
+        "lookback": 10,
+        "threshold": 7,
+        "otm_range": "4-8%虚值, fallback 3-10%",
+        "usage": "过滤器(降尾部风险+Switch效应). 纠缠时入场, 趋势时回避. S级品种必须启用"
+      },
+      "multidim_analysis": {
+        "date": "2026-03-15",
+        "data": "OTM宽跨(4-8%虚值) 44品种, 228830笔交易",
+        "dimensions": {
+          "composite_score": "尾部保护(30分)+PnL优势(25)+Switch效应(20)+双TF一致(15)+胜率提升(10)=满分100",
+          "switch_effect": "15个品种具有Switch效应(纠缠赚+趋势亏): Y/OI/EB/AG/SA/LC/M/UR/CF/SF/RM/SH/MA/TA/I",
+          "tail_risk": "AG 59.3x, PG 18.3x, L 16.2x, PB 9.5x, Y 9.5x, SN 8.5x",
+          "dual_timeframe": "26个品种30m+60m同时成立",
+          "exchange_cluster": "DCE和CZCE品种最多S级"
+        },
+        "grades": {
+          "S级_score_ge_60_共14个": ["Y(豆油,80.7)", "OI(菜油,79.6)", "EB(苯乙烯,78.7)", "AG(白银,77.0)", "PB(铅,76.9)", "SA(纯碱,76.4)", "LC(碳酸锂,76.3)", "M(豆粕,74.3)", "UR(尿素,73.2)", "PG(液化气,70.0)", "SN(锡,68.7)", "CF(棉花,62.5)", "SF(硅铁,61.6)", "ZN(锌,60.3)"],
+          "A级_score_45_59_共7个": ["RM(菜粕,58.5)", "SH(烧碱,57.5)", "MA(甲醇,56.5)", "NI(镍,55.5)", "TA(PTA,54.5)", "I(铁矿石,53.2)", "L(塑料,52.8)"],
+          "B级_score_30_44_共7个": ["C(玉米,44.3)", "SC(原油,44.2)", "V(PVC,43.3)", "RB(螺纹钢,43.0)", "AU(黄金,42.6)", "CU(铜,41.1)", "AL(铝,40.4)"],
+          "C级_score_lt_30": "PP/PX/AP/PF/EG/FG/RU/SR/P/AO/LH/PK/CJ/SM/SI/JD"
+        },
+        "key_switch_products": {
+          "Y豆油": "纠缠+0.47% vs 趋势-0.11%",
+          "EB苯乙烯": "纠缠+0.24% vs 趋势-0.47%",
+          "AG白银": "纠缠+0.17% vs 趋势-0.09%, 尾部保护59.3x",
+          "LC碳酸锂": "纠缠+0.22% vs 趋势-0.48%",
+          "M豆粕": "纠缠+0.73% vs 趋势-0.07%",
+          "UR尿素": "纠缠+0.76% vs 趋势-0.33%",
+          "SA纯碱": "纠缠+0.39% vs 趋势-0.16%"
+        },
+        "anti_filter_products": "JD鸡蛋(-2.59%), SM锰硅(-1.88%), CJ红枣(-1.50%), SI工业硅(-0.98%), AO氧化铝(-0.84%), PK花生(-0.65%), LH生猪(-0.39%) — 纠缠入场反而更差",
+        "atm_vs_otm": "ATM(Phase2a): 23/41=56%成立, 仅1个Switch品种. OTM(Phase2b): 28/44=64%成立, 15个Switch品种. OTM宽跨对过滤器响应更强",
+        "report": "~/Scripts/ma_tangle_otm_results/multidim_report.html"
+      }
     }
   ],
   "expiration_calendar": {

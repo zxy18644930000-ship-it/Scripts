@@ -351,8 +351,12 @@ class CTPDataCollector:
         self._connected = False
         self._running = False
         self._subscribed: Set[str] = set()
+        self._ticked_contracts: Set[str] = set()  # 实际收到tick的合约
         self._tick_count = 0
         self._last_status_time = time.time()
+        self._subscribe_batch_size = 200  # 每批订阅数量
+        self._subscribe_batch_delay = 0.3  # 批次间延迟(秒)
+        self._last_all_contracts = []  # 缓存最近一次all_contracts用于新合约发现
 
     @staticmethod
     def _load_config(path):
@@ -449,6 +453,7 @@ class CTPDataCollector:
             return
 
         all_contracts = self.main_engine.get_all_contracts()
+        self._last_all_contracts = list(all_contracts)
 
         if self.all_options:
             self._subscribe_all_options_smart(all_contracts)
@@ -570,11 +575,8 @@ class CTPDataCollector:
                 if self._extract_month(c.symbol) in active_months:
                     selected_options.append(c)
 
-        # ---- 订阅期权 ----
-        for c in selected_options:
-            req = SubscribeRequest(symbol=c.symbol, exchange=c.exchange)
-            self.main_engine.subscribe(req, "CTP")
-            self._subscribed.add(c.vt_symbol)
+        # ---- 分批订阅期权（防止CTP静默丢弃） ----
+        self._batch_subscribe(selected_options, label="期权")
 
         # ---- 阶段3: 额外订阅无期权的纯期货品种（价差监控用） ----
         _EXTRA_FUTURES = {'HC', 'NR', 'CY', 'LU', 'J'}  # 无期权但价差监控需要
@@ -614,17 +616,32 @@ class CTPDataCollector:
         if not contracts:
             logger.warning("没有匹配的合约！")
             return
-        for contract in contracts:
-            req = SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange)
-            self.main_engine.subscribe(req, "CTP")
-            self._subscribed.add(contract.vt_symbol)
+        self._batch_subscribe(contracts)
         logger.info(f"已订阅 {len(contracts)} 个合约")
+
+    def _batch_subscribe(self, contracts, label=""):
+        """分批订阅合约，防止CTP因一次性大量订阅而静默丢弃"""
+        total = len(contracts)
+        batch_size = self._subscribe_batch_size
+        for i in range(0, total, batch_size):
+            batch = contracts[i:i + batch_size]
+            for c in batch:
+                req = SubscribeRequest(symbol=c.symbol, exchange=c.exchange)
+                self.main_engine.subscribe(req, "CTP")
+                self._subscribed.add(c.vt_symbol)
+            batch_num = i // batch_size + 1
+            total_batches = (total + batch_size - 1) // batch_size
+            if total > batch_size:
+                logger.debug(f"{label}订阅批次 {batch_num}/{total_batches}: {len(batch)}个")
+            if i + batch_size < total:
+                time.sleep(self._subscribe_batch_delay)
 
     def _on_tick(self, event):
         tick = event.data
         if not tick.last_price or tick.last_price <= 0:
             return
         self._tick_count += 1
+        self._ticked_contracts.add(tick.vt_symbol)
         self.aggregator.update_tick(
             tick.symbol,
             tick.exchange.value if hasattr(tick.exchange, 'value') else str(tick.exchange),
@@ -652,9 +669,125 @@ class CTPDataCollector:
             now = time.time()
             if now - self._last_status_time > 300:
                 self._last_status_time = now
+                ticked = len(self._ticked_contracts)
+                subscribed = len(self._subscribed)
+                silent = subscribed - ticked
                 logger.info(f"状态: {self._tick_count} ticks | "
                            f"{self.db_writer.total_written} bars | "
-                           f"{len(self._subscribed)} 合约")
+                           f"{subscribed} 订阅 | {ticked} 活跃 | {silent} 沉默")
+
+    def _subscription_health_loop(self):
+        """订阅健康监控：定期检查沉默合约并重新订阅 + 发现新上市合约"""
+        # 启动后等待3分钟，让合约有足够时间产生tick
+        _initial_wait = 180
+        for _ in range(int(_initial_wait / 5)):
+            time.sleep(5)
+            if not self._running:
+                return
+
+        _check_interval = 900  # 每15分钟检查一次
+        while self._running:
+            try:
+                self._resub_silent_contracts()
+                self._discover_new_contracts()
+            except Exception as e:
+                logger.error(f"订阅健康检查异常: {e}")
+
+            for _ in range(int(_check_interval / 10)):
+                time.sleep(10)
+                if not self._running:
+                    return
+
+    def _resub_silent_contracts(self):
+        """重新订阅已订阅但未收到任何tick的合约"""
+        if not self._ticked_contracts:
+            return
+
+        silent = self._subscribed - self._ticked_contracts
+        if not silent:
+            logger.info(f"[健康检查] 全部 {len(self._subscribed)} 个订阅均正常")
+            return
+
+        # 过滤：只重订阅期权（期货流动性差的可以不管）
+        silent_options = [vt for vt in silent if 'C' in vt.upper().split('.')[0] or 'P' in vt.upper().split('.')[0]]
+        if not silent_options:
+            logger.info(f"[健康检查] {len(silent)} 个沉默合约均为期货，跳过")
+            return
+
+        logger.warning(f"[健康检查] 发现 {len(silent_options)} 个期权订阅沉默，重新订阅...")
+        # 从vt_symbol解析出symbol和exchange重新订阅
+        resub_count = 0
+        batch = []
+        for vt in silent_options:
+            parts = vt.split(".")
+            if len(parts) == 2:
+                symbol, exchange_str = parts
+                try:
+                    exchange = Exchange(exchange_str)
+                    # 用一个简单的对象模拟contract
+                    class _C:
+                        pass
+                    c = _C()
+                    c.symbol = symbol
+                    c.exchange = exchange
+                    c.vt_symbol = vt
+                    batch.append(c)
+                except Exception:
+                    pass
+
+        if batch:
+            # 重订阅前先清除这些合约的订阅记录，让_batch_subscribe重新添加
+            for c in batch:
+                self._subscribed.discard(c.vt_symbol)
+            self._batch_subscribe(batch, label="重订阅")
+            logger.info(f"[健康检查] 重新订阅了 {len(batch)} 个沉默合约")
+        else:
+            logger.info(f"[健康检查] 无法解析沉默合约，跳过重订阅")
+
+    def _discover_new_contracts(self):
+        """查询CTP合约列表，发现新上市的合约并自动订阅"""
+        if not self._connected or not self.main_engine:
+            return
+
+        try:
+            current_contracts = self.main_engine.get_all_contracts()
+        except Exception as e:
+            logger.warning(f"[新合约发现] 查询合约失败: {e}")
+            return
+
+        current_vt_set = {c.vt_symbol for c in current_contracts}
+        old_vt_set = {c.vt_symbol for c in self._last_all_contracts} if self._last_all_contracts else set()
+        new_vt_symbols = current_vt_set - old_vt_set
+
+        if not new_vt_symbols:
+            return
+
+        # 筛选新合约中属于已订阅品种的活跃月份期权
+        new_contracts = [c for c in current_contracts if c.vt_symbol in new_vt_symbols]
+        new_to_sub = []
+        for c in new_contracts:
+            if c.product != Product.OPTION:
+                continue
+            # 检查是否属于已订阅的品种范围
+            prefix = extract_product_prefix(c.symbol)
+            month = self._extract_month(c.symbol)
+            # 通过已有订阅推断活跃月份
+            for existing_vt in self._subscribed:
+                existing_sym = existing_vt.split(".")[0]
+                existing_prefix = extract_product_prefix(existing_sym)
+                if existing_prefix == prefix:
+                    existing_month = self._extract_month(existing_sym)
+                    if existing_month == month:
+                        new_to_sub.append(c)
+                        break
+
+        if new_to_sub:
+            logger.info(f"[新合约发现] 发现 {len(new_to_sub)} 个新期权: "
+                       f"{[c.symbol for c in new_to_sub[:10]]}")
+            self._batch_subscribe(new_to_sub, label="新合约")
+            notify("CTP数据采集", f"新增订阅 {len(new_to_sub)} 个新上市期权")
+
+        self._last_all_contracts = list(current_contracts)
 
     def run(self, daemon_mode=False):
         if not self.connect():
@@ -671,10 +804,15 @@ class CTPDataCollector:
         write_thread = threading.Thread(target=self._write_loop, daemon=True)
         write_thread.start()
 
+        # 订阅健康监控线程：检查沉默合约 + 发现新合约
+        health_thread = threading.Thread(target=self._subscription_health_loop, daemon=True)
+        health_thread.start()
+
         logger.info("=" * 50)
         logger.info("数据采集已启动")
         logger.info(f"数据库: {self.db_writer.db_path}")
         logger.info(f"合约数: {len(self._subscribed)}")
+        logger.info("订阅健康监控: 3分钟后首次检查，每15分钟复查")
         logger.info("交易时段结束后自动退出")
         logger.info("=" * 50)
 
