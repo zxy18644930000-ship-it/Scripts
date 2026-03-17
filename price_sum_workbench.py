@@ -1431,17 +1431,31 @@ def load_pair_data(call_sym, put_sym):
         except Exception:
             return datetime.min
 
-    # 过滤异常时间戳数据：
-    # 1. 15:05~20:55 之间不可能有交易（收盘后、夜盘开盘前），属于CTP异常写入
-    # 2. 比当前时间还晚的"未来数据"（如周五夜盘被CTP标记为周一日期）
+    # 判断交易所：CZCE品种代码全大写(CF,MA,TA…)，夜盘23:00收盘
+    # SHFE/INE品种小写(ag,cu,al…)，夜盘到01:00或02:30
+    _prod = re.match(r'([a-zA-Z]+)', call_sym)
+    _is_czce_dce = _prod and _prod.group(1)[0].isupper() if _prod else False
+    # DCE品种(m,y,p,c,j,i…)也是23:00收盘，但代码小写，用列表补充
+    if not _is_czce_dce and _prod:
+        _dce_prods = {'m', 'y', 'a', 'b', 'p', 'c', 'cs', 'jd', 'l', 'v', 'pp',
+                      'j', 'jm', 'i', 'eg', 'eb', 'pg', 'lh', 'rr', 'bb', 'fb'}
+        _is_czce_dce = _prod.group(1).lower() in _dce_prods
+
     now = datetime.now()
     def _is_bad_timestamp(dt_str):
         try:
             dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
             h = dt.hour
             m = dt.minute
-            # 15:05~20:55 之间是非交易时段，过滤掉
-            if (h == 15 and m >= 5) or (16 <= h <= 19) or (h == 20 and m < 55):
+            # 非交易时段CTP脏数据过滤：
+            # 02:31~08:59（夜盘收盘后→日盘开盘前，含08:59预开盘bar）
+            # 15:01~20:59（日盘收盘后→夜盘开盘前，含20:55-20:59预开盘bar）
+            if (h == 2 and m >= 31) or (3 <= h <= 8):
+                return True
+            if (h == 15 and m >= 1) or (16 <= h <= 20):
+                return True
+            # CZCE/DCE夜盘23:00收盘，23:00 bar是结算价非最后成交价
+            if _is_czce_dce and h == 23:
                 return True
             # 过滤掉未来数据
             if dt > now + timedelta(minutes=5):
@@ -1546,6 +1560,15 @@ def _check_double_rise(times, call_prices, put_prices, sum_prices, price_tick=1)
 
     c_chg = (c_now - c_open) / c_open
     p_chg = (p_now - p_open) / p_open
+
+    # 价格活跃度检查：价格几乎不动的死合约不触发警报
+    recent_sums = sum_prices[-130:]
+    if len(recent_sums) > 10:
+        mean_s = sum(recent_sums) / len(recent_sums)
+        if mean_s > 0:
+            std_s = (sum((x - mean_s) ** 2 for x in recent_sums) / len(recent_sums)) ** 0.5
+            if std_s / mean_s < 0.001:
+                return {'alert': False}
 
     # 布林通道判断：价格之和的5分钟K线是否突破上轨（26周期, 1.5σ，与trade2026一致）
     closes_5min = _aggregate_5min(times, sum_prices)
@@ -1931,6 +1954,103 @@ def get_alert_stats():
     return stats
 
 
+def _calc_activity_share(call_prices, put_prices, n_bars=None):
+    """C/P 绝对活跃度占比：谁在主导价格之和的波动。
+    n_bars=None 使用全部数据，n_bars=30 使用最近30根K线（跨交易日回溯）。
+    返回 (c_pct, p_pct, c_dir, p_dir) 或 None（数据不足）。
+    """
+    if len(call_prices) < 2 or len(put_prices) < 2:
+        return None
+    cp = call_prices[-n_bars:] if n_bars else call_prices
+    pp = put_prices[-n_bars:] if n_bars else put_prices
+    if len(cp) < 2:
+        return None
+    sum_abs_c = sum(abs(cp[i] - cp[i - 1]) for i in range(1, len(cp)))
+    sum_abs_p = sum(abs(pp[i] - pp[i - 1]) for i in range(1, len(pp)))
+    total = sum_abs_c + sum_abs_p
+    if total == 0:
+        return (0, 0, '—', '—')
+    c_pct = sum_abs_c / total
+    p_pct = sum_abs_p / total
+    c_net = cp[-1] - cp[0]
+    p_net = pp[-1] - pp[0]
+    c_dir = '↑' if c_net > 0 else ('↓' if c_net < 0 else '—')
+    p_dir = '↑' if p_net > 0 else ('↓' if p_net < 0 else '—')
+    return (c_pct, p_pct, c_dir, p_dir)
+
+
+# ============ 贡献度历史数据库 ============
+
+_CONTRIB_DB_PATH = os.path.expanduser('~/Scripts/contribution_history.db')
+
+def _init_contribution_db():
+    conn = sqlite3.connect(_CONTRIB_DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS contribution (
+        timestamp   TEXT NOT NULL,
+        call_sym    TEXT NOT NULL,
+        put_sym     TEXT NOT NULL,
+        sum_price   REAL,
+        call_price  REAL,
+        put_price   REAL,
+        c_pct_30m   REAL, p_pct_30m REAL, c_dir_30m TEXT, p_dir_30m TEXT,
+        c_pct_day   REAL, p_pct_day REAL, c_dir_day TEXT, p_dir_day TEXT,
+        c_pct_7d    REAL, p_pct_7d  REAL, c_dir_7d  TEXT, p_dir_7d  TEXT,
+        UNIQUE(timestamp, call_sym, put_sym)
+    )''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_contrib_pair_ts ON contribution (call_sym, put_sym, timestamp)')
+    conn.commit()
+    conn.close()
+
+_init_contribution_db()
+
+def _is_trading_hour():
+    """简单判断当前是否在期货交易时段（日盘 + 夜盘）"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    if now.weekday() >= 5:
+        return h >= 21 if now.weekday() == 4 else False
+    if 9 <= h <= 11 or (h == 11 and m <= 30):
+        return True
+    if 13 <= h <= 14 or (h == 14 and m <= 59) or (h == 15 and m == 0):
+        return True
+    if h >= 21 or h <= 2:
+        return True
+    return False
+
+def _save_contribution(pairs_info):
+    """批量写入贡献度快照。
+    pairs_info: list of (call_sym, put_sym, info_dict)
+    """
+    if not _is_trading_hour() or not pairs_info:
+        return
+    ts = datetime.now().strftime('%Y-%m-%dT%H:%M:00')
+    rows = []
+    for call_sym, put_sym, info in pairs_info:
+        def _unpack(act):
+            if act is None:
+                return (None, None, None, None)
+            return act
+        a30 = _unpack(info.get('activity_30m'))
+        ad = _unpack(info.get('activity_day'))
+        a7 = _unpack(info.get('activity_7d'))
+        rows.append((
+            ts, call_sym, put_sym,
+            info.get('sum'), info.get('call_last'), info.get('put_last'),
+            a30[0], a30[1], a30[2], a30[3],
+            ad[0], ad[1], ad[2], ad[3],
+            a7[0], a7[1], a7[2], a7[3],
+        ))
+    try:
+        conn = sqlite3.connect(_CONTRIB_DB_PATH)
+        conn.executemany(
+            'INSERT OR IGNORE INTO contribution VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            rows)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[ContribDB] write error: {e}')
+
+
 def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     """为一个期权对构建图表（双Y轴：左=期权价格，右=期货价格）"""
     times, call_prices, put_prices, _, fut_prices, futures_sym = \
@@ -2065,8 +2185,21 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     product = _extract_product(call_sym)
     tick = _PRICE_TICK.get(product, 1)
     dr = _check_double_rise(times, call_prices, put_prices, sum_prices, price_tick=tick)
+
+    act_30m = _calc_activity_share(call_prices, put_prices, n_bars=30)
+    day_start_idx = 0
+    if times:
+        dv = _get_default_view_start()
+        for i, t in enumerate(times):
+            if t >= dv:
+                day_start_idx = i
+                break
+    act_day = _calc_activity_share(call_prices[day_start_idx:], put_prices[day_start_idx:])
+    act_7d = _calc_activity_share(call_prices, put_prices)
+
     return fig, {'sum': latest_sum, 'futures_sym': futures_sym, 'double_rise': dr,
-                 'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio}
+                 'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio,
+                 'activity_30m': act_30m, 'activity_day': act_day, 'activity_7d': act_7d}
 
 
 # ============ 解析输入 ============
@@ -2215,7 +2348,11 @@ def auto_select_pairs():
 
         best = None
         for c_sym, c_px, c_vol, c_k in otm_calls[:10]:
+            if c_vol == 0:
+                continue
             for p_sym, p_px, p_vol, p_k in otm_puts[:10]:
+                if p_vol == 0:
+                    continue
                 if c_px + p_px < 8 or min(c_px, p_px) < 2:
                     continue
                 score = _score_pair(c_px, p_px, c_k, p_k, fp, c_vol, p_vol)
@@ -2232,6 +2369,13 @@ def auto_select_pairs():
             p_cnt = cur.fetchone()[0]
             if min(c_cnt, p_cnt) < min_bars:
                 continue  # 数据不足，跳过
+            # 累计成交量检查：近24小时两腿都需有真实成交
+            cur.execute("SELECT COALESCE(SUM(volume),0) FROM dbbardata WHERE symbol=? AND datetime>=?", (c_sym, recent))
+            c_total_vol = cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(volume),0) FROM dbbardata WHERE symbol=? AND datetime>=?", (p_sym, recent))
+            p_total_vol = cur.fetchone()[0]
+            if min(c_total_vol, p_total_vol) < 50:
+                continue  # 累计成交不足，死合约
             result.append({
                 'call': c_sym, 'put': p_sym,
                 'product': prod, 'month': month,
@@ -3011,123 +3155,135 @@ def _build_trade_row(idx):
         row_children.append(html.Span(f'交易{idx+1} ', style={
             'color': '#888', 'fontSize': '13px', 'fontWeight': 'bold', 'marginRight': '10px'}))
 
-    # 第一行：选对 + 加载 + 卖出进仓
+    # 第一行：标识 + 选对 + 加载
     line1 = row_children + [
         dcc.Dropdown(
             id={'type': 'trade-pair-select', 'index': idx},
             options=[], placeholder='选择期权对...',
             className='dark-dropdown',
-            style={'width': '320px', 'display': 'inline-block', 'verticalAlign': 'middle'}),
+            style={'width': '300px', 'display': 'inline-block', 'verticalAlign': 'middle'}),
         html.Button('加载', id={'type': 'load-btn', 'index': idx}, n_clicks=0, style={
-            'padding': '4px 12px', 'fontSize': '12px', 'cursor': 'pointer',
+            'padding': '4px 12px', 'fontSize': '12px', 'cursor': 'pointer', 'whiteSpace': 'nowrap',
             'backgroundColor': '#1a3a5e', 'color': '#4fc3f7',
             'border': '1px solid #4fc3f7', 'borderRadius': '4px', 'marginLeft': '8px'}),
         html.Span(id={'type': 'load-status', 'index': idx}, style={
-            'fontSize': '12px', 'marginLeft': '6px', 'minWidth': '70px'}),
-        html.Span(' 单腿手数 ', style={'color': '#aaa', 'fontSize': '12px', 'marginLeft': '12px', 'marginRight': '4px'}),
-        dcc.Input(
-            id={'type': 'trade-volume', 'index': idx}, type='number', value=1, min=1, max=500,
-            style={'width': '60px', 'padding': '5px 8px', 'fontSize': '13px',
-                   'backgroundColor': '#1a1a3e', 'color': '#fff',
-                   'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center'}),
+            'fontSize': '11px', 'marginLeft': '6px', 'whiteSpace': 'nowrap'}),
+        html.Span(id={'type': 'trade-entry-status', 'index': idx}, style={
+            'color': '#00FF88', 'fontSize': '12px', 'marginLeft': '10px', 'whiteSpace': 'nowrap'}),
+        html.Span(id={'type': 'trade-entry-result', 'index': idx}, style={
+            'color': '#00FF88', 'fontSize': '12px', 'whiteSpace': 'nowrap'}),
+    ]
+
+    # 第二行：进仓
+    line2 = [
+        html.Span('进仓 ', style={'color': '#00FF88', 'fontSize': '12px', 'fontWeight': 'bold',
+                                   'marginRight': '6px', 'whiteSpace': 'nowrap'}),
         html.Span('Ask≥', id={'type': 'entry-condition-label', 'index': idx},
-                  style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
+                  style={'color': '#aaa', 'fontSize': '11px'}),
         dcc.Input(
             id={'type': 'entry-condition-sum', 'index': idx}, type='number', placeholder='不限',
-            style={'width': '62px', 'padding': '5px 6px', 'fontSize': '12px',
+            style={'width': '60px', 'padding': '4px 6px', 'fontSize': '12px',
                    'backgroundColor': '#1a1a3e', 'color': '#FFD700',
-                   'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center'}),
+                   'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center',
+                   'marginLeft': '3px'}),
         dcc.Dropdown(
             id={'type': 'entry-direction', 'index': idx},
             options=[{'label': '卖出开仓', 'value': 'sell'}, {'label': '买入开仓', 'value': 'buy'}],
-            value='sell', clearable=False,
-            style={'width': '100px', 'display': 'inline-block', 'marginLeft': '6px',
+            value='sell', clearable=False, searchable=False,
+            style={'width': '110px', 'display': 'inline-block', 'marginLeft': '8px',
                    'fontSize': '12px', 'verticalAlign': 'middle'}),
         html.Button('进仓', id={'type': 'trade-entry-btn', 'index': idx}, n_clicks=0, style={
-            'padding': '5px 16px', 'fontSize': '13px', 'cursor': 'pointer',
+            'padding': '5px 18px', 'fontSize': '13px', 'cursor': 'pointer',
             'backgroundColor': '#1a4a1e', 'color': '#00FF88',
-            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginLeft': '4px',
-            'fontWeight': 'bold'}),
+            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginLeft': '8px',
+            'fontWeight': 'bold', 'whiteSpace': 'nowrap'}),
+        dcc.Input(
+            id={'type': 'trade-volume', 'index': idx}, type='number', value=1, min=1, max=500,
+            style={'width': '55px', 'padding': '4px 6px', 'fontSize': '13px',
+                   'backgroundColor': '#1a1a3e', 'color': '#fff',
+                   'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center',
+                   'marginLeft': '8px'}),
         dcc.Checklist(
             id={'type': 'entry-split-toggle', 'index': idx},
             options=[{'label': '分轮', 'value': 'split'}],
-            value=[], inline=True,
-            style={'display': 'inline-block', 'marginLeft': '6px', 'fontSize': '11px',
+            value=['split'], inline=True,
+            style={'display': 'inline-block', 'marginLeft': '8px', 'fontSize': '11px',
                    'verticalAlign': 'middle'},
             inputStyle={'marginRight': '2px', 'cursor': 'pointer'},
             labelStyle={'color': '#aaa', 'fontSize': '11px', 'cursor': 'pointer'}),
         html.Span(id={'type': 'entry-split-plan', 'index': idx}, style={
-            'color': '#4fc3f7', 'fontSize': '11px', 'marginLeft': '2px'}),
-        html.Span(id={'type': 'trade-entry-status', 'index': idx}, style={
-            'color': '#00FF88', 'fontSize': '12px', 'marginLeft': '10px'}),
-        html.Span(id={'type': 'trade-entry-result', 'index': idx}, style={
-            'color': '#00FF88', 'fontSize': '12px'}),
+            'color': '#4fc3f7', 'fontSize': '11px', 'marginLeft': '4px', 'whiteSpace': 'nowrap'}),
     ]
 
-    # 第二行：买入平仓 + 紧急停止
-    line2 = [
-        html.Span('', style={'width': '32px', 'display': 'inline-block'}),  # 左侧对齐占位
-        html.Span('平仓 ', style={'color': '#aaa', 'fontSize': '12px', 'marginRight': '4px'}),
-        dcc.Input(
-            id={'type': 'close-volume', 'index': idx}, type='number', value=1, min=1, max=500,
-            style={'width': '60px', 'padding': '5px 8px', 'fontSize': '13px',
-                   'backgroundColor': '#1a1a3e', 'color': '#fff',
-                   'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center'}),
+    # 第三行：平仓 + 时间强平
+    line3 = [
+        html.Span('平仓 ', style={'color': '#FF6B6B', 'fontSize': '12px', 'fontWeight': 'bold',
+                                   'marginRight': '6px', 'whiteSpace': 'nowrap'}),
         html.Span('Bid≤', id={'type': 'close-condition-label', 'index': idx},
-                  style={'color': '#aaa', 'fontSize': '11px', 'marginLeft': '10px'}),
+                  style={'color': '#aaa', 'fontSize': '11px'}),
         dcc.Input(
             id={'type': 'close-condition-sum', 'index': idx}, type='number', placeholder='不限',
-            style={'width': '62px', 'padding': '5px 6px', 'fontSize': '12px',
+            style={'width': '60px', 'padding': '4px 6px', 'fontSize': '12px',
                    'backgroundColor': '#1a1a3e', 'color': '#FF6B6B',
-                   'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center'}),
+                   'border': '1px solid #555', 'borderRadius': '4px', 'textAlign': 'center',
+                   'marginLeft': '3px'}),
         dcc.Dropdown(
             id={'type': 'close-direction', 'index': idx},
             options=[{'label': '买入平仓', 'value': 'buy_close'}, {'label': '卖出平仓', 'value': 'sell_close'}],
-            value='buy_close', clearable=False,
-            style={'width': '100px', 'display': 'inline-block', 'marginLeft': '6px',
+            value='buy_close', clearable=False, searchable=False,
+            style={'width': '110px', 'display': 'inline-block', 'marginLeft': '8px',
                    'fontSize': '12px', 'verticalAlign': 'middle'}),
         html.Button('平仓', id={'type': 'trade-close-btn', 'index': idx}, n_clicks=0, style={
-            'padding': '5px 16px', 'fontSize': '13px', 'cursor': 'pointer',
+            'padding': '5px 18px', 'fontSize': '13px', 'cursor': 'pointer',
             'backgroundColor': '#4a1a1e', 'color': '#FF6B6B',
-            'border': '1px solid #FF6B6B', 'borderRadius': '4px', 'marginLeft': '4px',
-            'fontWeight': 'bold'}),
+            'border': '1px solid #FF6B6B', 'borderRadius': '4px', 'marginLeft': '8px',
+            'fontWeight': 'bold', 'whiteSpace': 'nowrap'}),
+        dcc.Input(
+            id={'type': 'close-volume', 'index': idx}, type='number', value=1, min=1, max=500,
+            style={'width': '55px', 'padding': '4px 6px', 'fontSize': '13px',
+                   'backgroundColor': '#1a1a3e', 'color': '#fff',
+                   'border': '1px solid #444', 'borderRadius': '4px', 'textAlign': 'center',
+                   'marginLeft': '8px'}),
         dcc.Checklist(
             id={'type': 'close-split-toggle', 'index': idx},
             options=[{'label': '分轮', 'value': 'split'}],
-            value=[], inline=True,
-            style={'display': 'inline-block', 'marginLeft': '6px', 'fontSize': '11px',
+            value=['split'], inline=True,
+            style={'display': 'inline-block', 'marginLeft': '8px', 'fontSize': '11px',
                    'verticalAlign': 'middle'},
             inputStyle={'marginRight': '2px', 'cursor': 'pointer'},
             labelStyle={'color': '#aaa', 'fontSize': '11px', 'cursor': 'pointer'}),
         html.Span(id={'type': 'close-split-plan', 'index': idx}, style={
-            'color': '#FF6B6B', 'fontSize': '11px', 'marginLeft': '2px'}),
+            'color': '#FF6B6B', 'fontSize': '11px', 'marginLeft': '4px', 'whiteSpace': 'nowrap'}),
         html.Span(id={'type': 'trade-close-status', 'index': idx}, style={
-            'color': '#FF6B6B', 'fontSize': '12px', 'marginLeft': '10px'}),
+            'color': '#FF6B6B', 'fontSize': '12px', 'marginLeft': '8px', 'whiteSpace': 'nowrap'}),
         html.Span(id={'type': 'trade-close-result', 'index': idx}, style={
-            'color': '#FF6B6B', 'fontSize': '12px'}),
-        html.Span('│', style={'color': '#333', 'margin': '0 8px'}),
-        html.Button('停', id={'type': 'emergency-btn', 'index': idx}, n_clicks=0, style={
-            'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
-            'backgroundColor': '#4a0000', 'color': '#FF6B6B',
-            'border': '1px solid #FF6B6B', 'borderRadius': '4px',
-            'fontWeight': 'bold'}),
+            'color': '#FF6B6B', 'fontSize': '12px', 'whiteSpace': 'nowrap'}),
         html.Span(id={'type': 'emergency-status', 'index': idx}, style={
-            'fontSize': '11px', 'marginLeft': '6px'}),
-        html.Span('│', style={'color': '#333', 'margin': '0 8px'}),
+            'fontSize': '11px', 'marginLeft': '8px', 'whiteSpace': 'nowrap'}),
         html.Button('时间强平', id={'type': 'force-close-btn', 'index': idx}, n_clicks=0, style={
-            'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer',
+            'padding': '3px 10px', 'fontSize': '12px', 'cursor': 'pointer', 'whiteSpace': 'nowrap',
             'backgroundColor': '#1a3a1a', 'color': '#00FF88',
-            'border': '1px solid #00FF88', 'borderRadius': '4px',
+            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginLeft': '12px',
             'fontWeight': 'bold'}),
         html.Span(id={'type': 'force-close-status', 'index': idx}, style={
-            'fontSize': '11px', 'marginLeft': '6px'}),
+            'fontSize': '11px', 'marginLeft': '6px', 'whiteSpace': 'nowrap'}),
     ]
 
-    return html.Div([
-        html.Div(line1, style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap', 'gap': '2px 0'}),
-        html.Div(line2, style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap',
-                                'gap': '2px 0', 'marginTop': '3px'}),
-    ], id={'type': 'trade-row', 'index': idx}, style={'marginBottom': '8px'})
+    _row_style = {'display': 'flex', 'alignItems': 'center', 'gap': '0', 'whiteSpace': 'nowrap'}
+    # 右侧「停」大按钮，跨三行
+    stop_btn = html.Button('监', id={'type': 'emergency-btn', 'index': idx}, n_clicks=0,
+                           style=_RUN_BTN_STYLE)
+
+    left_col = html.Div([
+        html.Div(line1, style=_row_style),
+        html.Div(line2, style={**_row_style, 'marginTop': '3px'}),
+        html.Div(line3, style={**_row_style, 'marginTop': '3px'}),
+    ], style={'flex': '1', 'minWidth': '0'})
+
+    return html.Div([left_col, stop_btn],
+        id={'type': 'trade-row', 'index': idx},
+        style={'display': 'flex', 'alignItems': 'stretch', 'gap': '8px', 'marginBottom': '6px',
+               'borderBottom': '1px solid #2a2a4a', 'paddingBottom': '6px'})
 
 
 def serve_layout():
@@ -3298,6 +3454,7 @@ def serve_layout():
     dcc.Store(id='scorecard-collapsed', data=True),
     dcc.Store(id='loading-state', data={}),  # {product: start_timestamp}
     dcc.Store(id='trade-state', data=_load_trade_state()),  # 交易行选中状态持久化
+    dcc.Store(id='pending-trade-pair', data=None),  # 图表「加载」→ 自动填入交易行
 
     # 定时刷新
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
@@ -3814,30 +3971,46 @@ def on_emergency_stop_click(n_clicks, all_min_ask):
         return status_msg, [no_update] * n_rows, [no_update] * n_rows
 
 
+_STOP_BTN_STYLE = {
+    'padding': '0', 'width': '54px', 'minWidth': '54px', 'fontSize': '26px', 'cursor': 'pointer',
+    'backgroundColor': '#6a0000', 'color': '#fff',
+    'border': '2px solid #FF4444', 'borderRadius': '6px',
+    'fontWeight': 'bold', 'alignSelf': 'stretch'}
+_RUN_BTN_STYLE = {
+    'padding': '0', 'width': '54px', 'minWidth': '54px', 'fontSize': '26px', 'cursor': 'pointer',
+    'backgroundColor': '#003a00', 'color': '#fff',
+    'border': '2px solid #00FF88', 'borderRadius': '6px',
+    'fontWeight': 'bold', 'alignSelf': 'stretch'}
+
+
 @app.callback(
     Output({'type': 'emergency-status', 'index': MATCH}, 'children'),
     Output({'type': 'trade-entry-status', 'index': MATCH}, 'children', allow_duplicate=True),
     Output({'type': 'entry-condition-sum', 'index': MATCH}, 'value', allow_duplicate=True),
     Output({'type': 'trade-close-status', 'index': MATCH}, 'children'),
     Output({'type': 'close-condition-sum', 'index': MATCH}, 'value'),
+    Output({'type': 'emergency-btn', 'index': MATCH}, 'children'),
+    Output({'type': 'emergency-btn', 'index': MATCH}, 'style'),
     Input({'type': 'emergency-btn', 'index': MATCH}, 'n_clicks'),
     State({'type': 'trade-pair-select', 'index': MATCH}, 'value'),
     prevent_initial_call=True,
 )
 def on_row_emergency_stop(n_clicks, pair_json):
     """单行紧急停止：只停止当前行选定的品种"""
-    no_upd = (no_update,) * 5
+    no_upd = (no_update,) * 7
     if not n_clicks:
         return no_upd
 
     if not pair_json:
-        return html.Span('请先选择期权对', style={'color': '#FF4444'}), no_update, no_update, no_update, no_update
+        return (html.Span('请先选择期权对', style={'color': '#FF4444'}),
+                no_update, no_update, no_update, no_update, no_update, no_update)
 
     try:
         pair = json.loads(pair_json)
         product = _extract_product(pair['call'])
         if not product:
-            return html.Span('无法识别品种', style={'color': '#FF4444'}), no_update, no_update, no_update, no_update
+            return (html.Span('无法识别品种', style={'color': '#FF4444'}),
+                    no_update, no_update, no_update, no_update, no_update, no_update)
 
         # 感知状态：文件优先（最可靠），HTTP辅助
         es_path = os.path.join(_STATE_DIR, '.emergency_stop')
@@ -3866,16 +4039,19 @@ def on_row_emergency_stop(n_clicks, pair_json):
                                       style={'color': '#FF8800', 'fontSize': '11px'})
                 return (html.Span(f'{product}已停止 ({ts})',
                                   style={'color': '#FF4444', 'fontWeight': 'bold'}),
-                        cancelled, None, cancelled, None)
+                        cancelled, None, cancelled, None,
+                        '停', _STOP_BTN_STYLE)
             else:
                 return (html.Span(f'{product}已恢复 ({ts})',
                                   style={'color': '#00FF88', 'fontWeight': 'bold'}),
-                        no_update, no_update, no_update, no_update)
+                        no_update, no_update, no_update, no_update,
+                        '监', _RUN_BTN_STYLE)
         else:
             return (html.Span(f'{product}操作失败: {msg} ({ts})', style={'color': '#FFD700'}),
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update, no_update)
     except Exception as e:
-        return html.Span(f'错误: {e}', style={'color': '#FF4444'}), no_update, no_update, no_update, no_update
+        return (html.Span(f'错误: {e}', style={'color': '#FF4444'}),
+                no_update, no_update, no_update, no_update, no_update, no_update)
 
 
 @app.callback(
@@ -4251,11 +4427,13 @@ def on_trade_close_click(n_clicks, pair_json, volume, condition_sum, close_direc
 def manage_trade_rows(add_clicks, remove_clicks, current_rows, row_count):
     """点+添加交易行，点×删除对应行"""
     triggered = ctx.triggered_id
-    if triggered == 'add-trade-row-btn':
+    if triggered == 'add-trade-row-btn' and add_clicks and add_clicks > 0:
         new_idx = row_count
         new_rows = (current_rows or []) + [_build_trade_row(new_idx)]
         return new_rows, row_count + 1
     elif isinstance(triggered, dict) and triggered.get('type') == 'remove-trade-row-btn':
+        if not remove_clicks or not any(c and c > 0 for c in remove_clicks):
+            return no_update, no_update
         rm_idx = triggered['index']
         kept = []
         for r in (current_rows or []):
@@ -4268,6 +4446,69 @@ def manage_trade_rows(add_clicks, remove_clicks, current_rows, row_count):
             kept = [_build_trade_row(0)]
         return kept, row_count
     return no_update, no_update
+
+
+# ---- 图表「加载」按钮 → 新增交易行 + 自动选对 ----
+
+_load_trade_cooldown = {}  # pair_key → timestamp，防止定时刷新重建按钮时重复触发
+
+@app.callback(
+    Output('pairs-store', 'data', allow_duplicate=True),
+    Output('trade-rows-container', 'children', allow_duplicate=True),
+    Output('trade-row-count', 'data', allow_duplicate=True),
+    Output('pending-trade-pair', 'data'),
+    Output('add-msg', 'children', allow_duplicate=True),
+    Input({'type': 'load-to-trade-btn', 'index': ALL}, 'n_clicks'),
+    State('pairs-store', 'data'),
+    State('trade-rows-container', 'children'),
+    State('trade-row-count', 'data'),
+    prevent_initial_call=True,
+)
+def load_pair_to_trade(load_clicks, pairs, current_rows, row_count):
+    _skip = (no_update,) * 5
+    if not ctx.triggered:
+        return _skip
+    trig_val = ctx.triggered[0].get('value')
+    if not trig_val or trig_val < 1:
+        return _skip
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict) or triggered.get('type') != 'load-to-trade-btn':
+        return _skip
+    key = triggered.get('index', '')
+    if '|' not in key:
+        return _skip
+    now = time.time()
+    if key in _load_trade_cooldown and now - _load_trade_cooldown[key] < 8:
+        return _skip
+    _load_trade_cooldown[key] = now
+    call_sym, put_sym = key.split('|', 1)
+    pair_json = json.dumps({'call': call_sym, 'put': put_sym})
+    pairs_updated = no_update
+    already = any(p[0] == call_sym and p[1] == put_sym for p in pairs)
+    if not already:
+        pairs.insert(0, [call_sym, put_sym, 1.0, 1.0])
+        save_config(pairs)
+        pairs_updated = pairs
+    new_idx = row_count
+    new_rows = (current_rows or []) + [_build_trade_row(new_idx)]
+    msg = f'已加载 {call_sym} + {put_sym}'
+    print(f'[load-to-trade] {msg}, row={new_idx}')
+    return pairs_updated, new_rows, row_count + 1, pair_json, msg
+
+
+@app.callback(
+    Output({'type': 'trade-pair-select', 'index': ALL}, 'value', allow_duplicate=True),
+    Input('pending-trade-pair', 'data'),
+    State({'type': 'trade-pair-select', 'index': ALL}, 'value'),
+    prevent_initial_call=True,
+)
+def auto_select_pending_pair(pending, current_values):
+    if not pending:
+        return [no_update] * max(len(current_values), 1)
+    values = [no_update] * len(current_values)
+    if values:
+        values[-1] = pending
+    return values
 
 
 @app.callback(
@@ -4446,6 +4687,34 @@ def render_charts(pairs, _):
         except Exception as _ae:
             print(f'[alert_history] 补充回归检查失败: {_ae}')
 
+    # ---- 为缺少图表的回归预警自动补充图表 ----
+    _chart_keys = set()
+    for _, pair, _, _, _, _ in manual_items:
+        _chart_keys.add(f'{pair[0]}|{pair[1]}')
+    for _, ap, _, _ in auto_items:
+        _chart_keys.add(f'{ap.get("call","")}|{ap.get("put","")}')
+    _next_auto_idx = len(auto_pairs)
+    for akey, arec in _alert_active.items():
+        if arec.get('resolved') or akey in _chart_keys:
+            continue
+        csym, psym = arec.get('call_sym', ''), arec.get('put_sym', '')
+        if not csym or not psym:
+            continue
+        try:
+            fig, info = build_figure(csym, psym)
+        except Exception:
+            continue
+        ap_extra = {
+            'call': csym, 'put': psym,
+            'product': arec.get('futures_sym', '?'),
+            'futures_sym': arec.get('futures_sym', '?'),
+            'score': 0, 'price_sum': arec.get('last_sum', 0),
+            '_retreating': True,
+        }
+        auto_items.append((_next_auto_idx, ap_extra, fig, info))
+        _chart_keys.add(akey)
+        _next_auto_idx += 1
+
     # ---- Gamma/Strangle 每日检查 (暂时禁用排查渲染问题) ----
     scorecard_panel, scorecard_nav_items = None, []
 
@@ -4457,14 +4726,23 @@ def render_charts(pairs, _):
 
     # ---- pair_key → 图表 anchor 映射（供导航栏跳转用）----
     _pair_anchor_map = {}
+    _futures_anchor_map = {}  # futures_sym → anchor（品种级 fallback）
     for idx, pair, fig, info, cc, pc in manual_items:
         cs, ps = pair[0], pair[1]
         is_alert = idx in alert_manual_indices
-        _pair_anchor_map[f'{cs}|{ps}'] = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
+        anchor = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
+        _pair_anchor_map[f'{cs}|{ps}'] = anchor
+        fs = info.get('futures_sym', '')
+        if fs and fs not in _futures_anchor_map:
+            _futures_anchor_map[fs] = anchor
     for idx, ap, fig, info in auto_items:
         cs, ps = ap['call'], ap['put']
         is_alert = idx in alert_auto_indices
-        _pair_anchor_map[f'{cs}|{ps}'] = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
+        anchor = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
+        _pair_anchor_map[f'{cs}|{ps}'] = anchor
+        fs = info.get('futures_sym') or ap.get('futures_sym', '')
+        if fs and fs not in _futures_anchor_map:
+            _futures_anchor_map[fs] = anchor
 
     # ---- 左侧导航栏 ----
     nav_style = {'padding': '8px 12px', 'textDecoration': 'none',
@@ -4530,7 +4808,9 @@ def render_charts(pairs, _):
             pct = ((last_s - mid) / mid * 100) if mid > 0 else 0
             _cs = arec.get('call_sym', '')
             _ps = arec.get('put_sym', '')
-            _anchor = _pair_anchor_map.get(f'{_cs}|{_ps}', 'alert-stats-panel')
+            _anchor = (_pair_anchor_map.get(f'{_cs}|{_ps}')
+                       or _futures_anchor_map.get(fs)
+                       or 'alert-stats-panel')
             _sec.append(html.A([
                 html.Div(f'◎ {fs}', style={'fontWeight': 'bold', 'fontSize': '13px', 'color': '#FFCC00'}),
                 html.Div(f'↓ 距中轨+{pct:.1f}%', style={'fontSize': '11px', 'color': '#CC9900'}),
@@ -4544,7 +4824,9 @@ def render_charts(pairs, _):
         _sec = []
         for dkey, dsig in _diverge_signals.items():
             fs = dsig.get('futures_sym', '?')
-            anchor = _pair_anchor_map.get(dkey, 'diverge-banner')
+            anchor = (_pair_anchor_map.get(dkey)
+                      or _futures_anchor_map.get(fs)
+                      or 'diverge-banner')
             cs = dsig.get('call_sym', '?')
             ps = dsig.get('put_sym', '?')
             _sec.append(html.A([
@@ -4609,6 +4891,32 @@ def render_charts(pairs, _):
     charts = []
     graph_cfg = {'scrollZoom': True, 'displayModeBar': False}
 
+    def _activity_spans(info):
+        """从 info 字典生成 C/P 活跃度占比的 html.Span 列表"""
+        spans = []
+        dims = [
+            ('30m', info.get('activity_30m'), True),
+            ('今日', info.get('activity_day'), True),
+            ('7日', info.get('activity_7d'), False),
+        ]
+        parts = []
+        for label, data, show_dir in dims:
+            if data is None:
+                continue
+            c_pct, p_pct, c_dir, p_dir = data
+            if c_pct == 0 and p_pct == 0:
+                parts.append(f'{label} C:— P:—')
+            else:
+                c_str = f'C:{c_pct:.0%}{c_dir if show_dir else ""}'
+                p_str = f'P:{p_pct:.0%}{p_dir if show_dir else ""}'
+                parts.append(f'{label} {c_str} {p_str}')
+        if parts:
+            spans.append(html.Span(
+                '  ' + ' | '.join(parts),
+                style={'fontSize': '12px', 'marginLeft': '10px', 'color': '#aaa',
+                       'letterSpacing': '0.5px'}))
+        return spans
+
     # 辅助函数：构建手动图表卡片
     def _manual_card(idx, pair, fig, info, cc, pc, is_alert=False):
         call_sym, put_sym = pair[0], pair[1]
@@ -4619,6 +4927,7 @@ def render_charts(pairs, _):
             html.Span(f'{l1}  +  {l2}',
                        style={'color': '#FFD700', 'fontSize': '15px', 'fontWeight': 'bold'}),
         ]
+        header_parts.extend(_activity_spans(info))
         # 两腿失衡警告
         leg_ratio = info.get('leg_ratio', 1)
         if leg_ratio > 1.5:
@@ -4640,6 +4949,11 @@ def render_charts(pairs, _):
             'float': 'right', 'backgroundColor': 'transparent', 'color': '#e94560',
             'border': '1px solid #e94560', 'borderRadius': '3px', 'cursor': 'pointer',
             'padding': '2px 8px', 'fontSize': '12px'}))
+        load_id = f'{call_sym}|{put_sym}'
+        header_parts.append(html.Button('加载', id={'type': 'load-to-trade-btn', 'index': load_id}, n_clicks=0, style={
+            'float': 'right', 'backgroundColor': 'transparent', 'color': '#4fc3f7',
+            'border': '1px solid #4fc3f7', 'borderRadius': '3px', 'cursor': 'pointer',
+            'padding': '2px 8px', 'fontSize': '12px', 'marginLeft': '6px'}))
         if is_alert:
             adopt_id = f'{call_sym}|{put_sym}'
             header_parts.append(html.Button('\u2713', id={'type': 'adopt-btn', 'index': adopt_id}, n_clicks=0, style={
@@ -4667,6 +4981,7 @@ def render_charts(pairs, _):
             html.Span(f'  {ap["score"]:.1f}分',
                        style={'color': '#FFD700', 'fontSize': '13px', 'marginLeft': '10px'}),
         ]
+        header_parts.extend(_activity_spans(info))
         if ap.get('v6_tag'):
             header_parts.append(html.Span(
                 f'  {ap["v6_tag"]}',
@@ -4682,6 +4997,10 @@ def render_charts(pairs, _):
             'float': 'right', 'backgroundColor': 'transparent', 'color': '#00FF88',
             'border': '1px solid #00FF88', 'borderRadius': '3px', 'cursor': 'pointer',
             'padding': '2px 8px', 'fontSize': '14px', 'fontWeight': 'bold', 'marginLeft': '6px'}))
+        header_parts.append(html.Button('加载', id={'type': 'load-to-trade-btn', 'index': adopt_id}, n_clicks=0, style={
+            'float': 'right', 'backgroundColor': 'transparent', 'color': '#4fc3f7',
+            'border': '1px solid #4fc3f7', 'borderRadius': '3px', 'cursor': 'pointer',
+            'padding': '2px 8px', 'fontSize': '12px', 'marginLeft': '6px'}))
         border_color = '#FF4444' if is_alert else '#2a2a4a'
         div_id = f'alert-a-{idx}' if is_alert else f'a-chart-{idx}'
         header_parts.extend(_make_advisory_spans(ap['call'], ap.get('put')))
@@ -4792,6 +5111,15 @@ def render_charts(pairs, _):
                           'marginBottom': '8px'}))
 
     charts_area = html.Div(charts, style={'flex': '1', 'minWidth': '0'})
+
+    # ---- 贡献度历史写入 ----
+    contrib_data = []
+    for idx, pair, fig, info, cc, pc in manual_items:
+        contrib_data.append((pair[0], pair[1], info))
+    for idx, ap, fig, info in auto_items:
+        contrib_data.append((ap['call'], ap['put'], info))
+    if contrib_data:
+        threading.Thread(target=_save_contribution, args=(contrib_data,), daemon=True).start()
 
     charts_layout = html.Div([sidebar, charts_area],
                               style={'display': 'flex', 'alignItems': 'flex-start', 'padding': '8px'})
