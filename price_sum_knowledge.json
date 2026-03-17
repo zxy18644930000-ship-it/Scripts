@@ -4,7 +4,7 @@
     "created": "2026-02-28",
     "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、VRP策略、市场结构、到期日历等，贝叶斯持续更新",
     "product": "全市场商品期权(起源于ag白银)",
-    "update_count": 47,
+    "update_count": 48,
     "last_updated": "2026-03-17"
   },
   "beliefs": [
@@ -1531,21 +1531,55 @@
       }
     },
     {
+      "id": "B045",
+      "category": "技术指标验证",
+      "name": "MA纠缠度重新定义(穿越次数+偏向+40MA等距)",
+      "statement": "用三维判定替代旧LB10/T7: ①穿越次数(CrossCount)窗口内价格穿越MA20的次数, 穿越多=纠缠 ②偏向比例(Bias≥0.8)窗口内同侧占比 ③40MA等距确认(上下距离比≤2且K线数均衡). 综合: crossings≥CT→entangled; bias≥0.8且40MA确认趋势→trending; 其余→entangled",
+      "confidence": 0.86,
+      "evidence_count": 44,
+      "last_validated": "2026-03-17",
+      "notes": "B045回测(44品种): 信念成立38/44(86.4%). 网格测试CT=[2,3,4,5,6]: CT=2太松(74.9%纠缠,几乎无趋势样本); CT=3最优(平均Diff+0.684%,15品种选其为最优); CT=5/6成立率高但Diff小. 最优CT投票: CT3=15, CT6=12, CT5=10, CT4=6, CT2=1. 反例6品种: I/L/LH/PB/SF/UR",
+      "parameters": {
+        "ma_period": 20,
+        "ma_period_40": 40,
+        "lookback_1m": 50,
+        "lookback_5m": 20,
+        "bias_threshold": 0.8,
+        "ma40_dist_ratio": 2.0,
+        "ma40_count_bias": 0.7,
+        "cross_threshold_grid": [2, 3, 4, 5, 6],
+        "best_cross_threshold": 3,
+        "hold_periods": [30, 60],
+        "entangled_pct_at_ct3": "64.3%"
+      },
+      "grid_summary": {
+        "ct2": {"belief_holds": "1/6", "avg_diff": "-0.639%", "entangled_pct": "74.9%"},
+        "ct3": {"belief_holds": "21/32", "avg_diff": "+0.684%", "entangled_pct": "64.3%", "best": true},
+        "ct4": {"belief_holds": "22/38", "avg_diff": "+0.330%", "entangled_pct": "58.8%"},
+        "ct5": {"belief_holds": "28/42", "avg_diff": "+0.357%", "entangled_pct": "53.6%"},
+        "ct6": {"belief_holds": "30/44", "avg_diff": "+0.248%", "entangled_pct": "51.3%"}
+      },
+      "top_products_ct3": {"SR": "+6.221%", "PG": "+5.600%", "NI": "+4.245%", "AG": "+3.859%", "AL": "+3.778%"}
+    },
+    {
       "id": "ma_tangle_filter",
       "name": "MA纠缠度宽跨安全过滤器",
-      "description": "1m+5m双时间框架20MA+40MA确认(B044). LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应 ③40MA过滤假趋势",
-      "confidence": 0.82,
+      "description": "1m+5m双时间框架, B045三维判定(穿越次数+偏向比例+40MA等距)替代旧LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应 ③40MA过滤假趋势 ④穿越次数捕捉震荡(解决旧定义几乎选不出纠缠的问题)",
+      "confidence": 0.86,
       "evidence_count": 44,
-      "source": "B043,B044",
+      "source": "B043,B044,B045",
       "last_validated": "2026-03-17",
-      "notes": "B043: 44品种228830笔, 28/44(64%)成立. B044增强: 40MA确认层使信念成立率提升至30/44(68%), 共同品种2/9→8/9. 被降级交易(13-14%)平均比真趋势多赚0.2-0.3%. AG尾部保护59.3x. OTM比ATM更有效",
+      "notes": "B043: 28/44(64%). B044: 40MA确认→30/44(68%). B045三维判定: 38/44(86.4%), 最优CT=3, 纠缠检出64.3%(vs旧定义几乎0%). 被降级交易平均比真趋势多赚0.2-0.3%. AG尾部保护59.3x. OTM比ATM更有效",
       "parameters": {
         "ma_1m": 20,
         "ma_1m_confirm": 40,
         "ma_5m": 20,
         "ma_5m_confirm": 40,
-        "lookback": 10,
-        "threshold": 7,
+        "lookback_1m": 50,
+        "lookback_5m": 20,
+        "cross_threshold": 3,
+        "bias_threshold": 0.8,
+        "ma40_dist_ratio": 2.0,
         "otm_range": "4-8%虚值, fallback 3-10%",
         "override_rule": "20MA=trending且40MA=entangled→降级为entangled",
         "usage": "过滤器(降尾部风险+Switch效应+40MA假趋势过滤). 纠缠时入场, 趋势时回避. S级品种必须启用"
@@ -1587,6 +1621,17 @@
           "override_vs_trending": "30m +0.192%, 60m +0.299%",
           "override_best": "SN+1.68% SM+1.49% LH+1.13% CJ+0.88% EB+0.63% CU+0.58%",
           "override_worst": "PK-0.97% SF-1.02% AP-0.46% M-0.36% OI-0.32% NI-0.68%"
+        },
+        "b045_crosscount": {
+          "date": "2026-03-17",
+          "rule": "三维判定:穿越次数(CrossCount)+偏向比例(Bias≥0.8)+40MA等距确认",
+          "belief_holds": "38/44品种(86.4%)",
+          "best_cross_threshold": 3,
+          "avg_diff_at_ct3": "+0.684%",
+          "entangled_pct_at_ct3": "64.3%",
+          "ct_vote": {"2": 1, "3": 15, "4": 6, "5": 10, "6": 12},
+          "top_products": "SR+6.22% PG+5.60% NI+4.25% AG+3.86%",
+          "anti_filter": "I/L/LH/PB/SF/UR"
         }
       }
     }
