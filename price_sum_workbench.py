@@ -1232,6 +1232,10 @@ def _make_advisory_spans(call_sym, put_sym=None):
 
 # ============ 配置持久化 ============
 
+# 上次由工作台写入配置的时间（用于检测技能等外部修改）
+_config_file_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0.0
+
+
 def load_config():
     """加载已保存的期权对列表"""
     if os.path.exists(CONFIG_PATH):
@@ -1245,8 +1249,11 @@ def load_config():
 
 def save_config(pairs):
     """保存期权对列表"""
+    global _config_file_mtime
     with open(CONFIG_PATH, 'w') as f:
         json.dump(pairs, f, ensure_ascii=False, indent=2)
+    if os.path.exists(CONFIG_PATH):
+        _config_file_mtime = os.path.getmtime(CONFIG_PATH)
 
 
 _TRADE_STATE_PATH = os.path.expanduser('~/Scripts/trade_state.json')
@@ -2013,13 +2020,17 @@ def _save_contribution(pairs_info):
 
 
 # ============ MA 纠缠度过滤器 ============
-# 回测验证(B044 40MA确认层): 20MA + 40MA双确认, 1m+5m 双时间框架
-# 20MA判趋势但40MA仍纠缠 → 降级为"大幅震荡"而非真趋势
+# B045 三维判定: 穿越次数(CrossCount) + 偏向比例(Bias) + 40MA等距确认
+# 回测38/44成立, 最优CT=3, 纠缠检出64.3%
 
-_MA_PERIOD_20 = 20
+_MA_PERIOD = 20
 _MA_PERIOD_40 = 40
-_MA_LOOKBACK = 10
-_MA_THRESHOLD = 7
+_MA_LOOKBACK_1M = 50   # 1m 回看窗口 (~50分钟)
+_MA_LOOKBACK_5M = 20   # 5m 回看窗口 (~100分钟)
+_MA_CROSS_THRESHOLD = 3
+_MA_BIAS_THRESHOLD = 0.8
+_MA40_DIST_RATIO = 2.0
+_MA40_COUNT_BIAS = 0.7
 
 _MA_TANGLE_GRADE = {
     'S': {'UR', 'NI', 'LC', 'EB', 'SN', 'CF', 'LH', 'SI'},
@@ -2048,7 +2059,7 @@ def _resolve_futures_symbol(sym, cur):
 
 
 def _compute_ma_tangle_state(futures_sym):
-    """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（含40MA确认层）"""
+    """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）"""
     _warmup = {'state_1m': 'warmup', 'state_5m': 'warmup', 'combined': 'warmup',
                'overridden_1m': False, 'overridden_5m': False}
     if not futures_sym:
@@ -2064,7 +2075,7 @@ def _compute_ma_tangle_state(futures_sym):
             WHERE symbol=? ORDER BY datetime DESC LIMIT 800
         """, (resolved,))
         rows = cur.fetchall()
-        min_needed = _MA_PERIOD_40 + _MA_LOOKBACK
+        min_needed = _MA_PERIOD_40 + max(_MA_LOOKBACK_1M, _MA_LOOKBACK_5M * 5)
         if len(rows) < min_needed:
             return _warmup
         rows.reverse()
@@ -2074,44 +2085,80 @@ def _compute_ma_tangle_state(futures_sym):
         dts = list(seen.keys())
         closes = np.array(list(seen.values()), dtype=np.float64)
 
-        def _calc_state(prices, ma_period):
-            if len(prices) < ma_period + _MA_LOOKBACK:
-                return 'warmup'
+        def _cross_count_and_bias(prices, ma_period, lookback):
+            if len(prices) < ma_period + lookback:
+                return None, None, None
             ma = np.convolve(prices, np.ones(ma_period) / ma_period, mode='valid')
             tail = prices[ma_period - 1:]
+            sign = np.sign(tail - ma)
             above = (tail > ma).astype(np.float64)
             below = (tail < ma).astype(np.float64)
-            if len(above) < _MA_LOOKBACK:
-                return 'warmup'
-            ab_sum = np.sum(above[-_MA_LOOKBACK:])
-            bl_sum = np.sum(below[-_MA_LOOKBACK:])
-            if ab_sum >= _MA_THRESHOLD:
-                return 'trending_up'
-            elif bl_sum >= _MA_THRESHOLD:
-                return 'trending_down'
+            i = len(tail) - lookback
+            if i < 0:
+                return None, None, None
+            window_sign = sign[i:i + lookback]
+            sign_diff = np.diff(window_sign)
+            crossings = int(np.count_nonzero(sign_diff != 0))
+            ab_sum = np.sum(above[i:i + lookback])
+            bl_sum = np.sum(below[i:i + lookback])
+            total = ab_sum + bl_sum
+            if total > 0:
+                above_ratio = ab_sum / total
+                bias = max(above_ratio, 1.0 - above_ratio)
             else:
-                return 'entangled'
+                above_ratio = 0.5
+                bias = 0.5
+            return crossings, bias, above_ratio
 
-        state_1m_20 = _calc_state(closes, _MA_PERIOD_20)
-        state_1m_40 = _calc_state(closes, _MA_PERIOD_40)
+        def _ma40_equidist(prices, ma40, lookback):
+            if len(prices) < 40 + lookback or np.any(np.isnan(ma40[-lookback:])):
+                return 999.0, 1.0
+            i = len(prices) - lookback
+            wc = prices[i:i + lookback]
+            wm = ma40[i:i + lookback]
+            valid = ~np.isnan(wm)
+            if valid.sum() < lookback * 0.5:
+                return 999.0, 1.0
+            wc, wm = wc[valid], wm[valid]
+            above_mask, below_mask = wc > wm, wc < wm
+            n_above, n_below = int(above_mask.sum()), int(below_mask.sum())
+            dist_above = float(np.mean(wc[above_mask] - wm[above_mask])) if n_above > 0 else 0.0
+            dist_below = float(np.mean(wm[below_mask] - wc[below_mask])) if n_below > 0 else 0.0
+            eps = 1e-10
+            if dist_above > eps and dist_below > eps:
+                dist_ratio = max(dist_above, dist_below) / min(dist_above, dist_below)
+            else:
+                dist_ratio = 999.0
+            count_bias = max(n_above, n_below) / (n_above + n_below) if (n_above + n_below) > 0 else 0.5
+            return dist_ratio, count_bias
+
+        def _classify(crossings, bias, above_ratio, dist_ratio_40, count_bias_40):
+            if crossings is None:
+                return 'warmup'
+            if crossings >= _MA_CROSS_THRESHOLD:
+                return 'entangled'
+            if bias >= _MA_BIAS_THRESHOLD:
+                ma40_confirms = (dist_ratio_40 > _MA40_DIST_RATIO) or (count_bias_40 > _MA40_COUNT_BIAS)
+                if ma40_confirms:
+                    return 'trending_up' if above_ratio > 0.5 else 'trending_down'
+            return 'entangled'
+
+        ma40_1m = pd.Series(closes).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
+        cx_1m, bias_1m, ar_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
+        dr40_1m, cb40_1m = _ma40_equidist(closes, ma40_1m, _MA_LOOKBACK_1M)
+        state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m)
 
         df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
         df5 = df5.set_index('dt')
         r5 = df5['close'].resample('5min').last().dropna()
         r5v = r5.values
-        state_5m_20 = _calc_state(r5v, _MA_PERIOD_20) if len(r5v) >= _MA_PERIOD_20 + _MA_LOOKBACK else 'warmup'
-        state_5m_40 = _calc_state(r5v, _MA_PERIOD_40) if len(r5v) >= _MA_PERIOD_40 + _MA_LOOKBACK else 'warmup'
-
-        overridden_1m = False
-        overridden_5m = False
-        state_1m = state_1m_20
-        state_5m = state_5m_20
-        if state_1m_20.startswith('trending') and state_1m_40 == 'entangled':
-            state_1m = 'entangled'
-            overridden_1m = True
-        if state_5m_20.startswith('trending') and state_5m_40 == 'entangled':
-            state_5m = 'entangled'
-            overridden_5m = True
+        if len(r5v) < _MA_PERIOD_40 + _MA_LOOKBACK_5M:
+            state_5m = 'warmup'
+        else:
+            ma40_5m = pd.Series(r5v).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
+            cx_5m, bias_5m, ar_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
+            dr40_5m, cb40_5m = _ma40_equidist(r5v, ma40_5m, _MA_LOOKBACK_5M)
+            state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m)
 
         if state_1m == 'warmup' or state_5m == 'warmup':
             combined = 'warmup'
@@ -2120,7 +2167,7 @@ def _compute_ma_tangle_state(futures_sym):
         else:
             combined = 'warning'
         return {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
-                'overridden_1m': overridden_1m, 'overridden_5m': overridden_5m}
+                'overridden_1m': False, 'overridden_5m': False}
     except Exception as e:
         print(f'[MA纠缠] 计算失败 {futures_sym}: {e}')
         return _warmup
@@ -3577,7 +3624,7 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
-# 添加期权对成功后滚动到新图表（MutationObserver 等待图表渲染完成后自动滚动）
+# 添加期权对成功后滚动到新图表（MutationObserver + 轮询，等待图表渲染完成后自动滚动）
 app.clientside_callback(
     """
     function(pairKey) {
@@ -3587,12 +3634,21 @@ app.clientside_callback(
         if (el) { el.scrollIntoView({behavior:'smooth',block:'start'}); return null; }
         var container = document.getElementById('charts-container');
         if (!container) return null;
-        var obs = new MutationObserver(function(_, me) {
+        var scrollToEl = function() {
             var found = document.querySelector(sel);
-            if (found) { me.disconnect(); found.scrollIntoView({behavior:'smooth',block:'start'}); }
+            if (found) { found.scrollIntoView({behavior:'smooth',block:'start'}); return true; }
+            return false;
+        };
+        var obs = new MutationObserver(function(_, me) {
+            if (scrollToEl()) me.disconnect();
         });
         obs.observe(container, {childList:true, subtree:true});
-        setTimeout(function() { obs.disconnect(); }, 15000);
+        setTimeout(function() { obs.disconnect(); }, 30000);
+        var pollCount = 0;
+        var poll = setInterval(function() {
+            if (scrollToEl() || ++pollCount >= 20) clearInterval(poll);
+        }, 500);
+        setTimeout(function() { clearInterval(poll); }, 30000);
         return null;
     }
     """,
@@ -3600,6 +3656,29 @@ app.clientside_callback(
     Input('scroll-to-pair', 'data'),
     prevent_initial_call=True,
 )
+
+
+# 定时检测：技能等外部修改了 price_sum_pairs.json 时，从文件重载到 pairs-store
+@app.callback(
+    Output('pairs-store', 'data', allow_duplicate=True),
+    Input('timer', 'n_intervals'),
+    State('pairs-store', 'data'),
+    prevent_initial_call=True,
+)
+def sync_pairs_from_file(n_intervals, current_pairs):
+    """技能添加期权对时只改文件，工作台内存不更新。定时检测文件变更并重载。"""
+    global _config_file_mtime
+    if not os.path.exists(CONFIG_PATH):
+        return no_update
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+        if mtime > _config_file_mtime:
+            fresh = load_config()
+            _config_file_mtime = mtime
+            return fresh
+    except Exception:
+        pass
+    return no_update
 
 
 # 侧边栏×删除 — 独立callback，避免与modify_pairs的pattern-matching冲突
