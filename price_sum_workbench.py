@@ -668,11 +668,11 @@ def _load_dashboard():
             latest_acc = None
             for logf in glob.glob(os.path.join(_STRATEGY_STATE_DIR, '*_auto.log')):
                 try:
-                    import subprocess
-                    result = subprocess.run(
-                        ['tail', '-100', logf], capture_output=True, text=True, timeout=2
-                    )
-                    for line in reversed(result.stdout.splitlines()):
+                    with open(logf, 'rb') as _lf:
+                        _lf.seek(0, 2)
+                        _lf.seek(max(0, _lf.tell() - 15000))
+                        _tail_lines = _lf.read().decode('utf-8', errors='ignore').splitlines()[-100:]
+                    for line in reversed(_tail_lines):
                         m = log_pattern.search(line)
                         if m:
                             latest_acc = {
@@ -1331,10 +1331,16 @@ def _extract_futures_symbol(option_sym):
     return m.group(1) if m else None
 
 
+_symbol_resolve_cache = {}
+
 def _resolve_symbol(sym, cur):
     """自动匹配数据库中的实际 symbol 格式（处理大商所/广期所短横线格式）"""
+    cached = _symbol_resolve_cache.get(sym)
+    if cached is not None:
+        return cached
     cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (sym,))
     if cur.fetchone():
+        _symbol_resolve_cache[sym] = sym
         return sym
     # 尝试大商所格式: p2604C9000 -> p2604-C-9000
     m = re.match(r'([a-zA-Z]+\d{3,4})([CP])(\d+)', sym)
@@ -1342,7 +1348,9 @@ def _resolve_symbol(sym, cur):
         dash_sym = f'{m.group(1)}-{m.group(2)}-{m.group(3)}'
         cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (dash_sym,))
         if cur.fetchone():
+            _symbol_resolve_cache[sym] = dash_sym
             return dash_sym
+    _symbol_resolve_cache[sym] = sym
     return sym
 
 
@@ -2046,17 +2054,28 @@ def _get_ma_grade(product):
             return grade
     return None
 
+_futures_resolve_cache = {}
+
 def _resolve_futures_symbol(sym, cur):
     """解析期货 symbol 以匹配数据库格式（SQLite 区分大小写，CZCE 用大写 CF605，SHFE 用小写 cu2605）"""
+    cached = _futures_resolve_cache.get(sym)
+    if cached is not None:
+        return cached
     cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (sym,))
     if cur.fetchone():
+        _futures_resolve_cache[sym] = sym
         return sym
     alt = sym.upper() if sym[0].islower() else sym.lower()
     cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (alt,))
     if cur.fetchone():
+        _futures_resolve_cache[sym] = alt
         return alt
+    _futures_resolve_cache[sym] = sym
     return sym
 
+
+_ma_tangle_cache = {}  # {futures_sym: (timestamp, result)}
+_MA_TANGLE_CACHE_TTL = 60  # seconds
 
 def _compute_ma_tangle_state(futures_sym):
     """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）"""
@@ -2064,6 +2083,10 @@ def _compute_ma_tangle_state(futures_sym):
                'overridden_1m': False, 'overridden_5m': False}
     if not futures_sym:
         return _warmup
+    now_ts = time.time()
+    cached = _ma_tangle_cache.get(futures_sym)
+    if cached and now_ts - cached[0] < _MA_TANGLE_CACHE_TTL:
+        return cached[1]
     try:
         import numpy as np
         import pandas as pd
@@ -2166,8 +2189,10 @@ def _compute_ma_tangle_state(futures_sym):
             combined = 'safe'
         else:
             combined = 'warning'
-        return {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
-                'overridden_1m': False, 'overridden_5m': False}
+        result = {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
+                  'overridden_1m': False, 'overridden_5m': False}
+        _ma_tangle_cache[futures_sym] = (now_ts, result)
+        return result
     except Exception as e:
         print(f'[MA纠缠] 计算失败 {futures_sym}: {e}')
         return _warmup
@@ -2254,6 +2279,28 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
                 label = times[i][-8:-3]
             tick_text.append(label)
 
+    # 计算期权价格 Y 轴范围（使曲线充满图表，避免挤在底部）
+    opt_vals = [v for v in sum_prices + call_prices + put_prices if v is not None]
+    yaxis_range = None
+    if opt_vals:
+        y_lo, y_hi = min(opt_vals), max(opt_vals)
+        span = y_hi - y_lo or 1  # 单点或全相同值时 span=1
+        pad = max(span * 0.05, 0.5)  # 5% 或至少 0.5
+        yaxis_range = [y_lo - pad, y_hi + pad]
+
+    yaxis_cfg = dict(
+        title='期权价格',
+        title_font=dict(color='#FFD700'),
+        tickfont=dict(color='#ddd'),
+        gridcolor='#2a2a4a',
+        nticks=10,  # 保证足够密的刻度，低价期权也能清晰显示
+        showspikes=True, spikemode='across',
+        spikethickness=1, spikecolor='#555', spikedash='dot',
+    )
+    if yaxis_range:
+        yaxis_cfg['range'] = yaxis_range
+        yaxis_cfg['autorange'] = False
+
     layout_kwargs = dict(
         template='plotly_dark',
         paper_bgcolor='#1a1a2e',
@@ -2273,15 +2320,7 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
             spikethickness=1, spikecolor='#888', spikedash='solid',
             range=[default_start_idx - 0.5, len(times) - 0.5] if times else None,
         ),
-        yaxis=dict(
-            title='期权价格',
-            title_font=dict(color='#FFD700'),
-            tickfont=dict(color='#ddd'),
-            gridcolor='#2a2a4a',
-            nticks=10,  # 保证足够密的刻度，低价期权也能清晰显示
-            showspikes=True, spikemode='across',
-            spikethickness=1, spikecolor='#555', spikedash='dot',
-        ),
+        yaxis=yaxis_cfg,
         legend=dict(
             orientation='h', x=0.5, xanchor='center', y=-0.18,
             font=dict(color='#ddd', size=11)
@@ -2379,6 +2418,7 @@ def _parse_contract(sym):
 # 品种行权价间隔打分参数 (optimal_min, optimal_max, max_reasonable)
 _auto_cache = {'pairs': [], 'ts': None}
 _v6_recommended_pairs = []  # 今日计划精选的OTM宽跨推荐，由toggle_plan填充
+_v6_preheat_thread = threading.local()  # 哨兵：防止重复启动预热线程
 
 
 def _score_pair(cp, pp, cs, ps, fp, cv, pv, strike_params=None):
@@ -2456,20 +2496,19 @@ def auto_select_pairs():
             continue
         product_months.setdefault(prod, []).append((month, data))
 
-    result = []
-    for prod, months in product_months.items():
-        months.sort(key=lambda x: x[0])
-        month, data = months[0]
+    # 收集所有候选 symbol，一次性批量查 count 和 recent volume
+    candidate_syms = set()
+    _pre_candidates = []
+    for prod, months_list in product_months.items():
+        months_list.sort(key=lambda x: x[0])
+        month, data = months_list[0]
         fp_sym, fp = data['futures']
         otm_calls = [(s, p, v, k) for s, p, v, k in data['calls'] if k > fp and p > 0]
         otm_puts = [(s, p, v, k) for s, p, v, k in data['puts'] if k < fp and p > 0]
         if not otm_calls or not otm_puts:
             continue
-
-        # 按虚值度排序，只搜索前10档
         otm_calls.sort(key=lambda x: x[3] - fp)
         otm_puts.sort(key=lambda x: fp - x[3])
-
         best = None
         for c_sym, c_px, c_vol, c_k in otm_calls[:10]:
             if c_vol == 0:
@@ -2482,30 +2521,43 @@ def auto_select_pairs():
                 score = _score_pair(c_px, p_px, c_k, p_k, fp, c_vol, p_vol)
                 if score > 0 and (best is None or score > best[0]):
                     best = (score, c_sym, p_sym, c_px + p_px)
-
         if best:
-            score, c_sym, p_sym, psum = best
-            # 数据量检查：至少需要130条1分钟数据（≈26根5分钟K线）才能算布林带
-            min_bars = 130
-            cur.execute("SELECT COUNT(*) FROM dbbardata WHERE symbol=?", (c_sym,))
-            c_cnt = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM dbbardata WHERE symbol=?", (p_sym,))
-            p_cnt = cur.fetchone()[0]
-            if min(c_cnt, p_cnt) < min_bars:
-                continue  # 数据不足，跳过
-            # 累计成交量检查：近24小时两腿都需有真实成交
-            cur.execute("SELECT COALESCE(SUM(volume),0) FROM dbbardata WHERE symbol=? AND datetime>=?", (c_sym, recent))
-            c_total_vol = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(SUM(volume),0) FROM dbbardata WHERE symbol=? AND datetime>=?", (p_sym, recent))
-            p_total_vol = cur.fetchone()[0]
-            if min(c_total_vol, p_total_vol) < 50:
-                continue  # 累计成交不足，死合约
-            result.append({
-                'call': c_sym, 'put': p_sym,
-                'product': prod, 'month': month,
-                'score': score, 'price_sum': psum,
-                'futures_sym': fp_sym,
-            })
+            candidate_syms.add(best[1])
+            candidate_syms.add(best[2])
+            _pre_candidates.append((prod, month, fp_sym, best))
+
+    # 批量查 count 和 recent volume（替代逐条 SELECT）
+    _sym_count = {}
+    _sym_recent_vol = {}
+    if candidate_syms:
+        ph = ','.join('?' for _ in candidate_syms)
+        sym_list = list(candidate_syms)
+        cur.execute(f"SELECT symbol, COUNT(*) FROM dbbardata WHERE symbol IN ({ph}) GROUP BY symbol", sym_list)
+        for s, c in cur.fetchall():
+            _sym_count[s] = c
+        cur.execute(f"SELECT symbol, COALESCE(SUM(volume),0) FROM dbbardata WHERE symbol IN ({ph}) AND datetime>=? GROUP BY symbol",
+                    sym_list + [recent])
+        for s, v in cur.fetchall():
+            _sym_recent_vol[s] = v
+
+    result = []
+    min_bars = 130
+    for prod, month, fp_sym, best in _pre_candidates:
+        score, c_sym, p_sym, psum = best
+        c_cnt = _sym_count.get(c_sym, 0)
+        p_cnt = _sym_count.get(p_sym, 0)
+        if min(c_cnt, p_cnt) < min_bars:
+            continue
+        c_total_vol = _sym_recent_vol.get(c_sym, 0)
+        p_total_vol = _sym_recent_vol.get(p_sym, 0)
+        if min(c_total_vol, p_total_vol) < 50:
+            continue
+        result.append({
+            'call': c_sym, 'put': p_sym,
+            'product': prod, 'month': month,
+            'score': score, 'price_sum': psum,
+            'futures_sym': fp_sym,
+        })
 
     result.sort(key=lambda x: x['score'], reverse=True)
     _auto_cache['pairs'] = result
@@ -3412,6 +3464,8 @@ def _build_trade_row(idx):
 
 def serve_layout():
     """每次页面加载都从文件读取最新配置（而非启动时的静态快照）"""
+    _ts = _load_trade_state()
+    _ts_n = max(1, len(_ts.get('selections', [])) or 1)
     return html.Div([
     # 顶部标题栏
     html.Div([
@@ -3517,12 +3571,12 @@ def serve_layout():
     # 交易面板（动态多行，根据持久化状态恢复）
     html.Div([
         html.Div(id='trade-rows-container', children=[
-            _build_trade_row(i) for i in range(max(1, len(_load_trade_state().get('selections', [])) or 1))
+            _build_trade_row(i) for i in range(_ts_n)
         ]),
         # 全局紧急停止保留为隐藏占位（回调引用需要）
         html.Button(id='emergency-stop-btn', n_clicks=0, style={'display': 'none'}),
         html.Span(id='emergency-stop-status', style={'display': 'none'}),
-        dcc.Store(id='trade-row-count', data=max(1, len(_load_trade_state().get('selections', [])) or 1)),
+        dcc.Store(id='trade-row-count', data=_ts_n),
     ], style={'padding': '8px 20px', 'backgroundColor': '#0d1117',
               'borderBottom': '1px solid #1a1a3e'}),
 
@@ -3585,7 +3639,7 @@ def serve_layout():
     dcc.Store(id='pairs-store', data=load_config()),
     dcc.Store(id='scorecard-collapsed', data=True),
     dcc.Store(id='loading-state', data={}),  # {product: start_timestamp}
-    dcc.Store(id='trade-state', data=_load_trade_state()),  # 交易行选中状态持久化
+    dcc.Store(id='trade-state', data=_ts),  # 交易行选中状态持久化
     dcc.Store(id='pending-trade-pair', data=None),  # 图表「加载」→ 自动填入交易行
     dcc.Store(id='scroll-to-pair', data=None),  # 添加期权对成功后滚动到该图表
     dcc.Store(id='ma-entangled-store', data=[]),  # 纠缠状态期权对列表（由 render_charts 填充）
@@ -4765,12 +4819,15 @@ def render_charts(pairs, _):
     auto_pairs = [ap for ap in auto_pairs_raw if ap['futures_sym'] not in manual_futures][:20]
 
     # 注入今日计划精选的OTM宽跨推荐（Top5，排除已有品种）
-    # 懒初始化：如果还没点过今日计划，自动触发一次v6匹配
-    if not _v6_recommended_pairs:
-        try:
-            toggle_plan(1)  # 填充 _v6_recommended_pairs
-        except Exception:
-            pass
+    # 异步预热：首次渲染不阻塞，由后台线程填充 _v6_recommended_pairs
+    if not _v6_recommended_pairs and not getattr(_v6_preheat_thread, '_started', False):
+        def _fill_v6():
+            try:
+                toggle_plan(1)
+            except Exception:
+                pass
+        _v6_preheat_thread._started = True
+        threading.Thread(target=_fill_v6, daemon=True).start()
     existing_futures = manual_futures | {ap['futures_sym'] for ap in auto_pairs}
     for vp in _v6_recommended_pairs[:5]:
         _d = re.search(r'(\d{3,4})$', vp['contract'])
@@ -7617,5 +7674,26 @@ if __name__ == '__main__':
     _news_thread = threading.Thread(target=_news_hourly_fetcher, daemon=True)
     _news_thread.start()
     print('资讯自动采集: 每整点更新')
+
+    # 后台预热：提前填充 auto_select_pairs / scan_vrp / toggle_plan 缓存
+    def _preheat_caches():
+        try:
+            auto_select_pairs()
+            print('[预热] auto_select_pairs 完成')
+        except Exception:
+            pass
+        try:
+            scan_vrp()
+            print('[预热] scan_vrp 完成')
+        except Exception:
+            pass
+        try:
+            toggle_plan(1)
+            print('[预热] toggle_plan(v6) 完成')
+        except Exception:
+            pass
+    _preheat_thread = threading.Thread(target=_preheat_caches, daemon=True)
+    _preheat_thread.start()
+    print('后台预热: auto_select / vrp / v6 缓存')
 
     app.run(host='0.0.0.0', port=PORT, debug=False)
