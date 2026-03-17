@@ -695,11 +695,12 @@ def _load_dashboard():
 def _load_strategy_positions():
     """
     从策略状态文件(~/state/*_state.json)读取所有持仓。
-    如果state文件无持仓，兜底从dashboard.json读取CTP真实持仓（4小时内有效）。
+    仅在无任何新鲜state文件时才兜底读dashboard.json（防幽灵持仓）。
     Returns:
         list of dict: [{symbol, exchange, direction, volume, avg_price, pnl, product}, ...]
     """
     positions = []
+    has_fresh_state = False  # 是否有5分钟内更新过的state文件（策略在运行）
     try:
         if not os.path.isdir(_STRATEGY_STATE_DIR):
             return positions
@@ -708,16 +709,16 @@ def _load_strategy_positions():
                 continue
             fpath = os.path.join(_STRATEGY_STATE_DIR, fname)
             file_age = time.time() - os.path.getmtime(fpath)
-            # 超过24小时一律跳过
             if file_age > 86400:
                 continue
             try:
                 with open(fpath, 'r') as f:
                     state = json.load(f)
                 product = state.get('product_code', '')
-                # 策略未运行且文件超过4小时 → 跳过（防止幽灵持仓）
                 if file_age > 14400 and product and not _is_strategy_running(product):
                     continue
+                if file_age < 300:
+                    has_fresh_state = True
                 extra = state.get('extra', {})
                 real_call_px = extra.get('entry_call_price')
                 real_put_px = extra.get('entry_put_price')
@@ -727,7 +728,6 @@ def _load_strategy_positions():
                     if p.get('volume', 0) > 0:
                         sym = p.get('symbol', '')
                         avg = p.get('avg_price', 0)
-                        # 用实际成交价覆盖CTP结算价
                         if sym and real_call_px and sym == call_sym:
                             avg = real_call_px
                         elif sym and real_put_px and sym == put_sym:
@@ -746,34 +746,9 @@ def _load_strategy_positions():
     except Exception:
         pass
 
-    # 兜底：如果state文件无持仓，从dashboard.json读取CTP真实持仓（4小时内有效）
-    if not positions:
-        try:
-            if os.path.exists(_DASHBOARD_JSON_PATH):
-                dash_age = time.time() - os.path.getmtime(_DASHBOARD_JSON_PATH)
-                if dash_age < 14400:  # 4小时内
-                    with open(_DASHBOARD_JSON_PATH, 'r') as f:
-                        dash = json.load(f)
-                    for dp in dash.get('positions', []):
-                        if dp.get('volume', 0) > 0:
-                            sym = dp.get('symbol', '')
-                            # 从合约代码推断品种（如CF605C17000→CF）
-                            prod = ''
-                            import re
-                            m = re.match(r'^([A-Za-z]{1,3})', sym)
-                            if m:
-                                prod = m.group(1).upper()
-                            positions.append({
-                                'symbol': sym,
-                                'exchange': dp.get('exchange', ''),
-                                'direction': dp.get('direction', ''),
-                                'volume': dp.get('volume', 0),
-                                'avg_price': dp.get('avg_price', 0),
-                                'pnl': dp.get('pnl', 0),
-                                'product': prod,
-                            })
-        except Exception:
-            pass
+    # 有新鲜state文件（策略在跑）→ state就是权威，positions=[]代表真的无持仓，不兜底
+    if has_fresh_state:
+        return positions
     return positions
 
 
@@ -790,8 +765,10 @@ def _load_commodity_config(product):
 
 
 def _load_full_strategy_states():
-    """读取所有活跃的策略状态文件（含extra信息），兜底dashboard.json"""
+    """读取所有活跃的策略状态文件（含extra信息）。
+    有新鲜state文件时不兜底dashboard.json（防幽灵持仓）。"""
     states = []
+    has_fresh_state = False
     try:
         if not os.path.isdir(_STRATEGY_STATE_DIR):
             return states
@@ -805,36 +782,20 @@ def _load_full_strategy_states():
             try:
                 with open(fpath, 'r') as f:
                     state = json.load(f)
+                product = state.get('product_code', '')
+                if file_age > 14400 and product and not _is_strategy_running(product):
+                    continue
+                if file_age < 300:
+                    has_fresh_state = True
                 if state.get('positions'):
-                    product = state.get('product_code', '')
-                    # 策略未运行且文件超过4小时 → 跳过
-                    if file_age > 14400 and product and not _is_strategy_running(product):
-                        continue
                     states.append(state)
             except Exception:
                 continue
     except Exception:
         pass
 
-    # 兜底：state文件无持仓时，从dashboard.json构造虚拟state
-    if not states:
-        try:
-            if os.path.exists(_DASHBOARD_JSON_PATH):
-                dash_age = time.time() - os.path.getmtime(_DASHBOARD_JSON_PATH)
-                if dash_age < 14400:  # 4小时内
-                    with open(_DASHBOARD_JSON_PATH, 'r') as f:
-                        dash = json.load(f)
-                    dash_positions = [p for p in dash.get('positions', []) if p.get('volume', 0) > 0]
-                    if dash_positions:
-                        states.append({
-                            'product_code': '',
-                            'positions': dash_positions,
-                            'call_symbol': '',
-                            'put_symbol': '',
-                            'extra': {},
-                        })
-        except Exception:
-            pass
+    if has_fresh_state:
+        return states
     return states
 
 
@@ -2051,6 +2012,117 @@ def _save_contribution(pairs_info):
         print(f'[ContribDB] write error: {e}')
 
 
+# ============ MA 纠缠度过滤器 ============
+# 回测验证(B044 40MA确认层): 20MA + 40MA双确认, 1m+5m 双时间框架
+# 20MA判趋势但40MA仍纠缠 → 降级为"大幅震荡"而非真趋势
+
+_MA_PERIOD_20 = 20
+_MA_PERIOD_40 = 40
+_MA_LOOKBACK = 10
+_MA_THRESHOLD = 7
+
+_MA_TANGLE_GRADE = {
+    'S': {'UR', 'NI', 'LC', 'EB', 'SN', 'CF', 'LH', 'SI'},
+    'A': {'L', 'AL', 'FG', 'V', 'C', 'AG', 'ZN', 'SH', 'AU', 'PF', 'SA', 'PG', 'SC', 'CU', 'P', 'Y'},
+    'B': {'TA', 'RM', 'I', 'M', 'SM', 'EG'},
+    'C': {'PX', 'RB', 'MA', 'PP', 'RU', 'PB', 'SR', 'OI', 'SF', 'PK', 'AO', 'JD', 'AP', 'CJ'},
+}
+
+def _get_ma_grade(product):
+    p = product.upper()
+    for grade, products in _MA_TANGLE_GRADE.items():
+        if p in products:
+            return grade
+    return None
+
+def _resolve_futures_symbol(sym, cur):
+    """解析期货 symbol 以匹配数据库格式（SQLite 区分大小写，CZCE 用大写 CF605，SHFE 用小写 cu2605）"""
+    cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (sym,))
+    if cur.fetchone():
+        return sym
+    alt = sym.upper() if sym[0].islower() else sym.lower()
+    cur.execute("SELECT 1 FROM dbbardata WHERE symbol=? LIMIT 1", (alt,))
+    if cur.fetchone():
+        return alt
+    return sym
+
+
+def _compute_ma_tangle_state(futures_sym):
+    """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（含40MA确认层）"""
+    _warmup = {'state_1m': 'warmup', 'state_5m': 'warmup', 'combined': 'warmup',
+               'overridden_1m': False, 'overridden_5m': False}
+    if not futures_sym:
+        return _warmup
+    try:
+        import numpy as np
+        import pandas as pd
+        db = get_db()
+        cur = db.cursor()
+        resolved = _resolve_futures_symbol(futures_sym, cur)
+        cur.execute("""
+            SELECT datetime, close_price FROM dbbardata
+            WHERE symbol=? ORDER BY datetime DESC LIMIT 500
+        """, (resolved,))
+        rows = cur.fetchall()
+        min_needed = _MA_PERIOD_40 + _MA_LOOKBACK
+        if len(rows) < min_needed:
+            return _warmup
+        rows.reverse()
+        closes = np.array([r[1] for r in rows], dtype=np.float64)
+        dts = [r[0] for r in rows]
+
+        def _calc_state(prices, ma_period):
+            if len(prices) < ma_period + _MA_LOOKBACK:
+                return 'warmup'
+            ma = np.convolve(prices, np.ones(ma_period) / ma_period, mode='valid')
+            tail = prices[ma_period - 1:]
+            above = (tail > ma).astype(np.float64)
+            below = (tail < ma).astype(np.float64)
+            if len(above) < _MA_LOOKBACK:
+                return 'warmup'
+            ab_sum = np.sum(above[-_MA_LOOKBACK:])
+            bl_sum = np.sum(below[-_MA_LOOKBACK:])
+            if ab_sum >= _MA_THRESHOLD:
+                return 'trending_up'
+            elif bl_sum >= _MA_THRESHOLD:
+                return 'trending_down'
+            else:
+                return 'entangled'
+
+        state_1m_20 = _calc_state(closes, _MA_PERIOD_20)
+        state_1m_40 = _calc_state(closes, _MA_PERIOD_40)
+
+        df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
+        df5 = df5.set_index('dt')
+        r5 = df5['close'].resample('5min').last().dropna()
+        r5v = r5.values
+        state_5m_20 = _calc_state(r5v, _MA_PERIOD_20) if len(r5v) >= _MA_PERIOD_20 + _MA_LOOKBACK else 'warmup'
+        state_5m_40 = _calc_state(r5v, _MA_PERIOD_40) if len(r5v) >= _MA_PERIOD_40 + _MA_LOOKBACK else 'warmup'
+
+        overridden_1m = False
+        overridden_5m = False
+        state_1m = state_1m_20
+        state_5m = state_5m_20
+        if state_1m_20.startswith('trending') and state_1m_40 == 'entangled':
+            state_1m = 'entangled'
+            overridden_1m = True
+        if state_5m_20.startswith('trending') and state_5m_40 == 'entangled':
+            state_5m = 'entangled'
+            overridden_5m = True
+
+        if state_1m == 'warmup' or state_5m == 'warmup':
+            combined = 'warmup'
+        elif state_1m == 'entangled' and state_5m == 'entangled':
+            combined = 'safe'
+        else:
+            combined = 'warning'
+        return {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
+                'overridden_1m': overridden_1m, 'overridden_5m': overridden_5m}
+    except Exception as e:
+        print(f'[MA纠缠] 计算失败 {futures_sym}: {e}')
+        return _warmup
+
+
 def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     """为一个期权对构建图表（双Y轴：左=期权价格，右=期货价格）"""
     times, call_prices, put_prices, _, fut_prices, futures_sym = \
@@ -2196,10 +2268,12 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
                 break
     act_day = _calc_activity_share(call_prices[day_start_idx:], put_prices[day_start_idx:])
     act_7d = _calc_activity_share(call_prices, put_prices)
+    ma_tangle = _compute_ma_tangle_state(futures_sym)
 
     return fig, {'sum': latest_sum, 'futures_sym': futures_sym, 'double_rise': dr,
                  'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio,
-                 'activity_30m': act_30m, 'activity_day': act_day, 'activity_7d': act_7d}
+                 'activity_30m': act_30m, 'activity_day': act_day, 'activity_7d': act_7d,
+                 'ma_tangle': ma_tangle}
 
 
 # ============ 解析输入 ============
@@ -3455,10 +3529,11 @@ def serve_layout():
     dcc.Store(id='loading-state', data={}),  # {product: start_timestamp}
     dcc.Store(id='trade-state', data=_load_trade_state()),  # 交易行选中状态持久化
     dcc.Store(id='pending-trade-pair', data=None),  # 图表「加载」→ 自动填入交易行
+    dcc.Store(id='scroll-to-pair', data=None),  # 添加期权对成功后滚动到该图表
 
     # 定时刷新
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
-    dcc.Interval(id='account-timer', interval=5000, n_intervals=0),
+    dcc.Interval(id='account-timer', interval=2000, n_intervals=0),  # 持仓/CTP 2秒刷新
     dcc.Interval(id='load-timer', interval=2000, disabled=True),
 
     # 回到顶部悬浮按钮
@@ -3490,6 +3565,30 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+# 添加期权对成功后滚动到新图表（MutationObserver 等待图表渲染完成后自动滚动）
+app.clientside_callback(
+    """
+    function(pairKey) {
+        if (!pairKey) return window.dash_clientside.no_update;
+        var sel = '[data-pair="' + pairKey + '"]';
+        var el = document.querySelector(sel);
+        if (el) { el.scrollIntoView({behavior:'smooth',block:'start'}); return null; }
+        var container = document.getElementById('charts-container');
+        if (!container) return null;
+        var obs = new MutationObserver(function(_, me) {
+            var found = document.querySelector(sel);
+            if (found) { me.disconnect(); found.scrollIntoView({behavior:'smooth',block:'start'}); }
+        });
+        obs.observe(container, {childList:true, subtree:true});
+        setTimeout(function() { obs.disconnect(); }, 15000);
+        return null;
+    }
+    """,
+    Output('scroll-to-pair', 'data', allow_duplicate=True),
+    Input('scroll-to-pair', 'data'),
+    prevent_initial_call=True,
+)
+
 
 # 侧边栏×删除 — 独立callback，避免与modify_pairs的pattern-matching冲突
 @app.callback(
@@ -3518,6 +3617,7 @@ def nav_delete_pair(nav_del_clicks, pairs):
     Output('add-msg', 'children'),
     Output('leg1-input', 'value'),
     Output('leg2-input', 'value'),
+    Output('scroll-to-pair', 'data', allow_duplicate=True),
     Input('add-btn', 'n_clicks'),
     Input({'type': 'del-btn', 'index': ALL}, 'n_clicks'),
     State('prefix-input', 'value'),
@@ -3534,17 +3634,17 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
     # 删除按钮（必须有真实点击，防止定时器重建按钮时误触发）
     if isinstance(triggered, dict) and triggered.get('type') == 'del-btn':
         if not del_clicks or not any(c and c > 0 for c in del_clicks):
-            return no_update, '', no_update, no_update
+            return no_update, '', no_update, no_update, no_update
         idx = triggered['index']
         if 0 <= idx < len(pairs):
             removed = pairs.pop(idx)
             save_config(pairs)
-            return pairs, f'已删除 {removed[0]}+{removed[1]}', no_update, no_update
+            return pairs, f'已删除 {removed[0]}+{removed[1]}', no_update, no_update, no_update
 
     # 添加按钮
     if triggered == 'add-btn':
         if not sym1 or not sym2:
-            return no_update, '请输入两腿行权价', no_update, no_update
+            return no_update, '请输入两腿行权价', no_update, no_update, no_update
         prefix = (prefix or '').strip()
         sym1 = sym1.strip()
         sym2 = sym2.strip()
@@ -3561,9 +3661,9 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
         leg1 = normalize_symbol(sym1)
         leg2 = normalize_symbol(sym2)
         if not leg1:
-            return no_update, f'期权1格式不对: {sym1}', no_update, no_update
+            return no_update, f'期权1格式不对: {sym1}', no_update, no_update, no_update
         if not leg2:
-            return no_update, f'期权2格式不对: {sym2}', no_update, no_update
+            return no_update, f'期权2格式不对: {sym2}', no_update, no_update, no_update
         try:
             c1 = float(coeff1) if coeff1 else 1.0
         except (ValueError, TypeError):
@@ -3581,7 +3681,7 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
             pc1 = pair[2] if len(pair) > 2 else 1.0
             pc2 = pair[3] if len(pair) > 3 else 1.0
             if pair[0] == leg1 and pair[1] == leg2 and pc1 == c1 and pc2 == c2:
-                return no_update, f'{leg1}×{c1:g}+{leg2}×{c2:g} 已存在', no_update, no_update
+                return no_update, f'{leg1}×{c1:g}+{leg2}×{c2:g} 已存在', no_update, no_update, no_update
         # 检查两腿价格比率
         # CTP夜盘数据用交易日日期存储(如周五夜盘存为下周一日期)，
         # 导致 ORDER BY datetime DESC 会优先取到陈旧的夜盘价格而非当前日盘价格。
@@ -3596,7 +3696,7 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
             p1, p2 = r1[0] * c1, r2[0] * c2
             add_ratio = max(p1, p2) / min(p1, p2)
             if add_ratio > 3.0:
-                return no_update, f'两腿价差过大({p1:.0f} vs {p2:.0f}, {add_ratio:.1f}x)，不适合配对', no_update, no_update
+                return no_update, f'两腿价差过大({p1:.0f} vs {p2:.0f}, {add_ratio:.1f}x)，不适合配对', no_update, no_update, no_update
         pairs.insert(0, [leg1, leg2, c1, c2])  # 新添加的排在最前面
         save_config(pairs)
         msg = f'已添加 {leg1}×{c1:g} + {leg2}×{c2:g}'
@@ -3605,38 +3705,39 @@ def modify_pairs(add_clicks, del_clicks, prefix, sym1, coeff1, sym2, coeff2, pai
             add_ratio = max(p1, p2) / min(p1, p2)
             if add_ratio > 1.5:
                 msg += f'  (⚠ 两腿比率{add_ratio:.1f}x，建议换更平衡的行权价)'
-        return pairs, msg, '', ''
+        return pairs, msg, '', '', f'{leg1}|{leg2}'
 
-    return no_update, '', no_update, no_update
+    return no_update, '', no_update, no_update, no_update
 
 
 @app.callback(
     Output('pairs-store', 'data', allow_duplicate=True),
     Output('add-msg', 'children', allow_duplicate=True),
+    Output('scroll-to-pair', 'data', allow_duplicate=True),
     Input({'type': 'adopt-btn', 'index': ALL}, 'n_clicks'),
     State('pairs-store', 'data'),
     prevent_initial_call=True,
 )
 def adopt_pair(adopt_clicks, pairs):
     """收藏按钮：把自动推荐的期权对加入手动列表"""
-    # 防止定时器重建按钮时误触发：必须有真实点击(n_clicks>0)
+    no_scroll = no_update
     if not adopt_clicks or not any(c and c > 0 for c in adopt_clicks):
-        return no_update, no_update
+        return no_update, no_update, no_scroll
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict) or triggered.get('type') != 'adopt-btn':
-        return no_update, no_update
+        return no_update, no_update, no_scroll
     key = triggered.get('index', '')
     if '|' not in key:
-        return no_update, no_update
+        return no_update, no_update, no_scroll
     call_sym, put_sym = key.split('|', 1)
     for p in pairs:
         if p[0] == call_sym and p[1] == put_sym:
             print(f'[adopt_pair] {call_sym}+{put_sym} 已存在于pairs中, 跳过')
-            return no_update, f'{call_sym}+{put_sym} 已存在'
+            return no_update, f'{call_sym}+{put_sym} 已存在', no_scroll
     pairs.insert(0, [call_sym, put_sym, 1.0, 1.0])  # 排在最前面
     save_config(pairs)
     print(f'[adopt_pair] 已收藏 {call_sym} + {put_sym}, 当前共{len(pairs)}对')
-    return pairs, f'已收藏 {call_sym} + {put_sym}'
+    return pairs, f'已收藏 {call_sym} + {put_sym}', key
 
 
 _STATE_DIR = os.path.expanduser('~/state')
@@ -3700,6 +3801,32 @@ def _get_strategy_status(product):
     return None
 
 
+def _has_recent_ctp_error(product):
+    """该品种是否有近期 CTP 连接失败（会话超限等），有则不应显示「已就绪」"""
+    try:
+        err_path = os.path.join(_TRADE2026, 'state', 'ctp_error.json')
+        if not os.path.exists(err_path):
+            return False
+        with open(err_path) as f:
+            data = json.load(f)
+        if (data.get('product') or '').upper() != (product or '').upper():
+            return False
+        ts = data.get('timestamp', '')
+        if not ts:
+            return False
+        from datetime import datetime as _dt
+        try:
+            err_time = _dt.fromisoformat(ts[:19])
+        except ValueError:
+            return False
+        if err_time.tzinfo:
+            err_time = err_time.replace(tzinfo=None)
+        age_sec = (_dt.now() - err_time).total_seconds()
+        return age_sec < 600  # 10 分钟内视为近期
+    except Exception:
+        return False
+
+
 def _send_strategy_command(product, endpoint, payload=None):
     """发送命令到策略 HTTP API，返回 (success, message)。无 API 时 fallback 文件"""
     url = _get_strategy_api_url(product)
@@ -3733,12 +3860,12 @@ def _send_strategy_command_file(product, endpoint, payload=None):
             sig_path = os.path.join(_STATE_DIR, f'.trigger_entry_{pc}')
             with open(sig_path, 'w') as f:
                 json.dump(payload, f, ensure_ascii=False)
-            return True, '已写入信号文件(fallback)'
+            return True, '已写入信号文件，策略启动后将自动执行'
         elif endpoint == 'close':
             sig_path = os.path.join(_STATE_DIR, f'.trigger_close_{pc}')
             with open(sig_path, 'w') as f:
                 json.dump(payload, f, ensure_ascii=False)
-            return True, '已写入信号文件(fallback)'
+            return True, '已写入信号文件，策略启动后将自动执行'
         elif endpoint == 'emergency_stop':
             es_path = os.path.join(_STATE_DIR, '.emergency_stop')
             action = (payload or {}).get('action', 'stop')
@@ -4217,15 +4344,21 @@ def update_load_status(_, loading_state, all_pairs):
 
         if product not in loading_state:
             # 检查是否已有运行中的策略（之前手动启动的）
-            if _is_strategy_running(product):
+            # CTP 会话超限等错误时，不显示「已就绪」
+            if _is_strategy_running(product) and not _has_recent_ctp_error(product):
                 results.append(html.Span('已就绪', style={'color': '#00FF88', 'fontWeight': 'bold'}))
+            elif _has_recent_ctp_error(product):
+                results.append(html.Span('CTP连接失败', style={'color': '#FF4444', 'fontSize': '11px'}))
             else:
                 results.append('')
             continue
 
         elapsed = time.time() - loading_state[product]
-        if elapsed >= _LOAD_READY_SECONDS and _is_strategy_running(product):
+        # CTP 会话超限等错误时，不显示「已就绪」
+        if elapsed >= _LOAD_READY_SECONDS and _is_strategy_running(product) and not _has_recent_ctp_error(product):
             results.append(html.Span('已就绪', style={'color': '#00FF88', 'fontWeight': 'bold'}))
+        elif _has_recent_ctp_error(product):
+            results.append(html.Span('CTP连接失败', style={'color': '#FF4444', 'fontSize': '11px'}))
         else:
             sec = int(elapsed)
             results.append(html.Span(f'加载中 {sec}s...', style={'color': '#4fc3f7'}))
@@ -4917,6 +5050,54 @@ def render_charts(pairs, _):
                        'letterSpacing': '0.5px'}))
         return spans
 
+    def _ma_tangle_badge(info):
+        """根据 MA 纠缠度状态和品种分级生成徽章 Span（含等级字母标注）"""
+        mt = info.get('ma_tangle', {})
+        combined = mt.get('combined', 'warmup')
+        product = _extract_product(info.get('futures_sym', '') or '')
+        grade = _get_ma_grade(product) or '?'
+        s1 = mt.get('state_1m', 'warmup')
+        s5 = mt.get('state_5m', 'warmup')
+        ov1 = mt.get('overridden_1m', False)
+        ov5 = mt.get('overridden_5m', False)
+        if combined == 'safe':
+            ov_hint = ''
+            if ov1 or ov5:
+                ov_parts = []
+                if ov1: ov_parts.append('1m')
+                if ov5: ov_parts.append('5m')
+                ov_hint = f' 40MA降级{"+".join(ov_parts)}'
+            label = f'[{grade}] MA纠缠{ov_hint}'
+            color = '#00FF88'
+            bg = 'rgba(0,255,136,0.12)'
+            bold = False
+        elif combined == 'warning':
+            arrow = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '') or \
+                    {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
+            parts = []
+            if s1 != 'entangled':
+                parts.append(f'1m{arrow}')
+            if s5 != 'entangled':
+                parts.append(f'5m{arrow}')
+            detail = '+'.join(parts) if parts else '趋势'
+            label = f'[{grade}] MA趋势 {detail}'
+            _grade_colors = {'S': ('#FF4444', 'rgba(255,68,68,0.12)'),
+                             'A': ('#FF8800', 'rgba(255,136,0,0.12)'),
+                             'B': ('#CCAA00', 'rgba(204,170,0,0.12)'),
+                             'C': ('#888', 'rgba(136,136,136,0.1)')}
+            color, bg = _grade_colors.get(grade, ('#888', 'rgba(136,136,136,0.1)'))
+            bold = grade in ('S', 'A')
+        else:
+            label = f'[{grade}] MA预热'
+            color = '#888'
+            bg = 'rgba(136,136,136,0.1)'
+            bold = False
+        return html.Span(
+            f'  {label}',
+            style={'color': color, 'fontSize': '11px', 'marginLeft': '8px',
+                   'backgroundColor': bg, 'padding': '1px 6px',
+                   'borderRadius': '3px', 'fontWeight': 'bold' if bold else 'normal'})
+
     # 辅助函数：构建手动图表卡片
     def _manual_card(idx, pair, fig, info, cc, pc, is_alert=False):
         call_sym, put_sym = pair[0], pair[1]
@@ -4928,6 +5109,7 @@ def render_charts(pairs, _):
                        style={'color': '#FFD700', 'fontSize': '15px', 'fontWeight': 'bold'}),
         ]
         header_parts.extend(_activity_spans(info))
+        header_parts.append(_ma_tangle_badge(info))
         # 两腿失衡警告
         leg_ratio = info.get('leg_ratio', 1)
         if leg_ratio > 1.5:
@@ -4962,14 +5144,16 @@ def render_charts(pairs, _):
                 'padding': '2px 8px', 'fontSize': '14px', 'fontWeight': 'bold', 'marginLeft': '6px'}))
         border_color = '#FF4444' if is_alert else '#2a2a4a'
         div_id = f'alert-m-{idx}' if is_alert else f'm-chart-{idx}'
+        pair_key = f'{call_sym}|{put_sym}'
         header_parts.extend(_make_advisory_spans(call_sym, put_sym))
         card_children = [
             html.Div(header_parts, style={'padding': '10px 20px', 'backgroundColor': '#1a1a2e'}),
             dcc.Graph(figure=fig, config=graph_cfg),
         ]
         return html.Div(card_children,
-            id=div_id, style={'marginBottom': '8px', 'borderBottom': f'2px solid {border_color}',
-                              'borderLeft': f'3px solid {border_color}' if is_alert else 'none'})
+            id=div_id, **{'data-pair': pair_key},
+            style={'marginBottom': '8px', 'borderBottom': f'2px solid {border_color}',
+                   'borderLeft': f'3px solid {border_color}' if is_alert else 'none'})
 
     # 辅助函数：构建自动推荐图表卡片
     def _auto_card(idx, ap, fig, info, is_alert=False):
@@ -4982,6 +5166,7 @@ def render_charts(pairs, _):
                        style={'color': '#FFD700', 'fontSize': '13px', 'marginLeft': '10px'}),
         ]
         header_parts.extend(_activity_spans(info))
+        header_parts.append(_ma_tangle_badge(info))
         if ap.get('v6_tag'):
             header_parts.append(html.Span(
                 f'  {ap["v6_tag"]}',
@@ -7020,7 +7205,7 @@ def execute_diverge_sell(n_clicks, pair_key, volume):
 
 # ==================== CTP 连接监控面板 ====================
 
-def _build_ctp_monitor_content():
+def _build_ctp_monitor_content(kill_failed_pid=None, kill_failed_reason=None):
     """构建CTP连接监控面板内容"""
     import subprocess as _sp
 
@@ -7075,7 +7260,8 @@ def _build_ctp_monitor_content():
         procs = []
         for line in ps_out.strip().split('\n')[1:]:
             if any(kw in line for kw in ['trade2026', 'ctp_data_collector']):
-                if 'grep' in line or 'price_sum_workbench' in line or '/bin/sh' in line:
+                if any(skip in line for skip in ['grep', 'price_sum_workbench', '/bin/sh',
+                                                  'Cursor Helper', 'extension-host']):
                     continue
                 parts = line.split(None, 10)
                 if len(parts) >= 11:
@@ -7151,6 +7337,15 @@ def _build_ctp_monitor_content():
             'color': '#666', 'fontSize': '11px', 'fontStyle': 'italic'}),
     ], style={'padding': '4px 0'}))
 
+    if kill_failed_pid is not None and kill_failed_reason:
+        children.append(html.Div([
+            html.Span(f'⚠ PID {kill_failed_pid} 无法结束: {kill_failed_reason}', style={
+                'color': '#FFAA00', 'fontSize': '13px', 'fontWeight': 'bold'}),
+            html.Br(),
+            html.Span('可尝试在终端执行: kill -9 ' + str(kill_failed_pid) + '  或  ps -o ppid= -p ' + str(kill_failed_pid) + ' 查看父进程后结束父进程', style={
+                'color': '#888', 'fontSize': '12px'}),
+        ], style={'padding': '8px 0', 'marginTop': '8px', 'borderTop': '1px solid #333', 'backgroundColor': '#1a0f0f'}))
+
     return children
 
 
@@ -7169,20 +7364,36 @@ def toggle_ctp_monitor(n_clicks, kill_store):
     if triggered == 'kill-ctp-store' and kill_store:
         import signal
         pid = int(kill_store['pid'])
+        kill_failed_reason = None
         try:
             # SIGTERM不够——进程有信号处理器做优雅关闭，可能要数十秒
             # 先SIGTERM给个机会，0.5秒后SIGKILL强杀
             os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            pass  # 已退出
+        except PermissionError:
+            kill_failed_reason = '无权限结束（可能由系统/其他用户启动）'
         import time
         time.sleep(0.5)
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if not kill_failed_reason:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # 已退出
+            except PermissionError:
+                kill_failed_reason = '无权限结束（可能由系统/其他用户启动）'
         time.sleep(0.3)
-        content = _build_ctp_monitor_content()
+        # 检查进程是否仍存在（僵尸进程无法被 kill 清除）
+        if not kill_failed_reason:
+            try:
+                os.kill(pid, 0)  # signal 0 仅检测存在性
+                kill_failed_reason = '进程仍存活（可能为僵尸进程，需结束其父进程）'
+            except ProcessLookupError:
+                pass  # 已成功结束
+            except PermissionError:
+                kill_failed_reason = '无权限结束'
+        content = _build_ctp_monitor_content(kill_failed_pid=pid if kill_failed_reason else None,
+                                             kill_failed_reason=kill_failed_reason)
         panel_style = {
             'display': 'block',
             'backgroundColor': '#0f1a0f',
