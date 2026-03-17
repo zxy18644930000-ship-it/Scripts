@@ -1042,7 +1042,7 @@ def main():
         ok = bdiff > 0
         if ok:
             holds += 1
-        print(f'{prod:>6s} {bct:>7s} {ent_pct:>6.1f} {bdiff:>+8.3f} {"Y" if ok else "N":>4s}')
+        print(f'{prod:>6s} {str(bct):>7s} {ent_pct:>6.1f} {bdiff:>+8.3f} {"Y" if ok else "N":>4s}')
     print(f'\n信念成立: {holds}/{len(all_results)}')
 
     # CT 投票
