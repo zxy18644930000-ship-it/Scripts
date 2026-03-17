@@ -2061,15 +2061,18 @@ def _compute_ma_tangle_state(futures_sym):
         resolved = _resolve_futures_symbol(futures_sym, cur)
         cur.execute("""
             SELECT datetime, close_price FROM dbbardata
-            WHERE symbol=? ORDER BY datetime DESC LIMIT 500
+            WHERE symbol=? ORDER BY datetime DESC LIMIT 800
         """, (resolved,))
         rows = cur.fetchall()
         min_needed = _MA_PERIOD_40 + _MA_LOOKBACK
         if len(rows) < min_needed:
             return _warmup
         rows.reverse()
-        closes = np.array([r[1] for r in rows], dtype=np.float64)
-        dts = [r[0] for r in rows]
+        seen = {}
+        for r in rows:
+            seen[r[0]] = r[1]
+        dts = list(seen.keys())
+        closes = np.array(list(seen.values()), dtype=np.float64)
 
         def _calc_state(prices, ma_period):
             if len(prices) < ma_period + _MA_LOOKBACK:
