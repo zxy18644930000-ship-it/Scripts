@@ -4,8 +4,8 @@
     "created": "2026-02-28",
     "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、VRP策略、市场结构、到期日历等，贝叶斯持续更新",
     "product": "全市场商品期权(起源于ag白银)",
-    "update_count": 46,
-    "last_updated": "2026-03-15"
+    "update_count": 47,
+    "last_updated": "2026-03-17"
   },
   "beliefs": [
     {
@@ -1506,21 +1506,49 @@
       "note": "与B039互补: B039是单次进出(9品种网格), B043是循环做(AG+AO专项). AG循环做P50=4tick通过真实性检验, AO循环做P50=2tick失败. 实盘建议: AG DTE30-60, 23:15入场, TP0.8θ, SL5.0x(或不设SL), 1手循环做. AO维持B038单次scalp策略, 不宜循环. 跨学科: 频率与质量的tradeoff——AO追求高频但每笔太薄(类似高频做市), AG适中频率但每笔足够厚(类似swing scalp)"
     },
     {
-      "id": "ma_tangle_filter",
-      "name": "MA纠缠度宽跨安全过滤器",
-      "description": "1m+5m双时间框架20MA, LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应(趋势亏→纠缠赚)",
-      "confidence": 0.78,
+      "id": "B044",
+      "category": "技术指标验证",
+      "name": "40MA趋势确认层",
+      "statement": "在B043双时间框架20MA基础上增加40MA确认: 当20MA判定trending时, 若40MA仍为entangled(围绕40MA震荡), 则降级回纠缠. 规则: 20MA=trending+40MA=entangled→降级; 20MA=trending+40MA=trending→真趋势",
+      "confidence": 0.82,
       "evidence_count": 44,
-      "source": "B043",
-      "last_validated": "2026-03-15",
-      "notes": "OTM宽跨(4-8%虚值)直接验证: 44品种228830笔交易, 28/44(64%)信念成立. 15个品种具有Switch效应(趋势入场亏钱,纠缠入场赚钱). 26个品种双时间框架一致. AG尾部保护59.3x(趋势最差-267% vs 纠缠-28%). OTM比ATM更有效(64% vs 56%)",
+      "last_validated": "2026-03-17",
+      "notes": "B044回测(44品种): 信念成立30/44(68%). 共同品种B043→B044: 2/9→8/9. 被40MA降级交易(13-14%): 25/35品种降级组优于真趋势, 平均差值30m +0.192% 60m +0.299%. 降级组表现突出: SN+1.68% SM+1.49% LH+1.13% CJ+0.88% EB+0.63% CU+0.58%. 反例: PK-0.97% SF-1.02% AP-0.46% M-0.36% OI-0.32% NI-0.68%",
       "parameters": {
         "ma_1m": 20,
+        "ma_1m_confirm": 40,
         "ma_5m": 20,
+        "ma_5m_confirm": 40,
+        "lookback": 10,
+        "threshold": 7,
+        "override_rule": "20MA=trending且40MA=entangled→降级为entangled"
+      },
+      "override_stats": {
+        "pct_overridden": "13-14%",
+        "override_vs_trending_30m": "+0.192%",
+        "override_vs_trending_60m": "+0.299%",
+        "override_better_than_trending": "25/35品种"
+      }
+    },
+    {
+      "id": "ma_tangle_filter",
+      "name": "MA纠缠度宽跨安全过滤器",
+      "description": "1m+5m双时间框架20MA+40MA确认(B044). LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应 ③40MA过滤假趋势",
+      "confidence": 0.82,
+      "evidence_count": 44,
+      "source": "B043,B044",
+      "last_validated": "2026-03-17",
+      "notes": "B043: 44品种228830笔, 28/44(64%)成立. B044增强: 40MA确认层使信念成立率提升至30/44(68%), 共同品种2/9→8/9. 被降级交易(13-14%)平均比真趋势多赚0.2-0.3%. AG尾部保护59.3x. OTM比ATM更有效",
+      "parameters": {
+        "ma_1m": 20,
+        "ma_1m_confirm": 40,
+        "ma_5m": 20,
+        "ma_5m_confirm": 40,
         "lookback": 10,
         "threshold": 7,
         "otm_range": "4-8%虚值, fallback 3-10%",
-        "usage": "过滤器(降尾部风险+Switch效应). 纠缠时入场, 趋势时回避. S级品种必须启用"
+        "override_rule": "20MA=trending且40MA=entangled→降级为entangled",
+        "usage": "过滤器(降尾部风险+Switch效应+40MA假趋势过滤). 纠缠时入场, 趋势时回避. S级品种必须启用"
       },
       "multidim_analysis": {
         "date": "2026-03-15",
@@ -1549,7 +1577,17 @@
         },
         "anti_filter_products": "JD鸡蛋(-2.59%), SM锰硅(-1.88%), CJ红枣(-1.50%), SI工业硅(-0.98%), AO氧化铝(-0.84%), PK花生(-0.65%), LH生猪(-0.39%) — 纠缠入场反而更差",
         "atm_vs_otm": "ATM(Phase2a): 23/41=56%成立, 仅1个Switch品种. OTM(Phase2b): 28/44=64%成立, 15个Switch品种. OTM宽跨对过滤器响应更强",
-        "report": "~/Scripts/ma_tangle_otm_results/multidim_report.html"
+        "report": "~/Scripts/ma_tangle_otm_results/multidim_report.html",
+        "b044_40ma_confirm": {
+          "date": "2026-03-17",
+          "rule": "20MA=trending且40MA=entangled→降级为entangled",
+          "belief_holds": "30/44品种",
+          "common_products_improvement": "B043 2/9 → B044 8/9",
+          "override_trades": "13-14%被降级, 25/35品种降级组优于真趋势",
+          "override_vs_trending": "30m +0.192%, 60m +0.299%",
+          "override_best": "SN+1.68% SM+1.49% LH+1.13% CJ+0.88% EB+0.63% CU+0.58%",
+          "override_worst": "PK-0.97% SF-1.02% AP-0.46% M-0.36% OI-0.32% NI-0.68%"
+        }
       }
     }
   ],
