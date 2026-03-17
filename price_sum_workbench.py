@@ -3369,6 +3369,11 @@ def serve_layout():
     # 顶部标题栏
     html.Div([
         html.H2('期权工作台', style={'margin': '0', 'color': '#fff', 'display': 'inline-block'}),
+        html.Button('MA纠缠', id='ma-entangled-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#0a4a3a', 'color': '#00FF88',
+            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
         html.Button('资讯', id='news-btn', n_clicks=0, style={
             'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
             'cursor': 'pointer', 'backgroundColor': '#0a4a6e', 'color': '#4fc3f7',
@@ -3411,6 +3416,9 @@ def serve_layout():
 
     # VRP扫描面板（默认隐藏）
     html.Div(id='vrp-panel', style={'display': 'none'}),
+
+    # MA纠缠提醒面板（默认隐藏）
+    html.Div(id='ma-entangled-panel', style={'display': 'none'}),
 
     # 资讯面板（默认隐藏）
     html.Div(id='news-panel', style={'display': 'none'}),
@@ -3533,6 +3541,7 @@ def serve_layout():
     dcc.Store(id='trade-state', data=_load_trade_state()),  # 交易行选中状态持久化
     dcc.Store(id='pending-trade-pair', data=None),  # 图表「加载」→ 自动填入交易行
     dcc.Store(id='scroll-to-pair', data=None),  # 添加期权对成功后滚动到该图表
+    dcc.Store(id='ma-entangled-store', data=[]),  # 纠缠状态期权对列表（由 render_charts 填充）
 
     # 定时刷新
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
@@ -4657,6 +4666,7 @@ def update_account_bar(_):
 
 @app.callback(
     Output('charts-container', 'children'),
+    Output('ma-entangled-store', 'data'),
     Input('pairs-store', 'data'),
     Input('timer', 'n_intervals'),
 )
@@ -4704,9 +4714,10 @@ def render_charts(pairs, _):
         existing_futures.add(fut_sym)
 
     if not manual_pairs and not auto_pairs:
-        return html.Div('暂无数据，等待数据采集...',
+        empty = html.Div('暂无数据，等待数据采集...',
                          style={'color': '#666', 'padding': '50px', 'textAlign': 'center',
                                 'fontSize': '16px'})
+        return empty, []
 
     # ---- 构建所有图表和摘要 ----
     manual_items = []
@@ -5197,7 +5208,8 @@ def render_charts(pairs, _):
             dcc.Graph(figure=fig, config=graph_cfg),
         ]
         return html.Div(card_children,
-            id=div_id, style={'marginBottom': '8px', 'borderBottom': f'2px solid {border_color}',
+            id=div_id, **{'data-pair': adopt_id},
+            style={'marginBottom': '8px', 'borderBottom': f'2px solid {border_color}',
                               'borderLeft': f'3px solid {border_color}' if is_alert else 'none'})
 
     # 0) Gamma/Strangle 每日检查面板（最顶部）
@@ -5311,7 +5323,23 @@ def render_charts(pairs, _):
 
     charts_layout = html.Div([sidebar, charts_area],
                               style={'display': 'flex', 'alignItems': 'flex-start', 'padding': '8px'})
-    return charts_layout
+
+    # 收集 MA 纠缠状态期权对（combined=='safe'），供 MA纠缠 面板展示
+    entangled_list = []
+    for idx, pair, fig, info, cc, pc in manual_items:
+        mt = info.get('ma_tangle', {})
+        if mt.get('combined') == 'safe':
+            call_sym, put_sym = pair[0], pair[1]
+            entangled_list.append({'pair_key': f'{call_sym}|{put_sym}', 'label': f'{call_sym} + {put_sym}',
+                                   'futures_sym': info.get('futures_sym', '?')})
+    for idx, ap, fig, info in auto_items:
+        mt = info.get('ma_tangle', {})
+        if mt.get('combined') == 'safe':
+            pair_key = f'{ap["call"]}|{ap["put"]}'
+            entangled_list.append({'pair_key': pair_key, 'label': f'{ap["call"]} + {ap["put"]}',
+                                   'futures_sym': ap.get('futures_sym', info.get('futures_sym', '?'))})
+
+    return charts_layout, entangled_list
 
 
 # ============ 价差Z-Score监控 ============
@@ -5708,6 +5736,64 @@ def toggle_news(n_clicks):
         'display': 'block', 'backgroundColor': '#111827',
         'borderBottom': '3px solid #4fc3f7', 'marginBottom': '5px',
     }
+
+
+@app.callback(
+    Output('ma-entangled-panel', 'children'),
+    Output('ma-entangled-panel', 'style'),
+    Input('ma-entangled-btn', 'n_clicks'),
+    State('ma-entangled-store', 'data'),
+    prevent_initial_call=True,
+)
+def toggle_ma_entangled(n_clicks, entangled_list):
+    """切换 MA纠缠 面板：展示所有纠缠状态期权对，点击可滚动到对应图表"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    items = entangled_list or []
+    if not items:
+        body = html.Div('当前无 MA 纠缠状态期权对。',
+                       style={'color': '#888', 'padding': '30px', 'textAlign': 'center'})
+    else:
+        rows = []
+        for rec in items:
+            pair_key = rec.get('pair_key', '')
+            label = rec.get('label', pair_key)
+            fs = rec.get('futures_sym', '')
+            btn_label = f'{label}  ({fs})' if fs else label
+            rows.append(html.Button(btn_label, id={'type': 'ma-entangled-item', 'index': pair_key}, n_clicks=0,
+                            style={'width': '100%', 'textAlign': 'left', 'padding': '10px 20px',
+                                   'backgroundColor': 'rgba(0,255,136,0.06)', 'color': '#00FF88',
+                                   'border': 'none', 'borderBottom': '1px solid #2a2a4a',
+                                   'cursor': 'pointer', 'fontSize': '14px'}))
+        body = html.Div(rows, style={'maxHeight': '50vh', 'overflowY': 'auto'})
+
+    panel = html.Div([
+        html.Div([
+            html.Span('MA纠缠 可入场', style={'color': '#00FF88', 'fontSize': '15px', 'fontWeight': 'bold'}),
+            html.Span(f'  共 {len(items)} 个', style={'color': '#666', 'fontSize': '12px', 'marginLeft': '10px'}),
+        ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
+        body,
+    ])
+    return panel, {
+        'display': 'block', 'backgroundColor': '#111827',
+        'borderBottom': '3px solid #00FF88', 'marginBottom': '5px',
+    }
+
+
+@app.callback(
+    Output('scroll-to-pair', 'data', allow_duplicate=True),
+    Input({'type': 'ma-entangled-item', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def ma_entangled_item_click(all_clicks):
+    """点击 MA纠缠 面板中的期权对，滚动到对应图表"""
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict) or triggered.get('type') != 'ma-entangled-item':
+        return no_update
+    if not all_clicks or not any(c and c > 0 for c in all_clicks):
+        return no_update
+    return triggered.get('index')
 
 
 @app.callback(
