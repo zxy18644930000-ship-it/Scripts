@@ -2113,7 +2113,7 @@ def _compute_ma_tangle_state(futures_sym):
         closes = np.array(list(seen.values()), dtype=np.float64)
 
         def _cross_count_and_bias(prices, ma_period, lookback):
-            _empty = (None, None, None, 0, False, 0, 999)
+            _empty = (None, None, None, 0, False, 0, 999, 0, 0, 0)
             if len(prices) < ma_period + lookback:
                 return _empty
             ma = np.convolve(prices, np.ones(ma_period) / ma_period, mode='valid')
@@ -2153,24 +2153,38 @@ def _compute_ma_tangle_state(futures_sym):
                 slope = np.polyfit(np.arange(len(dev)), dev, 1)[0]
                 deviation_growing = slope > 0
 
-            prior_streak_len = 0
-            prior_streak_ended_ago = 999
-            boundary = lookback - recent_consecutive - 1
-            if boundary >= 0:
-                ps = window_sign[boundary]
-                if ps != 0:
-                    cnt = 0
-                    for k in range(boundary, -1, -1):
-                        if window_sign[k] == ps:
-                            cnt += 1
-                        else:
-                            break
-                    prior_streak_len = cnt
-                    prior_streak_ended_ago = recent_consecutive
+            runs = []
+            run_start_k = 0
+            for k in range(1, lookback):
+                if window_sign[k] != window_sign[run_start_k] or window_sign[k] == 0:
+                    if window_sign[run_start_k] != 0:
+                        runs.append((run_start_k, k - run_start_k, int(window_sign[run_start_k])))
+                    run_start_k = k
+            if window_sign[run_start_k] != 0:
+                runs.append((run_start_k, lookback - run_start_k, int(window_sign[run_start_k])))
+
+            longest_streak_len = 0
+            longest_streak_ended_ago = 999
+            longest_streak_sign = 0
+            post_crossings = 0
+            post_opposite = 0
+
+            if runs:
+                longest = max(runs, key=lambda r: r[1])
+                longest_streak_len = longest[1]
+                longest_end_idx = longest[0] + longest[1]
+                longest_streak_ended_ago = lookback - longest_end_idx
+                longest_streak_sign = longest[2]
+                if longest_end_idx < lookback:
+                    post_section = window_sign[longest_end_idx:]
+                    if len(post_section) > 1:
+                        post_crossings = int(np.count_nonzero(np.diff(post_section) != 0))
+                    post_opposite = int(np.sum(post_section == -longest_streak_sign))
 
             return (crossings, bias, above_ratio,
                     recent_consecutive, deviation_growing,
-                    prior_streak_len, prior_streak_ended_ago)
+                    longest_streak_len, longest_streak_ended_ago,
+                    longest_streak_sign, post_crossings, post_opposite)
 
         def _ma40_equidist(prices, ma40, lookback):
             if len(prices) < 40 + lookback or np.any(np.isnan(ma40[-lookback:])):
@@ -2196,14 +2210,21 @@ def _compute_ma_tangle_state(futures_sym):
 
         def _classify(crossings, bias, above_ratio, dist_ratio_40, count_bias_40,
                       recent_consecutive=0, deviation_growing=False,
-                      prior_streak_len=0, prior_streak_ended_ago=999,
+                      longest_streak_len=0, longest_streak_ended_ago=999,
+                      longest_streak_sign=0, post_crossings=0, post_opposite=0,
                       consec_threshold=6, transition_window=5):
             if crossings is None:
                 return 'warmup'
             if recent_consecutive >= consec_threshold and deviation_growing:
                 return 'trending_up' if above_ratio > 0.5 else 'trending_down'
-            if prior_streak_len >= consec_threshold and prior_streak_ended_ago <= transition_window:
-                return 'transitioning'
+            if (longest_streak_len >= consec_threshold
+                    and 1 <= longest_streak_ended_ago <= transition_window):
+                if longest_streak_ended_ago <= 2:
+                    return 'trans_touch'
+                if post_crossings <= 1 and post_opposite >= 2:
+                    return 'trans_cross'
+                if post_crossings >= 2:
+                    return 'trans_oscillate'
             if crossings >= _MA_CROSS_THRESHOLD:
                 return 'entangled'
             if bias >= _MA_BIAS_THRESHOLD:
@@ -2213,10 +2234,11 @@ def _compute_ma_tangle_state(futures_sym):
             return 'entangled'
 
         ma40_1m = pd.Series(closes).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-        cx_1m, bias_1m, ar_1m, rc_1m, dg_1m, ps_1m, psa_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
+        cx_1m, bias_1m, ar_1m, rc_1m, dg_1m, ls_1m, lsa_1m, lss_1m, pcx_1m, pop_1m = \
+            _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
         dr40_1m, cb40_1m = _ma40_equidist(closes, ma40_1m, _MA_LOOKBACK_1M)
         state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m,
-                             rc_1m, dg_1m, ps_1m, psa_1m,
+                             rc_1m, dg_1m, ls_1m, lsa_1m, lss_1m, pcx_1m, pop_1m,
                              _RECENT_CONSEC_1M, _TRANSITION_WINDOW_1M)
 
         df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
@@ -2227,15 +2249,17 @@ def _compute_ma_tangle_state(futures_sym):
             state_5m = 'warmup'
         else:
             ma40_5m = pd.Series(r5v).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-            cx_5m, bias_5m, ar_5m, rc_5m, dg_5m, ps_5m, psa_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
+            cx_5m, bias_5m, ar_5m, rc_5m, dg_5m, ls_5m, lsa_5m, lss_5m, pcx_5m, pop_5m = \
+                _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
             dr40_5m, cb40_5m = _ma40_equidist(r5v, ma40_5m, _MA_LOOKBACK_5M)
             state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m,
-                                 rc_5m, dg_5m, ps_5m, psa_5m,
+                                 rc_5m, dg_5m, ls_5m, lsa_5m, lss_5m, pcx_5m, pop_5m,
                                  _RECENT_CONSEC_5M, _TRANSITION_WINDOW_5M)
 
+        _SAFE_STATES = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
         if state_1m == 'warmup' or state_5m == 'warmup':
             combined = 'warmup'
-        elif state_1m in ('entangled', 'transitioning') and state_5m in ('entangled', 'transitioning'):
+        elif state_1m in _SAFE_STATES and state_5m in _SAFE_STATES:
             combined = 'safe'
         else:
             combined = 'warning'
