@@ -2039,6 +2039,8 @@ _MA_CROSS_THRESHOLD = 3
 _MA_BIAS_THRESHOLD = 0.8
 _MA40_DIST_RATIO = 2.0
 _MA40_COUNT_BIAS = 0.7
+_RECENT_CONSEC_1M = 12  # 1m连续同侧根数阈值(~12分钟) — 趋势转换覆盖
+_RECENT_CONSEC_5M = 6   # 5m连续同侧根数阈值(~30分钟) — 趋势转换覆盖
 
 _MA_TANGLE_GRADE = {
     'S': {'UR', 'NI', 'LC', 'EB', 'SN', 'CF', 'LH', 'SI'},
@@ -2110,7 +2112,7 @@ def _compute_ma_tangle_state(futures_sym):
 
         def _cross_count_and_bias(prices, ma_period, lookback):
             if len(prices) < ma_period + lookback:
-                return None, None, None
+                return None, None, None, 0, False
             ma = np.convolve(prices, np.ones(ma_period) / ma_period, mode='valid')
             tail = prices[ma_period - 1:]
             sign = np.sign(tail - ma)
@@ -2118,7 +2120,7 @@ def _compute_ma_tangle_state(futures_sym):
             below = (tail < ma).astype(np.float64)
             i = len(tail) - lookback
             if i < 0:
-                return None, None, None
+                return None, None, None, 0, False
             window_sign = sign[i:i + lookback]
             sign_diff = np.diff(window_sign)
             crossings = int(np.count_nonzero(sign_diff != 0))
@@ -2131,7 +2133,24 @@ def _compute_ma_tangle_state(futures_sym):
             else:
                 above_ratio = 0.5
                 bias = 0.5
-            return crossings, bias, above_ratio
+
+            last_s = window_sign[-1]
+            recent_consecutive = 0
+            if last_s != 0:
+                for k in range(lookback - 1, -1, -1):
+                    if window_sign[k] == last_s:
+                        recent_consecutive += 1
+                    else:
+                        break
+
+            deviation_growing = False
+            if recent_consecutive >= 3:
+                n = min(recent_consecutive, lookback)
+                dev = np.abs(tail[-n:] - ma[-n:])
+                slope = np.polyfit(np.arange(len(dev)), dev, 1)[0]
+                deviation_growing = slope > 0
+
+            return crossings, bias, above_ratio, recent_consecutive, deviation_growing
 
         def _ma40_equidist(prices, ma40, lookback):
             if len(prices) < 40 + lookback or np.any(np.isnan(ma40[-lookback:])):
@@ -2155,9 +2174,12 @@ def _compute_ma_tangle_state(futures_sym):
             count_bias = max(n_above, n_below) / (n_above + n_below) if (n_above + n_below) > 0 else 0.5
             return dist_ratio, count_bias
 
-        def _classify(crossings, bias, above_ratio, dist_ratio_40, count_bias_40):
+        def _classify(crossings, bias, above_ratio, dist_ratio_40, count_bias_40,
+                      recent_consecutive=0, deviation_growing=False, consec_threshold=6):
             if crossings is None:
                 return 'warmup'
+            if recent_consecutive >= consec_threshold and deviation_growing:
+                return 'trending_up' if above_ratio > 0.5 else 'trending_down'
             if crossings >= _MA_CROSS_THRESHOLD:
                 return 'entangled'
             if bias >= _MA_BIAS_THRESHOLD:
@@ -2167,9 +2189,10 @@ def _compute_ma_tangle_state(futures_sym):
             return 'entangled'
 
         ma40_1m = pd.Series(closes).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-        cx_1m, bias_1m, ar_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
+        cx_1m, bias_1m, ar_1m, rc_1m, dg_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
         dr40_1m, cb40_1m = _ma40_equidist(closes, ma40_1m, _MA_LOOKBACK_1M)
-        state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m)
+        state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m,
+                             rc_1m, dg_1m, _RECENT_CONSEC_1M)
 
         df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
         df5 = df5.set_index('dt')
@@ -2179,9 +2202,10 @@ def _compute_ma_tangle_state(futures_sym):
             state_5m = 'warmup'
         else:
             ma40_5m = pd.Series(r5v).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-            cx_5m, bias_5m, ar_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
+            cx_5m, bias_5m, ar_5m, rc_5m, dg_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
             dr40_5m, cb40_5m = _ma40_equidist(r5v, ma40_5m, _MA_LOOKBACK_5M)
-            state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m)
+            state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m,
+                                 rc_5m, dg_5m, _RECENT_CONSEC_5M)
 
         if state_1m == 'warmup' or state_5m == 'warmup':
             combined = 'warmup'
