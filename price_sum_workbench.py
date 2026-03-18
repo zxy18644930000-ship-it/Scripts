@@ -2418,7 +2418,7 @@ def _parse_contract(sym):
 # 品种行权价间隔打分参数 (optimal_min, optimal_max, max_reasonable)
 _auto_cache = {'pairs': [], 'ts': None}
 _v6_recommended_pairs = []  # 今日计划精选的OTM宽跨推荐，由toggle_plan填充
-_v6_preheat_thread = threading.local()  # 哨兵：防止重复启动预热线程
+_v6_preheat_started = False  # 哨兵：防止重复启动预热线程
 
 
 def _score_pair(cp, pp, cs, ps, fp, cv, pv, strike_params=None):
@@ -2912,6 +2912,7 @@ def scan_vrp():
 
     db = get_db()
     cur = db.cursor()
+    day_start = get_trading_day_start()
 
     # 1. 获取所有期货合约
     cur.execute("""SELECT DISTINCT symbol FROM dbbardata
@@ -2921,26 +2922,44 @@ def scan_vrp():
 
     # 按品种分组
     products = {}
+    valid_futures = []
     for f in all_futures:
         prod, month = _parse_futures_symbol(f)
         if not prod or prod not in _EXCHANGE_MAP:
             continue
-        # 跳过带后缀的合约（如l2604F）
         if not re.match(r'^[a-zA-Z]+\d{3,4}$', f):
             continue
         products.setdefault(prod, []).append((f, month))
+        valid_futures.append(f)
+
+    # 批量预取：一次性获取所有期货合约的近期数据量（替代逐个 COUNT）
+    _fut_count = {}
+    if valid_futures:
+        ph = ','.join('?' for _ in valid_futures)
+        cur.execute(f"SELECT symbol, COUNT(*) FROM dbbardata WHERE symbol IN ({ph}) AND datetime>=? GROUP BY symbol",
+                    valid_futures + [day_start])
+        _fut_count = {s: c for s, c in cur.fetchall()}
+
+    # 批量预取：近期所有 symbol 的最新价（限 day_start 以后，避免全表扫描）
+    _latest_px = {}
+    cur.execute("""SELECT b.symbol, b.close_price FROM dbbardata b
+        INNER JOIN (SELECT symbol, MAX(datetime) as max_dt FROM dbbardata
+            WHERE datetime >= ? GROUP BY symbol) m
+        ON b.symbol = m.symbol AND b.datetime = m.max_dt""", (day_start,))
+    _recent_symbols = set()
+    for sym, px in cur.fetchall():
+        _recent_symbols.add(sym)
+        if px and px > 0:
+            _latest_px[sym] = px
 
     results = []
-    day_start = get_trading_day_start()
 
     for prod, contracts in products.items():
         try:
-            # 选主力合约：近期数据量最大
+            # 选主力合约：近期数据量最大（从预取 dict 查，零 SQL）
             best_sym, best_month, best_count = None, None, 0
             for f_sym, month in contracts:
-                cur.execute("SELECT COUNT(*) FROM dbbardata WHERE symbol=? AND datetime>=?",
-                            (f_sym, day_start))
-                cnt = cur.fetchone()[0]
+                cnt = _fut_count.get(f_sym, 0)
                 if cnt > best_count:
                     best_count = cnt
                     best_sym = f_sym
@@ -2949,14 +2968,11 @@ def scan_vrp():
             if best_sym is None or best_count < 10:
                 continue
 
-            # 期货最新价格
-            cur.execute(_LATEST_PRICE_SQL, (best_sym,))
-            row = cur.fetchone()
-            if not row:
+            futures_price = _latest_px.get(best_sym)
+            if not futures_price:
                 continue
-            futures_price = row[0]
 
-            # RV：近N天1分钟收盘价
+            # RV：近N天1分钟收盘价（此查询必须逐品种，因数据量大）
             cur.execute("SELECT close_price FROM dbbardata WHERE symbol=? AND datetime>=? ORDER BY datetime",
                         (best_sym, day_start))
             fut_closes = [r[0] for r in cur.fetchall()]
@@ -2964,34 +2980,20 @@ def scan_vrp():
             if rv is None:
                 continue
 
-            # DTE
             dte = _estimate_dte(prod, best_month)
             if dte is None or dte <= 0:
                 continue
             T = dte / 365.0
 
-            # 构造期权symbol前缀
             is_czce = _EXCHANGE_MAP.get(prod, '') in ('CZCE', 'CZCE_SP')
-            if is_czce:
-                opt_prefix = f'{prod.upper()}{best_month}'
-            else:
-                opt_prefix = f'{prod.lower()}{best_month}'
+            opt_prefix = f'{prod.upper()}{best_month}' if is_czce else f'{prod.lower()}{best_month}'
 
-            # 查找Call期权
-            cur.execute("SELECT DISTINCT symbol FROM dbbardata WHERE symbol LIKE ? AND datetime>=?",
-                        (f'{opt_prefix}C%', day_start))
-            call_syms = [r[0] for r in cur.fetchall()]
-
-            # dash格式（大商所/广期所）
-            if not call_syms:
-                cur.execute("SELECT DISTINCT symbol FROM dbbardata WHERE symbol LIKE ? AND datetime>=?",
-                            (f'{opt_prefix}-C-%', day_start))
-                call_syms = [r[0] for r in cur.fetchall()]
-
+            # 从预取的 symbol 集合中筛选 call 期权（零 SQL）
+            call_syms = [s for s in _recent_symbols
+                         if s.startswith(f'{opt_prefix}C') or s.startswith(f'{opt_prefix}-C-')]
             if not call_syms:
                 continue
 
-            # 解析行权价，找ATM
             atm_call, atm_strike = None, None
             min_diff = float('inf')
             for cs in call_syms:
@@ -3008,23 +3010,17 @@ def scan_vrp():
             if atm_call is None:
                 continue
 
-            # 对应Put
             if '-C-' in atm_call:
                 atm_put = atm_call.replace('-C-', '-P-')
             else:
                 atm_put = re.sub(r'C(\d+)$', f'P{atm_strike}', atm_call)
 
-            # ATM Call 最新价
-            cur.execute(_LATEST_PRICE_SQL, (atm_call,))
-            row = cur.fetchone()
-            if not row or row[0] <= 0:
+            call_price = _latest_px.get(atm_call)
+            if not call_price or call_price <= 0:
                 continue
-            call_price = row[0]
-
-            # ATM Put 最新价
-            cur.execute(_LATEST_PRICE_SQL, (atm_put,))
-            row = cur.fetchone()
-            put_price = row[0] if row and row[0] > 0 else None
+            put_price = _latest_px.get(atm_put)
+            if put_price and put_price <= 0:
+                put_price = None
 
             # IV（Call + Put 均值）
             iv_c = _bs_iv_from_price(futures_price, atm_strike, T, call_price, 'C')
@@ -4820,13 +4816,14 @@ def render_charts(pairs, _):
 
     # 注入今日计划精选的OTM宽跨推荐（Top5，排除已有品种）
     # 异步预热：首次渲染不阻塞，由后台线程填充 _v6_recommended_pairs
-    if not _v6_recommended_pairs and not getattr(_v6_preheat_thread, '_started', False):
+    global _v6_preheat_started
+    if not _v6_recommended_pairs and not _v6_preheat_started:
+        _v6_preheat_started = True
         def _fill_v6():
             try:
                 toggle_plan(1)
             except Exception:
                 pass
-        _v6_preheat_thread._started = True
         threading.Thread(target=_fill_v6, daemon=True).start()
     existing_futures = manual_futures | {ap['futures_sym'] for ap in auto_pairs}
     for vp in _v6_recommended_pairs[:5]:
@@ -7677,21 +7674,18 @@ if __name__ == '__main__':
 
     # 后台预热：提前填充 auto_select_pairs / scan_vrp / toggle_plan 缓存
     def _preheat_caches():
-        try:
-            auto_select_pairs()
-            print('[预热] auto_select_pairs 完成')
-        except Exception:
-            pass
-        try:
-            scan_vrp()
-            print('[预热] scan_vrp 完成')
-        except Exception:
-            pass
-        try:
-            toggle_plan(1)
-            print('[预热] toggle_plan(v6) 完成')
-        except Exception:
-            pass
+        import traceback, sys
+        t0 = time.time()
+        for name, fn in [('auto_select_pairs', auto_select_pairs),
+                          ('scan_vrp', scan_vrp),
+                          ('toggle_plan', lambda: toggle_plan(1))]:
+            try:
+                fn()
+                print(f'[预热] {name} 完成 ({time.time()-t0:.1f}s)', flush=True)
+            except Exception:
+                traceback.print_exc()
+                sys.stdout.flush()
+        print(f'[预热] 全部完成 ({time.time()-t0:.1f}s)', flush=True)
     _preheat_thread = threading.Thread(target=_preheat_caches, daemon=True)
     _preheat_thread.start()
     print('后台预热: auto_select / vrp / v6 缓存')
