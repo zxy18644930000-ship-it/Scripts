@@ -2041,6 +2041,8 @@ _MA40_DIST_RATIO = 2.0
 _MA40_COUNT_BIAS = 0.7
 _RECENT_CONSEC_1M = 12  # 1m连续同侧根数阈值(~12分钟) — 趋势转换覆盖
 _RECENT_CONSEC_5M = 6   # 5m连续同侧根数阈值(~30分钟) — 趋势转换覆盖
+_TRANSITION_WINDOW_1M = 10  # 1m: 先前长streak结束后的转换观察窗口
+_TRANSITION_WINDOW_5M = 5   # 5m: 先前长streak结束后的转换观察窗口
 
 _MA_TANGLE_GRADE = {
     'S': {'UR', 'NI', 'LC', 'EB', 'SN', 'CF', 'LH', 'SI'},
@@ -2111,8 +2113,9 @@ def _compute_ma_tangle_state(futures_sym):
         closes = np.array(list(seen.values()), dtype=np.float64)
 
         def _cross_count_and_bias(prices, ma_period, lookback):
+            _empty = (None, None, None, 0, False, 0, 999)
             if len(prices) < ma_period + lookback:
-                return None, None, None, 0, False
+                return _empty
             ma = np.convolve(prices, np.ones(ma_period) / ma_period, mode='valid')
             tail = prices[ma_period - 1:]
             sign = np.sign(tail - ma)
@@ -2120,7 +2123,7 @@ def _compute_ma_tangle_state(futures_sym):
             below = (tail < ma).astype(np.float64)
             i = len(tail) - lookback
             if i < 0:
-                return None, None, None, 0, False
+                return _empty
             window_sign = sign[i:i + lookback]
             sign_diff = np.diff(window_sign)
             crossings = int(np.count_nonzero(sign_diff != 0))
@@ -2150,7 +2153,24 @@ def _compute_ma_tangle_state(futures_sym):
                 slope = np.polyfit(np.arange(len(dev)), dev, 1)[0]
                 deviation_growing = slope > 0
 
-            return crossings, bias, above_ratio, recent_consecutive, deviation_growing
+            prior_streak_len = 0
+            prior_streak_ended_ago = 999
+            boundary = lookback - recent_consecutive - 1
+            if boundary >= 0:
+                ps = window_sign[boundary]
+                if ps != 0:
+                    cnt = 0
+                    for k in range(boundary, -1, -1):
+                        if window_sign[k] == ps:
+                            cnt += 1
+                        else:
+                            break
+                    prior_streak_len = cnt
+                    prior_streak_ended_ago = recent_consecutive
+
+            return (crossings, bias, above_ratio,
+                    recent_consecutive, deviation_growing,
+                    prior_streak_len, prior_streak_ended_ago)
 
         def _ma40_equidist(prices, ma40, lookback):
             if len(prices) < 40 + lookback or np.any(np.isnan(ma40[-lookback:])):
@@ -2175,11 +2195,15 @@ def _compute_ma_tangle_state(futures_sym):
             return dist_ratio, count_bias
 
         def _classify(crossings, bias, above_ratio, dist_ratio_40, count_bias_40,
-                      recent_consecutive=0, deviation_growing=False, consec_threshold=6):
+                      recent_consecutive=0, deviation_growing=False,
+                      prior_streak_len=0, prior_streak_ended_ago=999,
+                      consec_threshold=6, transition_window=5):
             if crossings is None:
                 return 'warmup'
             if recent_consecutive >= consec_threshold and deviation_growing:
                 return 'trending_up' if above_ratio > 0.5 else 'trending_down'
+            if prior_streak_len >= consec_threshold and prior_streak_ended_ago <= transition_window:
+                return 'transitioning'
             if crossings >= _MA_CROSS_THRESHOLD:
                 return 'entangled'
             if bias >= _MA_BIAS_THRESHOLD:
@@ -2189,10 +2213,11 @@ def _compute_ma_tangle_state(futures_sym):
             return 'entangled'
 
         ma40_1m = pd.Series(closes).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-        cx_1m, bias_1m, ar_1m, rc_1m, dg_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
+        cx_1m, bias_1m, ar_1m, rc_1m, dg_1m, ps_1m, psa_1m = _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
         dr40_1m, cb40_1m = _ma40_equidist(closes, ma40_1m, _MA_LOOKBACK_1M)
         state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m,
-                             rc_1m, dg_1m, _RECENT_CONSEC_1M)
+                             rc_1m, dg_1m, ps_1m, psa_1m,
+                             _RECENT_CONSEC_1M, _TRANSITION_WINDOW_1M)
 
         df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
         df5 = df5.set_index('dt')
@@ -2202,14 +2227,15 @@ def _compute_ma_tangle_state(futures_sym):
             state_5m = 'warmup'
         else:
             ma40_5m = pd.Series(r5v).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
-            cx_5m, bias_5m, ar_5m, rc_5m, dg_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
+            cx_5m, bias_5m, ar_5m, rc_5m, dg_5m, ps_5m, psa_5m = _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
             dr40_5m, cb40_5m = _ma40_equidist(r5v, ma40_5m, _MA_LOOKBACK_5M)
             state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m,
-                                 rc_5m, dg_5m, _RECENT_CONSEC_5M)
+                                 rc_5m, dg_5m, ps_5m, psa_5m,
+                                 _RECENT_CONSEC_5M, _TRANSITION_WINDOW_5M)
 
         if state_1m == 'warmup' or state_5m == 'warmup':
             combined = 'warmup'
-        elif state_1m == 'entangled' and state_5m == 'entangled':
+        elif state_1m in ('entangled', 'transitioning') and state_5m in ('entangled', 'transitioning'):
             combined = 'safe'
         else:
             combined = 'warning'
@@ -5232,23 +5258,33 @@ def render_charts(pairs, _):
         ov1 = mt.get('overridden_1m', False)
         ov5 = mt.get('overridden_5m', False)
         if combined == 'safe':
-            ov_hint = ''
-            if ov1 or ov5:
-                ov_parts = []
-                if ov1: ov_parts.append('1m')
-                if ov5: ov_parts.append('5m')
-                ov_hint = f' 40MA降级{"+".join(ov_parts)}'
-            label = f'[{grade}] MA纠缠{ov_hint}'
-            color = '#00FF88'
-            bg = 'rgba(0,255,136,0.12)'
-            bold = False
+            has_transition = s1 == 'transitioning' or s5 == 'transitioning'
+            if has_transition:
+                t_parts = []
+                if s1 == 'transitioning': t_parts.append('1m')
+                if s5 == 'transitioning': t_parts.append('5m')
+                label = f'[{grade}] MA转换→纠缠 {"+".join(t_parts)}'
+                color = '#4fc3f7'
+                bg = 'rgba(79,195,247,0.12)'
+                bold = False
+            else:
+                ov_hint = ''
+                if ov1 or ov5:
+                    ov_parts = []
+                    if ov1: ov_parts.append('1m')
+                    if ov5: ov_parts.append('5m')
+                    ov_hint = f' 40MA降级{"+".join(ov_parts)}'
+                label = f'[{grade}] MA纠缠{ov_hint}'
+                color = '#00FF88'
+                bg = 'rgba(0,255,136,0.12)'
+                bold = False
         elif combined == 'warning':
             arrow = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '') or \
                     {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
             parts = []
-            if s1 != 'entangled':
+            if s1 not in ('entangled', 'transitioning'):
                 parts.append(f'1m{arrow}')
-            if s5 != 'entangled':
+            if s5 not in ('entangled', 'transitioning'):
                 parts.append(f'5m{arrow}')
             detail = '+'.join(parts) if parts else '趋势'
             label = f'[{grade}] MA趋势 {detail}'
