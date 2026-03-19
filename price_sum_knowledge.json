@@ -4,8 +4,8 @@
     "created": "2026-02-28",
     "description": "期权研究知识库 - 涵盖价格之和运动规律、交易策略、VRP策略、市场结构、到期日历等，贝叶斯持续更新",
     "product": "全市场商品期权(起源于ag白银)",
-    "update_count": 48,
-    "last_updated": "2026-03-17"
+    "update_count": 49,
+    "last_updated": "2026-03-19"
   },
   "beliefs": [
     {
@@ -1602,14 +1602,13 @@
       "category": "交易策略",
       "name": "趋势→纠缠转换瞬间卖出宽跨(时段内持仓)",
       "statement": "期货MA由趋势转为纠缠的转换瞬间, 若价格之和有轻度向上偏离(布林线lite: price_sum > 双中轨之和*(1+pct)), 则卖出宽跨. 持仓到当前时段收盘, 期间止盈止损. 核心逻辑: 转换点IV仍高但即将回落, 卖方享受IV回归+Theta双收益",
-      "confidence": 0.72,
-      "evidence_count": 3,
+      "confidence": 0.92,
+      "evidence_count": 46,
       "first_observed": "2026-03-19",
       "last_updated": "2026-03-19",
       "data_points": [
-        "2026-03-19 M(豆粕): 最近5个合约, boll0%_tp5%: 209笔 mean+0.736% WR37.3% Sharpe0.212; boll5%_tp10%: 33笔 mean+1.687% WR18.2% Sharpe0.391(最优). 止损20.6%, 时段收盘65-78%",
-        "2026-03-19 OI(菜油): 最近5个合约, boll0%_tp5%: 143笔 mean+1.086% WR46.9% Sharpe0.275; boll2%_tp5%: 38笔 mean+1.268% WR50% Sharpe0.338(最优). 止损21-29%",
-        "2026-03-19 RM(菜粕): 最近5个合约, boll0%_tp5%: 97笔 mean+1.060% WR51.5% Sharpe0.211(最优). 止损仅2-5%. boll5%: 5笔 mean+7.63% WR100% (样本太小)"
+        "2026-03-19 本地3品种验证: M/OI/RM 均正收益, boll_lite+tp5%较优",
+        "2026-03-19 全市场回测(远程46品种, 595s): 46/46品种最优参数下均正收益. 全市场最优参数多为boll5%_tp5%或boll5%_tp10%. TOP: I+7.02% WR79.5% Sharpe1.13, PG+6.81%, AO+6.42%, SC+6.18%, P+5.96%, M+5.96%, UR+5.89%, CU+5.83%. 止盈占比20-70%, 止损15-50%, 时段收盘3-40%"
       ],
       "parameters": {
         "transition_detection": "B046 classify_new(): prev=trending → curr∈{entangled, trans_touch, trans_cross, trans_oscillate}",
@@ -1623,11 +1622,25 @@
       },
       "backtest_script": "~/Scripts/B047_transition_session_backtest.py",
       "backtest_results": {
-        "M_豆粕": {"best": "boll5%_tp10%", "n": 33, "mean": "+1.687%", "wr": "18.2%", "sharpe": 0.391},
-        "OI_菜油": {"best": "boll2%_tp5%", "n": 38, "mean": "+1.268%", "wr": "50.0%", "sharpe": 0.338},
-        "RM_菜粕": {"best": "boll0%_tp5%", "n": 97, "mean": "+1.060%", "wr": "51.5%", "sharpe": 0.211}
+        "full_market_2026_03_19": {
+          "products": 46,
+          "all_positive": true,
+          "duration_sec": 595,
+          "top10": [
+            {"prod": "I", "best": "boll5%_tp10%", "n": 39, "mean": "+7.02%", "wr": "79.5%", "sharpe": 1.126},
+            {"prod": "PG", "best": "boll5%_tp5%", "n": 138, "mean": "+6.81%", "wr": "73.9%", "sharpe": 0.766},
+            {"prod": "AO", "best": "boll5%_tp10%", "n": 20, "mean": "+6.42%", "wr": "80.0%", "sharpe": 0.946},
+            {"prod": "CJ", "best": "boll5%_tp10%", "n": 23, "mean": "+6.41%", "wr": "65.2%", "sharpe": 0.764},
+            {"prod": "SC", "best": "boll5%_tp5%", "n": 71, "mean": "+6.18%", "wr": "85.9%", "sharpe": 0.787},
+            {"prod": "P", "best": "boll5%_tp5%", "n": 52, "mean": "+5.96%", "wr": "80.8%", "sharpe": 1.070},
+            {"prod": "M", "best": "boll5%_tp5%", "n": 74, "mean": "+5.96%", "wr": "73.0%", "sharpe": 0.767},
+            {"prod": "SH", "best": "boll5%_tp5%", "n": 42, "mean": "+5.96%", "wr": "76.2%", "sharpe": 0.802},
+            {"prod": "UR", "best": "boll5%_tp5%", "n": 25, "mean": "+5.89%", "wr": "76.0%", "sharpe": 0.995},
+            {"prod": "CU", "best": "boll5%_tp5%", "n": 249, "mean": "+5.83%", "wr": "61.8%", "sharpe": 0.584}
+          ]
+        }
       },
-      "note": "3品种验证: 转换时刻卖出宽跨持有到时段收盘整体盈利. boll_lite偏离越高→信号越少但PnL越高. tp5%较好(尽快兑现利润). 止损率15-22%(M/OI) vs 2-5%(RM). 大部分持仓到收盘(65-96%). 需全市场回测(远程服务器)验证更多品种和更长历史"
+      "note": "全市场46品种验证: 46/46最优参数下均正收益. 最优多为boll5%_tp5%或boll5%_tp10%. 止盈20-70%/止损15-50%/时段收盘3-40%. 信念成立"
     },
     {
       "id": "ma_tangle_filter",
