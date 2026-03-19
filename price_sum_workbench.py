@@ -34,6 +34,7 @@ DB_PATH = os.path.expanduser('~/.vntrader/database.db')
 CONFIG_PATH = os.path.expanduser('~/Scripts/price_sum_pairs.json')
 ALERT_HISTORY_PATH = os.path.expanduser('~/Scripts/alert_history.json')
 ALERT_DB_PATH = os.path.expanduser('~/Scripts/alert_history.db')  # SQLite长期存储
+B047_DB_PATH = os.path.expanduser('~/Scripts/b047_opportunities.db')  # B047 转换机会历史
 PORT = 8052
 REFRESH_MS = 60_000
 
@@ -1069,15 +1070,18 @@ def _build_account_bar():
 
     rows = []
     if row1_parts:
-        rows.append(html.Div(row1_parts))
+        rows.append(html.Div(row1_parts, style={
+            'display': 'flex', 'alignItems': 'center', 'flexWrap': 'nowrap', 'overflowX': 'auto'}))
     if row2_parts:
-        rows.append(html.Div(row2_parts, style={'marginTop': '4px'}))
+        rows.append(html.Div(row2_parts, style={
+            'marginTop': '4px', 'display': 'flex', 'alignItems': 'center', 'flexWrap': 'nowrap', 'overflowX': 'auto'}))
 
     return html.Div(rows, style={
         'padding': '8px 20px',
         'backgroundColor': '#0d1117',
         'borderBottom': '1px solid #1a1a3e',
         'overflow': 'hidden',
+        'whiteSpace': 'nowrap',
     })
 
 
@@ -2348,7 +2352,7 @@ def _check_b047_transition(futures_sym, call_sym, put_sym, sum_now, boll_middle)
     if transition_5m:
         trans_type.append(f'5m: {prev["state_5m"]}→{curr["state_5m"]}')
 
-    _b047_opportunities[futures_sym] = {
+    rec = {
         'futures_sym': futures_sym,
         'call_sym': call_sym,
         'put_sym': put_sym,
@@ -2361,6 +2365,12 @@ def _check_b047_transition(futures_sym, call_sym, put_sym, sum_now, boll_middle)
         'session_end': session_end,
         'trigger_time': now.strftime('%H:%M:%S'),
     }
+    is_new = futures_sym not in _b047_opportunities
+    _b047_opportunities[futures_sym] = rec
+    if is_new:
+        rec_db = dict(rec)
+        rec_db['created_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+        _b047_db_insert(rec_db)
     print(f'[B047] 转换机会: {futures_sym} {call_sym}+{put_sym} sum={sum_now:.1f} '
           f'mid={boll_middle:.1f} dev={deviation_pct:+.1f}% {" | ".join(trans_type)}')
 
@@ -3632,55 +3642,52 @@ def serve_layout():
     _ts = _load_trade_state()
     _ts_n = max(1, len(_ts.get('selections', [])) or 1)
     return html.Div([
-    # 顶部标题栏
+    # 顶部标题栏 + 两排按钮
     html.Div([
-        html.H2('期权工作台', style={'margin': '0', 'color': '#fff', 'display': 'inline-block'}),
-        html.Button('转换机会', id='b047-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#4a0a2a', 'color': '#FF69B4',
-            'border': '1px solid #FF69B4', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('MA纠缠', id='ma-entangled-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#0a4a3a', 'color': '#00FF88',
-            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('资讯', id='news-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#0a4a6e', 'color': '#4fc3f7',
-            'border': '1px solid #4fc3f7', 'borderRadius': '4px', 'marginTop': '3px'}),
-        html.Button('预警统计', id='alert-stats-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#3a3a0a', 'color': '#FFD700',
-            'border': '1px solid #FFD700', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('VRP扫描', id='vrp-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#0a3a0a', 'color': '#00FF88',
-            'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('今日计划', id='plan-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#4a0a0a', 'color': '#ff9800',
-            'border': '1px solid #ff9800', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('价差监控', id='spread-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#1a0a3a', 'color': '#bb86fc',
-            'border': '1px solid #bb86fc', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('背离监控', id='diverge-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#3a1a0a', 'color': '#FF6B00',
-            'border': '1px solid #FF6B00', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-        html.Button('CTP监控', id='ctp-monitor-btn', n_clicks=0, style={
-            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
-            'cursor': 'pointer', 'backgroundColor': '#0a2a1a', 'color': '#00DD00',
-            'border': '1px solid #00DD00', 'borderRadius': '4px', 'marginTop': '3px',
-            'marginRight': '8px'}),
-    ], style={'backgroundColor': '#1a1a2e', 'padding': '15px 25px',
-              'borderBottom': '3px solid #e94560'}),
+        html.Div([
+            html.H2('期权工作台', style={'margin': '0', 'color': '#fff', 'whiteSpace': 'nowrap'}),
+        ], style={'marginRight': '20px'}),
+        html.Div([
+            html.Button('转换机会', id='b047-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#4a0a2a', 'color': '#FF69B4',
+                'border': '1px solid #FF69B4', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('MA纠缠', id='ma-entangled-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#0a4a3a', 'color': '#00FF88',
+                'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('今日计划', id='plan-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#4a0a0a', 'color': '#ff9800',
+                'border': '1px solid #ff9800', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('预警统计', id='alert-stats-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#3a3a0a', 'color': '#FFD700',
+                'border': '1px solid #FFD700', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('VRP扫描', id='vrp-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#0a3a0a', 'color': '#00FF88',
+                'border': '1px solid #00FF88', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('背离监控', id='diverge-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#3a1a0a', 'color': '#FF6B00',
+                'border': '1px solid #FF6B00', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('价差监控', id='spread-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#1a0a3a', 'color': '#bb86fc',
+                'border': '1px solid #bb86fc', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('CTP监控', id='ctp-monitor-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#0a2a1a', 'color': '#00DD00',
+                'border': '1px solid #00DD00', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+            html.Button('资讯', id='news-btn', n_clicks=0, style={
+                'padding': '5px 14px', 'fontSize': '12px', 'cursor': 'pointer',
+                'backgroundColor': '#0a4a6e', 'color': '#4fc3f7',
+                'border': '1px solid #4fc3f7', 'borderRadius': '4px', 'marginRight': '6px', 'marginBottom': '4px'}),
+        ], style={'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center', 'flex': '1'}),
+    ], style={'backgroundColor': '#1a1a2e', 'padding': '10px 25px',
+              'borderBottom': '3px solid #e94560',
+              'display': 'flex', 'alignItems': 'center'}),
 
     # 今日计划面板（默认隐藏）
     html.Div(id='plan-panel', style={'display': 'none'}),
@@ -5452,7 +5459,7 @@ def render_charts(pairs, _):
                     if ov1: ov_parts.append('1m')
                     if ov5: ov_parts.append('5m')
                     ov_hint = f' 40MA降级{"+".join(ov_parts)}'
-                label = f'[{grade}] MA纠缠{ov_hint}'
+                label = f'[{grade}] MA20纠缠{ov_hint}'
                 color = '#00FF88'
                 bg = 'rgba(0,255,136,0.12)'
                 bold = False
@@ -5465,7 +5472,7 @@ def render_charts(pairs, _):
             if s5 not in _SAFE_SET:
                 parts.append(f'5m{arrow}')
             detail = '+'.join(parts) if parts else '趋势'
-            label = f'[{grade}] MA趋势 {detail}'
+            label = f'[{grade}] MA20趋势 {detail}'
             _grade_colors = {'S': ('#FF4444', 'rgba(255,68,68,0.12)'),
                              'A': ('#FF8800', 'rgba(255,136,0,0.12)'),
                              'B': ('#CCAA00', 'rgba(204,170,0,0.12)'),
@@ -5473,7 +5480,7 @@ def render_charts(pairs, _):
             color, bg = _grade_colors.get(grade, ('#888', 'rgba(136,136,136,0.1)'))
             bold = grade in ('S', 'A')
         else:
-            label = f'[{grade}] MA预热'
+            label = f'[{grade}] MA20预热'
             color = '#888'
             bg = 'rgba(136,136,136,0.1)'
             bold = False
@@ -6208,13 +6215,40 @@ def toggle_b047_panel(n_clicks, opportunities):
                                    'cursor': 'pointer', 'fontSize': '13px', 'fontFamily': 'monospace'}))
         body = html.Div(rows, style={'maxHeight': '50vh', 'overflowY': 'auto'})
 
+    # 历史记录（从 DB 加载）
+    history = _load_b047_history(limit=80)
+    hist_rows = []
+    for i, rec in enumerate(history):
+        created = rec.get('created_at', '')[:16]  # YYYY-MM-DD HH:MM
+        fs = rec.get('futures_sym', '?')
+        pair_key = rec.get('pair_key', '')
+        sum_now = rec.get('sum_now', 0)
+        dev = rec.get('deviation_pct', 0)
+        trans = rec.get('transition', '')[:30]  # 截断
+        session = rec.get('session', '')
+        label = f'{created}  {fs}  Sum={sum_now}  +{dev:.1f}%  {trans}  {session}'
+        # 历史项用 hist_{pair_key}_{i} 避免与当前项 ID 冲突
+        hist_idx = f'hist_{pair_key}_{i}'
+        hist_rows.append(html.Button(label, id={'type': 'b047-item', 'index': hist_idx}, n_clicks=0,
+                        style={'width': '100%', 'textAlign': 'left', 'padding': '6px 16px',
+                               'backgroundColor': 'rgba(255,105,180,0.04)', 'color': '#999',
+                               'border': 'none', 'borderBottom': '1px solid #1a1a2e',
+                               'cursor': 'pointer', 'fontSize': '12px', 'fontFamily': 'monospace'}))
+    hist_body = html.Div([
+        html.Div('历史记录（点击可定位到图表）', style={'color': '#666', 'fontSize': '12px',
+                'padding': '8px 20px', 'borderBottom': '1px solid #2a2a4a'}),
+        html.Div(hist_rows if hist_rows else [html.Div('暂无历史', style={'color': '#555', 'padding': '12px', 'fontSize': '12px'})],
+                 style={'maxHeight': '35vh', 'overflowY': 'auto'}),
+    ])
+
     panel = html.Div([
         html.Div([
             html.Span('B047 转换机会', style={'color': '#FF69B4', 'fontSize': '15px', 'fontWeight': 'bold'}),
-            html.Span(f'  共 {len(items)} 个', style={'color': '#666', 'fontSize': '12px', 'marginLeft': '10px'}),
+            html.Span(f'  当前 {len(items)} 个', style={'color': '#666', 'fontSize': '12px', 'marginLeft': '10px'}),
             html.Span('  trending→entangled + 布林lite>5%', style={'color': '#555', 'fontSize': '11px', 'marginLeft': '10px'}),
         ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
         body,
+        hist_body,
     ])
     return panel, {
         'display': 'block', 'backgroundColor': '#111827',
@@ -6234,7 +6268,11 @@ def b047_item_click(all_clicks):
         return no_update
     if not all_clicks or not any(c and c > 0 for c in all_clicks):
         return no_update
-    return triggered.get('index')
+    idx = triggered.get('index')
+    # 历史项 index 格式: hist_{pair_key}_{i}，需提取 pair_key
+    if isinstance(idx, str) and idx.startswith('hist_'):
+        idx = idx[5:].rsplit('_', 1)[0]  # pair_key
+    return idx
 
 
 @app.callback(
