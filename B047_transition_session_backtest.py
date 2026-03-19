@@ -760,7 +760,14 @@ def process_product(product):
 
     if use_flat:
         option_yymms = list_option_yymms_flat(product)
-        contracts = [c for c in contracts if c[len(prod_upper):] in option_yymms]
+        # CZCE 期货合约用4位yymm(如2511), 期权用3位(如511)，需兼容
+        def _yymm_match(contract_yymm, yymm_set):
+            if contract_yymm in yymm_set:
+                return True
+            if exchange == 'CZCE' and len(contract_yymm) == 4 and contract_yymm[1:] in yymm_set:
+                return True
+            return False
+        contracts = [c for c in contracts if _yymm_match(c[len(prod_upper):], option_yymms)]
         if RECENT_CONTRACTS and len(contracts) > RECENT_CONTRACTS:
             contracts = contracts[-RECENT_CONTRACTS:]
         print('  Options (flat): 按合约月份+时间范围局部读取')
