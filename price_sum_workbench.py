@@ -1370,21 +1370,29 @@ def load_pair_data(call_sym, put_sym):
 
     for sym, store in [(call_sym, call_data), (put_sym, put_data)]:
         cur.execute("""
-            SELECT datetime, close_price FROM dbbardata
+            SELECT datetime, close_price, volume FROM dbbardata
             WHERE symbol=? AND datetime>=? ORDER BY datetime
         """, (sym, day_start))
-        for dt_str, px in cur.fetchall():
-            store[dt_str] = px
+        _vol_map = {}
+        for dt_str, px, vol in cur.fetchall():
+            prev_vol = _vol_map.get(dt_str, -1)
+            if vol is not None and vol > prev_vol:
+                store[dt_str] = px
+                _vol_map[dt_str] = vol
 
     # 加载期货价格
     futures_sym = _extract_futures_symbol(call_sym)
     if futures_sym:
         cur.execute("""
-            SELECT datetime, close_price FROM dbbardata
+            SELECT datetime, close_price, volume FROM dbbardata
             WHERE symbol=? AND datetime>=? ORDER BY datetime
         """, (futures_sym, day_start))
-        for dt_str, px in cur.fetchall():
-            futures_data[dt_str] = px
+        _fvol = {}
+        for dt_str, px, vol in cur.fetchall():
+            prev_vol = _fvol.get(dt_str, -1)
+            if vol is not None and vol > prev_vol:
+                futures_data[dt_str] = px
+                _fvol[dt_str] = vol
 
     def _night_before_day(dt_str):
         """排序键：夜盘减1天让它排在对应日盘之前，但当前夜盘不减（排在图表最右边）"""
@@ -2080,6 +2088,9 @@ def _resolve_futures_symbol(sym, cur):
 
 _ma_tangle_cache = {}  # {futures_sym: (timestamp, result)}
 _MA_TANGLE_CACHE_TTL = 60  # seconds
+_ma_prev_state = {}   # {futures_sym: {'state_1m': ..., 'state_5m': ...}} — B047 转换检测用
+_b047_opportunities = {}  # {futures_sym: {触发信息}} — 活跃的 B047 转换机会
+_B047_BOLL_LITE_PCT = 0.05  # 布林线 lite 偏离阈值（回测最优 boll5%）
 
 def _compute_ma_tangle_state(futures_sym):
     """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）"""
@@ -2265,11 +2276,83 @@ def _compute_ma_tangle_state(futures_sym):
             combined = 'warning'
         result = {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
                   'overridden_1m': False, 'overridden_5m': False}
+        old_cached = _ma_tangle_cache.get(futures_sym)
+        if old_cached:
+            old_result = old_cached[1]
+            if old_result.get('state_1m') != 'warmup':
+                _ma_prev_state[futures_sym] = {
+                    'state_1m': old_result['state_1m'],
+                    'state_5m': old_result['state_5m'],
+                }
         _ma_tangle_cache[futures_sym] = (now_ts, result)
         return result
     except Exception as e:
         print(f'[MA纠缠] 计算失败 {futures_sym}: {e}')
         return _warmup
+
+
+def _check_b047_transition(futures_sym, call_sym, put_sym, sum_now, boll_middle):
+    """检测 B047 转换机会: trending→safe 转换 + 布林线 lite 偏离"""
+    if not futures_sym or not sum_now or not boll_middle or boll_middle <= 0:
+        return
+    prev = _ma_prev_state.get(futures_sym)
+    if not prev:
+        return
+    cached = _ma_tangle_cache.get(futures_sym)
+    if not cached:
+        return
+    curr = cached[1]
+    if curr.get('state_1m') == 'warmup' or curr.get('state_5m') == 'warmup':
+        return
+
+    _TRENDING = ('trending_up', 'trending_down')
+    _SAFE = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
+
+    transition_1m = prev.get('state_1m') in _TRENDING and curr.get('state_1m') in _SAFE
+    transition_5m = prev.get('state_5m') in _TRENDING and curr.get('state_5m') in _SAFE
+
+    if not transition_1m and not transition_5m:
+        if futures_sym in _b047_opportunities:
+            del _b047_opportunities[futures_sym]
+        return
+
+    if sum_now <= boll_middle * (1 + _B047_BOLL_LITE_PCT):
+        return
+
+    deviation_pct = (sum_now - boll_middle) / boll_middle * 100
+    now = datetime.now()
+    h = now.hour
+
+    if 9 <= h < 15:
+        session = '日盘'
+        session_end = '15:00'
+    elif h >= 21 or h < 3:
+        session = '夜盘'
+        session_end = '23:00+'
+    else:
+        return
+
+    trans_type = []
+    if transition_1m:
+        trans_type.append(f'1m: {prev["state_1m"]}→{curr["state_1m"]}')
+    if transition_5m:
+        trans_type.append(f'5m: {prev["state_5m"]}→{curr["state_5m"]}')
+
+    _b047_opportunities[futures_sym] = {
+        'futures_sym': futures_sym,
+        'call_sym': call_sym,
+        'put_sym': put_sym,
+        'pair_key': f'{call_sym}|{put_sym}',
+        'sum_now': round(sum_now, 1),
+        'boll_middle': round(boll_middle, 1),
+        'deviation_pct': round(deviation_pct, 2),
+        'transition': ' | '.join(trans_type),
+        'session': session,
+        'session_end': session_end,
+        'trigger_time': now.strftime('%H:%M:%S'),
+    }
+    print(f'[B047] 转换机会: {futures_sym} {call_sym}+{put_sym} sum={sum_now:.1f} '
+          f'mid={boll_middle:.1f} dev={deviation_pct:+.1f}% {" | ".join(trans_type)}')
 
 
 def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
@@ -2432,6 +2515,7 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     act_day = _calc_activity_share(call_prices[day_start_idx:], put_prices[day_start_idx:])
     act_7d = _calc_activity_share(call_prices, put_prices)
     ma_tangle = _compute_ma_tangle_state(futures_sym)
+    _check_b047_transition(futures_sym, call_sym, put_sym, latest_sum, dr.get('boll_middle', 0))
 
     return fig, {'sum': latest_sum, 'futures_sym': futures_sym, 'double_rise': dr,
                  'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio,
@@ -3540,6 +3624,11 @@ def serve_layout():
     # 顶部标题栏
     html.Div([
         html.H2('期权工作台', style={'margin': '0', 'color': '#fff', 'display': 'inline-block'}),
+        html.Button('转换机会', id='b047-btn', n_clicks=0, style={
+            'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
+            'cursor': 'pointer', 'backgroundColor': '#4a0a2a', 'color': '#FF69B4',
+            'border': '1px solid #FF69B4', 'borderRadius': '4px', 'marginTop': '3px',
+            'marginRight': '8px'}),
         html.Button('MA纠缠', id='ma-entangled-btn', n_clicks=0, style={
             'float': 'right', 'padding': '6px 16px', 'fontSize': '13px',
             'cursor': 'pointer', 'backgroundColor': '#0a4a3a', 'color': '#00FF88',
@@ -3590,6 +3679,9 @@ def serve_layout():
 
     # MA纠缠提醒面板（默认隐藏）
     html.Div(id='ma-entangled-panel', style={'display': 'none'}),
+
+    # B047 转换机会面板（默认隐藏）
+    html.Div(id='b047-panel', style={'display': 'none'}),
 
     # 资讯面板（默认隐藏）
     html.Div(id='news-panel', style={'display': 'none'}),
@@ -3713,6 +3805,7 @@ def serve_layout():
     dcc.Store(id='pending-trade-pair', data=None),  # 图表「加载」→ 自动填入交易行
     dcc.Store(id='scroll-to-pair', data=None),  # 添加期权对成功后滚动到该图表
     dcc.Store(id='ma-entangled-store', data=[]),  # 纠缠状态期权对列表（由 render_charts 填充）
+    dcc.Store(id='b047-store', data=[]),  # B047 转换机会列表
 
     # 定时刷新
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
@@ -4870,6 +4963,7 @@ def update_account_bar(_):
 @app.callback(
     Output('charts-container', 'children'),
     Output('ma-entangled-store', 'data'),
+    Output('b047-store', 'data'),
     Input('pairs-store', 'data'),
     Input('timer', 'n_intervals'),
 )
@@ -5124,6 +5218,20 @@ def render_charts(pairs, _):
 
     # 布林线警报导航（包括"回归中"）
     all_alerts = alert_manual + alert_auto
+
+    def _boll_dist(item):
+        """提取距中轨距离（用于排序，越大越靠前）"""
+        if len(item) == 6:
+            _, _, _, info, _, _ = item
+        else:
+            _, _, _, info = item
+        dr = info.get('double_rise', {})
+        s = info.get('sum') or 0
+        mid = dr.get('boll_middle') or 0
+        return (s - mid) if mid > 0 else 0
+
+    all_alerts = sorted(all_alerts, key=_boll_dist, reverse=True)
+
     _nav_active_keys = set()
     for item in all_alerts:
         if len(item) == 6:
@@ -5134,6 +5242,9 @@ def render_charts(pairs, _):
             _nav_active_keys.add(f'{ap.get("call","")}|{ap.get("put","")}')
     _nav_retreating = [arec for akey, arec in _alert_active.items()
                        if not arec.get('resolved') and akey not in _nav_active_keys]
+    _nav_retreating = sorted(_nav_retreating,
+        key=lambda r: (r.get('last_sum', 0) - r.get('boll_middle', 0)) if r.get('boll_middle', 0) > 0 else 0,
+        reverse=True)
 
     if all_alerts or _nav_retreating:
         _sec = []
@@ -5281,13 +5392,21 @@ def render_charts(pairs, _):
         s5 = mt.get('state_5m', 'warmup')
         ov1 = mt.get('overridden_1m', False)
         ov5 = mt.get('overridden_5m', False)
+        _TRANS_LABELS = {
+            'trans_touch': '首触MA',
+            'trans_cross': '反穿站稳',
+            'trans_oscillate': '穿梭',
+        }
+        _SAFE_SET = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
         if combined == 'safe':
-            has_transition = s1 == 'transitioning' or s5 == 'transitioning'
+            has_transition = s1.startswith('trans_') or s5.startswith('trans_')
             if has_transition:
                 t_parts = []
-                if s1 == 'transitioning': t_parts.append('1m')
-                if s5 == 'transitioning': t_parts.append('5m')
-                label = f'[{grade}] MA转换→纠缠 {"+".join(t_parts)}'
+                if s1.startswith('trans_'):
+                    t_parts.append(f'1m{_TRANS_LABELS.get(s1, "")}')
+                if s5.startswith('trans_'):
+                    t_parts.append(f'5m{_TRANS_LABELS.get(s5, "")}')
+                label = f'[{grade}] 趋→纠 {"+".join(t_parts)}'
                 color = '#4fc3f7'
                 bg = 'rgba(79,195,247,0.12)'
                 bold = False
@@ -5306,9 +5425,9 @@ def render_charts(pairs, _):
             arrow = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '') or \
                     {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
             parts = []
-            if s1 not in ('entangled', 'transitioning'):
+            if s1 not in _SAFE_SET:
                 parts.append(f'1m{arrow}')
-            if s5 not in ('entangled', 'transitioning'):
+            if s5 not in _SAFE_SET:
                 parts.append(f'5m{arrow}')
             detail = '+'.join(parts) if parts else '趋势'
             label = f'[{grade}] MA趋势 {detail}'
@@ -5556,7 +5675,9 @@ def render_charts(pairs, _):
             entangled_list.append({'pair_key': pair_key, 'label': f'{ap["call"]} + {ap["put"]}',
                                    'futures_sym': ap.get('futures_sym', info.get('futures_sym', '?'))})
 
-    return charts_layout, entangled_list
+    b047_list = list(_b047_opportunities.values())
+
+    return charts_layout, entangled_list, b047_list
 
 
 # ============ 价差Z-Score监控 ============
@@ -6007,6 +6128,72 @@ def ma_entangled_item_click(all_clicks):
     """点击 MA纠缠 面板中的期权对，滚动到对应图表"""
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict) or triggered.get('type') != 'ma-entangled-item':
+        return no_update
+    if not all_clicks or not any(c and c > 0 for c in all_clicks):
+        return no_update
+    return triggered.get('index')
+
+
+# ============ B047 转换机会面板 ============
+
+@app.callback(
+    Output('b047-panel', 'children'),
+    Output('b047-panel', 'style'),
+    Input('b047-btn', 'n_clicks'),
+    State('b047-store', 'data'),
+    prevent_initial_call=True,
+)
+def toggle_b047_panel(n_clicks, opportunities):
+    """切换 B047 转换机会面板"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    items = opportunities or []
+    if not items:
+        body = html.Div('当前无 B047 转换机会。MA 需先处于趋势状态再转为纠缠，且价格之和需高于中轨 5%。',
+                       style={'color': '#888', 'padding': '30px', 'textAlign': 'center', 'fontSize': '13px'})
+    else:
+        rows = []
+        for rec in items:
+            fs = rec.get('futures_sym', '?')
+            pair_key = rec.get('pair_key', '')
+            sum_now = rec.get('sum_now', 0)
+            dev = rec.get('deviation_pct', 0)
+            trans = rec.get('transition', '')
+            trigger_time = rec.get('trigger_time', '')
+            session = rec.get('session', '')
+
+            label = f'{fs}  Sum={sum_now}  偏离+{dev:.1f}%  {trans}  [{trigger_time} {session}]'
+            rows.append(html.Button(label, id={'type': 'b047-item', 'index': pair_key}, n_clicks=0,
+                            style={'width': '100%', 'textAlign': 'left', 'padding': '10px 20px',
+                                   'backgroundColor': 'rgba(255,105,180,0.08)', 'color': '#FF69B4',
+                                   'border': 'none', 'borderBottom': '1px solid #2a2a4a',
+                                   'cursor': 'pointer', 'fontSize': '13px', 'fontFamily': 'monospace'}))
+        body = html.Div(rows, style={'maxHeight': '50vh', 'overflowY': 'auto'})
+
+    panel = html.Div([
+        html.Div([
+            html.Span('B047 转换机会', style={'color': '#FF69B4', 'fontSize': '15px', 'fontWeight': 'bold'}),
+            html.Span(f'  共 {len(items)} 个', style={'color': '#666', 'fontSize': '12px', 'marginLeft': '10px'}),
+            html.Span('  trending→entangled + 布林lite>5%', style={'color': '#555', 'fontSize': '11px', 'marginLeft': '10px'}),
+        ], style={'padding': '10px 25px', 'borderBottom': '1px solid #2a2a4a'}),
+        body,
+    ])
+    return panel, {
+        'display': 'block', 'backgroundColor': '#111827',
+        'borderBottom': '3px solid #FF69B4', 'marginBottom': '5px',
+    }
+
+
+@app.callback(
+    Output('scroll-to-pair', 'data', allow_duplicate=True),
+    Input({'type': 'b047-item', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def b047_item_click(all_clicks):
+    """点击 B047 面板中的机会，滚动到对应图表"""
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict) or triggered.get('type') != 'b047-item':
         return no_update
     if not all_clicks or not any(c and c > 0 for c in all_clicks):
         return no_update
