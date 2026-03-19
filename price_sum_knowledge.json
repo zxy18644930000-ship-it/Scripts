@@ -1608,7 +1608,8 @@
       "last_updated": "2026-03-19",
       "data_points": [
         "2026-03-19 本地3品种验证: M/OI/RM 均正收益, boll_lite+tp5%较优",
-        "2026-03-19 全市场回测(远程46品种, 595s): 46/46品种最优参数下均正收益. 全市场最优参数多为boll5%_tp5%或boll5%_tp10%. TOP: I+7.02% WR79.5% Sharpe1.13, PG+6.81%, AO+6.42%, SC+6.18%, P+5.96%, M+5.96%, UR+5.89%, CU+5.83%. 止盈占比20-70%, 止损15-50%, 时段收盘3-40%"
+        "2026-03-19 MA20全市场回测(远程46品种): 46/46正收益, 平均PnL+4.52%. TOP: I+7.02%, PG+6.81%, AO+6.42%, SC+6.18%, P+5.96%",
+        "2026-03-19 MA10全市场回测(远程46品种): 45/46正收益(AD负), 平均PnL+3.93%. MA20优于MA10(31:13). MA10优势品种: SN+4.86%, PP+4.21%, FG+3.18%, SA+3.34%. MA10信号更多但单笔质量略低"
       ],
       "parameters": {
         "transition_detection": "B046 classify_new(): prev=trending → curr∈{entangled, trans_touch, trans_cross, trans_oscillate}",
@@ -1622,25 +1623,26 @@
       },
       "backtest_script": "~/Scripts/B047_transition_session_backtest.py",
       "backtest_results": {
-        "full_market_2026_03_19": {
+        "MA20_full_market": {
+          "ma_period": 20,
           "products": 46,
-          "all_positive": true,
-          "duration_sec": 595,
-          "top10": [
-            {"prod": "I", "best": "boll5%_tp10%", "n": 39, "mean": "+7.02%", "wr": "79.5%", "sharpe": 1.126},
-            {"prod": "PG", "best": "boll5%_tp5%", "n": 138, "mean": "+6.81%", "wr": "73.9%", "sharpe": 0.766},
-            {"prod": "AO", "best": "boll5%_tp10%", "n": 20, "mean": "+6.42%", "wr": "80.0%", "sharpe": 0.946},
-            {"prod": "CJ", "best": "boll5%_tp10%", "n": 23, "mean": "+6.41%", "wr": "65.2%", "sharpe": 0.764},
-            {"prod": "SC", "best": "boll5%_tp5%", "n": 71, "mean": "+6.18%", "wr": "85.9%", "sharpe": 0.787},
-            {"prod": "P", "best": "boll5%_tp5%", "n": 52, "mean": "+5.96%", "wr": "80.8%", "sharpe": 1.070},
-            {"prod": "M", "best": "boll5%_tp5%", "n": 74, "mean": "+5.96%", "wr": "73.0%", "sharpe": 0.767},
-            {"prod": "SH", "best": "boll5%_tp5%", "n": 42, "mean": "+5.96%", "wr": "76.2%", "sharpe": 0.802},
-            {"prod": "UR", "best": "boll5%_tp5%", "n": 25, "mean": "+5.89%", "wr": "76.0%", "sharpe": 0.995},
-            {"prod": "CU", "best": "boll5%_tp5%", "n": 249, "mean": "+5.83%", "wr": "61.8%", "sharpe": 0.584}
-          ]
-        }
+          "positive": 46,
+          "avg_pnl": "+4.52%",
+          "top5": "I+7.02% PG+6.81% AO+6.42% SC+6.18% P+5.96%"
+        },
+        "MA10_full_market": {
+          "ma_period": 10,
+          "products": 46,
+          "positive": 45,
+          "negative": ["AD"],
+          "avg_pnl": "+3.93%",
+          "top5": "UR+6.71% SC+6.38% SH+6.09% AG+5.62% CU+5.06%",
+          "ma10_better": "FG PP SN SA UR L PF PB PX SC SH Y AP",
+          "ma20_better": "AD AG AL AO AU BR C CJ CU EB EG I LC LH M NI OI P PG PK RB RM SI SM SR TA V ZN"
+        },
+        "conclusion": "MA20整体更优(31:13), 但MA10也普遍盈利. MA10更敏感(信号更多), MA20更精准(单笔更高)"
       },
-      "note": "全市场46品种验证: 46/46最优参数下均正收益. 最优多为boll5%_tp5%或boll5%_tp10%. 止盈20-70%/止损15-50%/时段收盘3-40%. 信念成立"
+      "note": "MA20和MA10两个版本均验证盈利. MA20: 46/46正, 平均+4.52%. MA10: 45/46正, 平均+3.93%. 实盘可根据个人观察习惯选择"
     },
     {
       "id": "ma_tangle_filter",

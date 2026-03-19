@@ -2086,20 +2086,24 @@ def _resolve_futures_symbol(sym, cur):
     return sym
 
 
-_ma_tangle_cache = {}  # {futures_sym: (timestamp, result)}
+_ma_tangle_cache = {}  # {futures_sym: (timestamp, result)} — MA20
+_ma_tangle_cache_10 = {}  # {futures_sym: (timestamp, result)} — MA10
 _MA_TANGLE_CACHE_TTL = 60  # seconds
 _ma_prev_state = {}   # {futures_sym: {'state_1m': ..., 'state_5m': ...}} — B047 转换检测用
 _b047_opportunities = {}  # {futures_sym: {触发信息}} — 活跃的 B047 转换机会
 _B047_BOLL_LITE_PCT = 0.05  # 布林线 lite 偏离阈值（回测最优 boll5%）
 
-def _compute_ma_tangle_state(futures_sym):
-    """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）"""
+def _compute_ma_tangle_state(futures_sym, ma_period=None):
+    """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）
+    ma_period: 均线周期, 默认None=使用全局 _MA_PERIOD(20)"""
     _warmup = {'state_1m': 'warmup', 'state_5m': 'warmup', 'combined': 'warmup',
                'overridden_1m': False, 'overridden_5m': False}
     if not futures_sym:
         return _warmup
+    use_period = ma_period or _MA_PERIOD
+    cache = _ma_tangle_cache_10 if use_period == 10 else _ma_tangle_cache
     now_ts = time.time()
-    cached = _ma_tangle_cache.get(futures_sym)
+    cached = cache.get(futures_sym)
     if cached and now_ts - cached[0] < _MA_TANGLE_CACHE_TTL:
         return cached[1]
     try:
@@ -2244,13 +2248,16 @@ def _compute_ma_tangle_state(futures_sym):
                     return 'trending_up' if above_ratio > 0.5 else 'trending_down'
             return 'entangled'
 
+        consec_1m = 8 if use_period == 10 else _RECENT_CONSEC_1M
+        consec_5m = 4 if use_period == 10 else _RECENT_CONSEC_5M
+
         ma40_1m = pd.Series(closes).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
         cx_1m, bias_1m, ar_1m, rc_1m, dg_1m, ls_1m, lsa_1m, lss_1m, pcx_1m, pop_1m = \
-            _cross_count_and_bias(closes, _MA_PERIOD, _MA_LOOKBACK_1M)
+            _cross_count_and_bias(closes, use_period, _MA_LOOKBACK_1M)
         dr40_1m, cb40_1m = _ma40_equidist(closes, ma40_1m, _MA_LOOKBACK_1M)
         state_1m = _classify(cx_1m, bias_1m, ar_1m, dr40_1m, cb40_1m,
                              rc_1m, dg_1m, ls_1m, lsa_1m, lss_1m, pcx_1m, pop_1m,
-                             _RECENT_CONSEC_1M, _TRANSITION_WINDOW_1M)
+                             consec_1m, _TRANSITION_WINDOW_1M)
 
         df5 = pd.DataFrame({'close': closes, 'dt': pd.to_datetime(dts)})
         df5 = df5.set_index('dt')
@@ -2261,11 +2268,11 @@ def _compute_ma_tangle_state(futures_sym):
         else:
             ma40_5m = pd.Series(r5v).rolling(_MA_PERIOD_40, min_periods=_MA_PERIOD_40).mean().values
             cx_5m, bias_5m, ar_5m, rc_5m, dg_5m, ls_5m, lsa_5m, lss_5m, pcx_5m, pop_5m = \
-                _cross_count_and_bias(r5v, _MA_PERIOD, _MA_LOOKBACK_5M)
+                _cross_count_and_bias(r5v, use_period, _MA_LOOKBACK_5M)
             dr40_5m, cb40_5m = _ma40_equidist(r5v, ma40_5m, _MA_LOOKBACK_5M)
             state_5m = _classify(cx_5m, bias_5m, ar_5m, dr40_5m, cb40_5m,
                                  rc_5m, dg_5m, ls_5m, lsa_5m, lss_5m, pcx_5m, pop_5m,
-                                 _RECENT_CONSEC_5M, _TRANSITION_WINDOW_5M)
+                                 consec_5m, _TRANSITION_WINDOW_5M)
 
         _SAFE_STATES = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
         if state_1m == 'warmup' or state_5m == 'warmup':
@@ -2276,15 +2283,18 @@ def _compute_ma_tangle_state(futures_sym):
             combined = 'warning'
         result = {'state_1m': state_1m, 'state_5m': state_5m, 'combined': combined,
                   'overridden_1m': False, 'overridden_5m': False}
-        old_cached = _ma_tangle_cache.get(futures_sym)
-        if old_cached:
-            old_result = old_cached[1]
-            if old_result.get('state_1m') != 'warmup':
-                _ma_prev_state[futures_sym] = {
-                    'state_1m': old_result['state_1m'],
-                    'state_5m': old_result['state_5m'],
-                }
-        _ma_tangle_cache[futures_sym] = (now_ts, result)
+        if use_period == 10:
+            _ma_tangle_cache_10[futures_sym] = (now_ts, result)
+        else:
+            old_cached = _ma_tangle_cache.get(futures_sym)
+            if old_cached:
+                old_result = old_cached[1]
+                if old_result.get('state_1m') != 'warmup':
+                    _ma_prev_state[futures_sym] = {
+                        'state_1m': old_result['state_1m'],
+                        'state_5m': old_result['state_5m'],
+                    }
+            _ma_tangle_cache[futures_sym] = (now_ts, result)
         return result
     except Exception as e:
         print(f'[MA纠缠] 计算失败 {futures_sym}: {e}')
@@ -2515,12 +2525,13 @@ def build_figure(call_sym, put_sym, call_coeff=1.0, put_coeff=1.0):
     act_day = _calc_activity_share(call_prices[day_start_idx:], put_prices[day_start_idx:])
     act_7d = _calc_activity_share(call_prices, put_prices)
     ma_tangle = _compute_ma_tangle_state(futures_sym)
+    ma_tangle_10 = _compute_ma_tangle_state(futures_sym, ma_period=10)
     _check_b047_transition(futures_sym, call_sym, put_sym, latest_sum, dr.get('boll_middle', 0))
 
     return fig, {'sum': latest_sum, 'futures_sym': futures_sym, 'double_rise': dr,
                  'call_last': call_last, 'put_last': put_last, 'leg_ratio': leg_ratio,
                  'activity_30m': act_30m, 'activity_day': act_day, 'activity_7d': act_7d,
-                 'ma_tangle': ma_tangle}
+                 'ma_tangle': ma_tangle, 'ma_tangle_10': ma_tangle_10}
 
 
 # ============ 解析输入 ============
@@ -5382,6 +5393,30 @@ def render_charts(pairs, _):
                        'letterSpacing': '0.5px'}))
         return spans
 
+    def _ma10_badge(info):
+        """MA10 纠缠度简短徽章"""
+        mt10 = info.get('ma_tangle_10', {})
+        combined = mt10.get('combined', 'warmup')
+        s1 = mt10.get('state_1m', 'warmup')
+        s5 = mt10.get('state_5m', 'warmup')
+        _SAFE = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
+        if combined == 'warmup':
+            return html.Span('  M10:预热', style={'color': '#666', 'fontSize': '10px', 'marginLeft': '4px'})
+        if combined == 'safe':
+            label = '纠缠'
+            if s1.startswith('trans_') or s5.startswith('trans_'):
+                label = '趋→纠'
+            return html.Span(f'  M10:{label}', style={
+                'color': '#7B68EE', 'fontSize': '10px', 'marginLeft': '4px',
+                'backgroundColor': 'rgba(123,104,238,0.12)', 'padding': '1px 4px',
+                'borderRadius': '3px'})
+        arrow = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '') or \
+                {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
+        return html.Span(f'  M10:趋势{arrow}', style={
+            'color': '#CD853F', 'fontSize': '10px', 'marginLeft': '4px',
+            'backgroundColor': 'rgba(205,133,63,0.1)', 'padding': '1px 4px',
+            'borderRadius': '3px'})
+
     def _ma_tangle_badge(info):
         """根据 MA 纠缠度状态和品种分级生成徽章 Span（含等级字母标注）"""
         mt = info.get('ma_tangle', {})
@@ -5460,6 +5495,7 @@ def render_charts(pairs, _):
         ]
         header_parts.extend(_activity_spans(info))
         header_parts.append(_ma_tangle_badge(info))
+        header_parts.append(_ma10_badge(info))
         # 两腿失衡警告
         leg_ratio = info.get('leg_ratio', 1)
         if leg_ratio > 1.5:
@@ -5517,6 +5553,7 @@ def render_charts(pairs, _):
         ]
         header_parts.extend(_activity_spans(info))
         header_parts.append(_ma_tangle_badge(info))
+        header_parts.append(_ma10_badge(info))
         if ap.get('v6_tag'):
             header_parts.append(html.Span(
                 f'  {ap["v6_tag"]}',
