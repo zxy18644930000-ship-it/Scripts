@@ -3009,6 +3009,465 @@ _NO_NIGHT_SESSION = {
 }
 
 
+# === 模拟交易系统 (历史回测 + 实时模拟盘) ===
+import os as _os
+_SIM_CACHE = {'ts': 0, 'result': None}
+_SIM_PAPER_FILE = _os.path.expanduser('~/state/sim_paper_trade.json')
+
+_NIGHT_CLOSE_HM = {
+    'AU': (2, 25), 'AG': (2, 25), 'SC': (2, 25),
+    'CU': (0, 55), 'AL': (0, 55), 'ZN': (0, 55), 'PB': (0, 55),
+    'NI': (0, 55), 'SN': (0, 55), 'AO': (0, 55),
+}
+
+
+def _sim_strangle_bars(cur, call_sym, put_sym, entry_call, entry_put,
+                       tp_coeff, sl_ratio, dte, dt_start, dt_end):
+    """逐分钟模拟宽跨持仓，返回 {exit_time, exit_sum, pnl, pnl_pct, reason} 或 None"""
+    entry_sum = entry_call + entry_put
+    if entry_sum <= 0 or dte <= 0:
+        return None
+
+    cur.execute("""SELECT datetime, close_price FROM dbbardata
+        WHERE symbol=? AND datetime BETWEEN ? AND ? ORDER BY datetime""",
+        (call_sym, dt_start, dt_end))
+    c_bars = {r[0]: r[1] for r in cur.fetchall() if r[1] and r[1] > 0}
+
+    cur.execute("""SELECT datetime, close_price FROM dbbardata
+        WHERE symbol=? AND datetime BETWEEN ? AND ? ORDER BY datetime""",
+        (put_sym, dt_start, dt_end))
+    p_bars = {r[0]: r[1] for r in cur.fetchall() if r[1] and r[1] > 0}
+
+    all_ts = sorted(set(c_bars.keys()) | set(p_bars.keys()))
+    if not all_ts:
+        return None
+
+    last_c, last_p = entry_call, entry_put
+    tp_threshold = entry_sum * tp_coeff / dte
+
+    for ts in all_ts:
+        c_px = c_bars.get(ts, last_c)
+        p_px = p_bars.get(ts, last_p)
+        last_c, last_p = c_px, p_px
+        current_sum = c_px + p_px
+        pnl = entry_sum - current_sum
+
+        if pnl >= tp_threshold:
+            return {'exit_time': ts, 'exit_sum': current_sum,
+                    'pnl': pnl, 'pnl_pct': pnl / entry_sum * 100, 'reason': '止盈'}
+
+        if sl_ratio < 900:
+            min_leg = min(c_px, p_px)
+            if min_leg > 0 and max(c_px, p_px) / min_leg >= sl_ratio:
+                return {'exit_time': ts, 'exit_sum': current_sum,
+                        'pnl': pnl, 'pnl_pct': pnl / entry_sum * 100, 'reason': '止损'}
+
+    final_sum = last_c + last_p
+    final_pnl = entry_sum - final_sum
+    return {'exit_time': all_ts[-1], 'exit_sum': final_sum,
+            'pnl': final_pnl, 'pnl_pct': final_pnl / entry_sum * 100, 'reason': '强平'}
+
+
+def _run_historical_sim(top_n=5, max_days=8):
+    """历史回测: 最近 max_days 个交易夜盘, V6 Top-N 宽跨, 方案A(当晚)/B(次日) 对比"""
+    import time as _time
+    now = _time.time()
+    if _SIM_CACHE['result'] and now - _SIM_CACHE['ts'] < 300:
+        return _SIM_CACHE['result']
+
+    db = get_db()
+    cur = db.cursor()
+    today_d = datetime.now().date()
+
+    cur.execute("""SELECT DISTINCT date(datetime) FROM dbbardata
+        WHERE CAST(substr(datetime,12,2) AS INTEGER) >= 21
+        ORDER BY date(datetime) DESC LIMIT ?""", (max_days + 2,))
+    night_dates = [r[0] for r in cur.fetchall()]
+
+    cur.execute("""SELECT DISTINCT date(datetime) FROM dbbardata
+        WHERE CAST(substr(datetime,12,2) AS INTEGER) BETWEEN 9 AND 14
+        ORDER BY date(datetime) ASC""")
+    day_dates_asc = [r[0] for r in cur.fetchall()]
+
+    trades = []
+
+    for night_d_str in night_dates:
+        night_d = date.fromisoformat(night_d_str)
+        if night_d >= today_d:
+            continue
+
+        next_day_str = None
+        for dd in day_dates_asc:
+            if dd > night_d_str:
+                next_day_str = dd
+                break
+
+        scored = []
+        for prod, info in _V6_CONFIG.items():
+            if prod.upper() in _NO_NIGHT_SESSION:
+                continue
+            ex = info['ex']
+            months = info.get('months', list(range(1, 13)))
+            for mo_off in range(0, 8):
+                yr, mo = night_d.year, night_d.month + mo_off
+                if mo > 12:
+                    yr += 1; mo -= 12
+                if mo not in months:
+                    continue
+                exp = _official_expiry(ex, yr, mo, _trading_cal, product_code=prod.upper())
+                if not exp:
+                    continue
+                dte = (exp - night_d).days
+                if dte < 1 or dte > 200:
+                    continue
+                for bname, blo, bhi in _DTE_RANGES:
+                    if blo <= dte <= bhi and bname in info:
+                        params = info[bname]
+                        if not str(params['entry']).startswith('night'):
+                            continue
+                        contract = f'{prod}{yr % 100:02d}{mo:02d}'
+                        scored.append({
+                            'prod': prod, 'name': info['name'], 'ex': ex,
+                            'contract': contract, 'dte': dte,
+                            'sharpe': params['sharpe'], 'wr': params['wr'],
+                            'tp': params['tp'], 'sl': params['sl'],
+                        })
+                        break
+
+        scored.sort(key=lambda x: x['sharpe'], reverse=True)
+
+        sim_count = 0
+        for item in scored:
+            if sim_count >= top_n:
+                break
+            prod = item['prod']
+            contract = item['contract']
+            ex = item['ex']
+            dte = item['dte']
+
+            _digits = contract[len(prod):]
+            if ex == 'CZCE':
+                fut_sym = f'{prod.upper()}{_digits[-3:]}'
+            else:
+                fut_sym = f'{prod.lower()}{_digits}'
+
+            entry_ws = f'{night_d_str} 21:04:00'
+            entry_we = f'{night_d_str} 21:10:00'
+
+            cur.execute("""SELECT close_price FROM dbbardata
+                WHERE symbol=? AND datetime BETWEEN ? AND ?
+                ORDER BY datetime ASC LIMIT 1""",
+                (fut_sym, entry_ws, entry_we))
+            row = cur.fetchone()
+            if not row or not row[0]:
+                continue
+            fut_px = row[0]
+
+            if ex == 'CZCE':
+                opt_prefix = prod.upper() + _digits[-3:]
+            else:
+                opt_prefix = prod.lower() + _digits
+            pats = [f'{opt_prefix}C%', f'{opt_prefix}P%',
+                    f'{opt_prefix}-C-%', f'{opt_prefix}-P-%']
+
+            cur.execute("""SELECT b.symbol, b.close_price, b.volume
+                FROM dbbardata b INNER JOIN (
+                    SELECT symbol, MAX(datetime) as mdt FROM dbbardata
+                    WHERE datetime BETWEEN ? AND ?
+                    AND (symbol LIKE ? OR symbol LIKE ? OR symbol LIKE ? OR symbol LIKE ?)
+                    GROUP BY symbol
+                ) m ON b.symbol=m.symbol AND b.datetime=m.mdt""",
+                (entry_ws, entry_we, *pats))
+
+            calls, puts = [], []
+            for sym, px, vol in cur.fetchall():
+                if not px or px <= 0:
+                    continue
+                parsed = _parse_contract(sym)
+                if not parsed:
+                    continue
+                _, _mo, cp, strike = parsed
+                if cp == 'C' and strike > fut_px:
+                    otm_pct = (strike - fut_px) / fut_px
+                    if 0.02 <= otm_pct <= 0.15:
+                        calls.append((sym, px, vol or 0, strike))
+                elif cp == 'P' and strike < fut_px:
+                    otm_pct = (fut_px - strike) / fut_px
+                    if 0.02 <= otm_pct <= 0.15:
+                        puts.append((sym, px, vol or 0, strike))
+
+            if not calls or not puts:
+                continue
+
+            best = None
+            for c_sym, c_px, c_vol, c_k in sorted(calls, key=lambda x: x[3] - fut_px)[:8]:
+                for p_sym, p_px, p_vol, p_k in sorted(puts, key=lambda x: fut_px - x[3])[:8]:
+                    if c_px <= 0 or p_px <= 0:
+                        continue
+                    psum = c_px + p_px
+                    if psum < 4:
+                        continue
+                    ratio = max(c_px, p_px) / min(c_px, p_px)
+                    if ratio > 2.5:
+                        continue
+                    sym_score = max(0, 1.0 - (ratio - 1.0) * 0.6)
+                    if not best or sym_score > best['score']:
+                        best = {'c_sym': c_sym, 'p_sym': p_sym,
+                                'c_px': c_px, 'p_px': p_px,
+                                'c_k': c_k, 'p_k': p_k,
+                                'psum': psum, 'score': sym_score}
+
+            if not best:
+                continue
+
+            close_hm = _NIGHT_CLOSE_HM.get(prod.upper(), (22, 55))
+            next_d = night_d + timedelta(days=1)
+            next_d_fmt = next_d.strftime('%Y-%m-%d')
+
+            if close_hm[0] < 21:
+                plan_a_end = f'{next_d_fmt} {close_hm[0]:02d}:{close_hm[1]:02d}:00'
+            else:
+                plan_a_end = f'{night_d_str} {close_hm[0]:02d}:{close_hm[1]:02d}:00'
+
+            sim_start = f'{night_d_str} 21:05:00'
+
+            result_a = _sim_strangle_bars(
+                cur, best['c_sym'], best['p_sym'],
+                best['c_px'], best['p_px'],
+                item['tp'], item['sl'], dte, sim_start, plan_a_end)
+
+            plan_b_end = f'{next_day_str} 11:25:00' if next_day_str else plan_a_end
+            result_b = _sim_strangle_bars(
+                cur, best['c_sym'], best['p_sym'],
+                best['c_px'], best['p_px'],
+                item['tp'], item['sl'], dte,
+                sim_start, plan_b_end) if next_day_str else None
+
+            trades.append({
+                'date': night_d_str, 'prod': prod, 'name': item['name'],
+                'call_sym': best['c_sym'], 'put_sym': best['p_sym'],
+                'call_k': best['c_k'], 'put_k': best['p_k'],
+                'entry_sum': best['psum'], 'dte': dte,
+                'tp': item['tp'], 'sl': item['sl'],
+                'plan_a': result_a, 'plan_b': result_b,
+            })
+            sim_count += 1
+
+    valid_a = [t for t in trades if t['plan_a']]
+    valid_b = [t for t in trades if t['plan_b']]
+
+    summary = {
+        'total_trades': len(trades),
+        'days': len(set(t['date'] for t in trades)),
+        'plan_a': {
+            'count': len(valid_a),
+            'wins': sum(1 for t in valid_a if t['plan_a']['pnl'] > 0),
+            'total_pnl_pct': sum(t['plan_a']['pnl_pct'] for t in valid_a),
+            'avg_pnl_pct': sum(t['plan_a']['pnl_pct'] for t in valid_a) / max(len(valid_a), 1),
+            'tp_count': sum(1 for t in valid_a if t['plan_a']['reason'] == '止盈'),
+            'sl_count': sum(1 for t in valid_a if t['plan_a']['reason'] == '止损'),
+        },
+        'plan_b': {
+            'count': len(valid_b),
+            'wins': sum(1 for t in valid_b if t['plan_b']['pnl'] > 0),
+            'total_pnl_pct': sum(t['plan_b']['pnl_pct'] for t in valid_b),
+            'avg_pnl_pct': sum(t['plan_b']['pnl_pct'] for t in valid_b) / max(len(valid_b), 1),
+            'tp_count': sum(1 for t in valid_b if t['plan_b']['reason'] == '止盈'),
+            'sl_count': sum(1 for t in valid_b if t['plan_b']['reason'] == '止损'),
+        },
+    }
+
+    result = {'trades': trades, 'summary': summary}
+    _SIM_CACHE['result'] = result
+    _SIM_CACHE['ts'] = _time.time()
+    return result
+
+
+def _load_sim_paper():
+    """读取今日模拟盘状态"""
+    try:
+        with open(_SIM_PAPER_FILE, 'r') as f:
+            import json
+            data = json.load(f)
+            if data.get('date') == datetime.now().strftime('%Y-%m-%d'):
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _save_sim_paper(data):
+    """保存模拟盘状态"""
+    import json
+    _os.makedirs(_os.path.dirname(_SIM_PAPER_FILE), exist_ok=True)
+    with open(_SIM_PAPER_FILE, 'w') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _build_sim_section(unified_top5):
+    """构建模拟交易面板（历史回测 + 今日模拟盘），返回 html.Div 或 None"""
+    sim_children = []
+
+    # === Part 1: 历史回测 ===
+    try:
+        sim_result = _run_historical_sim(top_n=5, max_days=8)
+    except Exception as e:
+        sim_result = None
+        sim_children.append(html.Div(f'历史回测异常: {e}',
+            style={'color': '#f44336', 'padding': '10px'}))
+
+    if sim_result and sim_result['trades']:
+        trades = sim_result['trades']
+        summ = sim_result['summary']
+        sa, sb = summ['plan_a'], summ['plan_b']
+
+        wr_a = sa['wins'] / max(sa['count'], 1) * 100
+        wr_b = sb['wins'] / max(sb['count'], 1) * 100
+
+        sim_children.append(html.Div([
+            html.Span('模拟交易回测', style={
+                'color': '#00FF88', 'fontSize': '15px', 'fontWeight': 'bold'}),
+            html.Span(f'  最近{summ["days"]}个交易日 · 每晚Top5 · {summ["total_trades"]}笔',
+                style={'color': '#888', 'fontSize': '12px'}),
+        ], style={'padding': '10px 25px 5px', 'borderTop': '2px solid #00FF88'}))
+
+        # Summary cards
+        def _card(title, pnl, wr, wins, total, tp, sl, color):
+            pnl_c = '#00FF88' if pnl >= 0 else '#ff4444'
+            return html.Div([
+                html.Div(title, style={'color': color, 'fontWeight': 'bold', 'fontSize': '13px'}),
+                html.Div([
+                    html.Span(f'累计: ', style={'color': '#888'}),
+                    html.Span(f'{pnl:+.1f}%', style={'color': pnl_c, 'fontWeight': 'bold', 'fontSize': '16px'}),
+                ]),
+                html.Div([
+                    html.Span(f'均PnL: {pnl/max(total,1):+.2f}% ', style={'color': '#aaa', 'fontSize': '11px'}),
+                    html.Span(f'胜率: {wr:.0f}%({wins}/{total})', style={'color': '#FFD700', 'fontSize': '11px'}),
+                ]),
+                html.Div(f'止盈{tp} · 止损{sl} · 强平{total-tp-sl}',
+                    style={'color': '#666', 'fontSize': '10px'}),
+            ], style={'display': 'inline-block', 'width': '48%', 'verticalAlign': 'top',
+                      'padding': '8px 12px', 'backgroundColor': '#0a1a2a',
+                      'borderRadius': '6px', 'margin': '4px 1%'})
+
+        sim_children.append(html.Div([
+            _card('方案A: 当晚出仓', sa['total_pnl_pct'], wr_a, sa['wins'], sa['count'],
+                  sa['tp_count'], sa['sl_count'], '#4fc3f7'),
+            _card('方案B: 次日11:25出仓', sb['total_pnl_pct'], wr_b, sb['wins'], sb['count'],
+                  sb['tp_count'], sb['sl_count'], '#bb86fc'),
+        ], style={'padding': '0 20px'}))
+
+        # Trade detail table
+        th_s = {'color': '#666', 'padding': '3px 6px', 'textAlign': 'center',
+                'fontSize': '10px', 'borderBottom': '1px solid #333'}
+        hdr = html.Tr([
+            html.Th('日期', style=th_s), html.Th('品种', style=th_s),
+            html.Th('期权对', style=th_s), html.Th('进仓价', style=th_s),
+            html.Th('DTE', style=th_s),
+            html.Th('A出仓', style={**th_s, 'color': '#4fc3f7'}),
+            html.Th('A盈亏%', style={**th_s, 'color': '#4fc3f7'}),
+            html.Th('A原因', style={**th_s, 'color': '#4fc3f7'}),
+            html.Th('B出仓', style={**th_s, 'color': '#bb86fc'}),
+            html.Th('B盈亏%', style={**th_s, 'color': '#bb86fc'}),
+            html.Th('B原因', style={**th_s, 'color': '#bb86fc'}),
+        ])
+
+        rows = []
+        prev_date = None
+        for t in sorted(trades, key=lambda x: (x['date'], -x.get('entry_sum', 0)), reverse=True):
+            date_label = t['date'][5:] if t['date'] != prev_date else ''
+            prev_date = t['date']
+            ra = t['plan_a']
+            rb = t['plan_b']
+
+            def _pnl_cell(r):
+                if not r:
+                    return '-', '#666', '-'
+                c = '#00FF88' if r['pnl_pct'] > 0 else ('#ff4444' if r['pnl_pct'] < 0 else '#888')
+                exit_t = r['exit_time'][-8:-3] if len(r['exit_time']) > 8 else r['exit_time']
+                return f'{r["pnl_pct"]:+.1f}%', c, r['reason']
+
+            a_pnl, a_c, a_reason = _pnl_cell(ra)
+            b_pnl, b_c, b_reason = _pnl_cell(rb)
+            a_exit = f'{ra["exit_sum"]:.0f}' if ra else '-'
+            b_exit = f'{rb["exit_sum"]:.0f}' if rb else '-'
+
+            td_s = {'padding': '3px 6px', 'textAlign': 'center', 'fontSize': '11px'}
+            rows.append(html.Tr([
+                html.Td(date_label, style={**td_s, 'color': '#aaa', 'textAlign': 'left'}),
+                html.Td(t['name'], style={**td_s, 'color': '#fff'}),
+                html.Td(f"C{t['call_k']:.0f}+P{t['put_k']:.0f}", style={**td_s, 'color': '#888', 'fontSize': '10px'}),
+                html.Td(f"{t['entry_sum']:.0f}", style={**td_s, 'color': '#FFD700'}),
+                html.Td(str(t['dte']), style={**td_s, 'color': '#888'}),
+                html.Td(a_exit, style={**td_s, 'color': '#4fc3f7'}),
+                html.Td(a_pnl, style={**td_s, 'color': a_c, 'fontWeight': 'bold'}),
+                html.Td(a_reason, style={**td_s, 'color': '#555', 'fontSize': '10px'}),
+                html.Td(b_exit, style={**td_s, 'color': '#bb86fc'}),
+                html.Td(b_pnl, style={**td_s, 'color': b_c, 'fontWeight': 'bold'}),
+                html.Td(b_reason, style={**td_s, 'color': '#555', 'fontSize': '10px'}),
+            ], style={'borderBottom': '1px solid #1a1a3e'}))
+
+        sim_children.append(html.Div(
+            html.Table([html.Thead(hdr), html.Tbody(rows)],
+                style={'width': '100%', 'borderCollapse': 'collapse'}),
+            style={'padding': '5px 15px', 'overflowX': 'auto', 'maxHeight': '350px', 'overflowY': 'auto'}))
+
+        sim_children.append(html.Div(
+            '策略: 21:05进仓V6 Sharpe排名前5(仅夜盘品种) · TP=权利金/DTE×tp_coeff · SL=腿比 · 数据源CTP',
+            style={'color': '#555', 'fontSize': '10px', 'padding': '4px 25px'}))
+    elif sim_result:
+        sim_children.append(html.Div('CTP数据库无足够夜盘历史数据，至少需要2个交易日',
+            style={'color': '#888', 'padding': '20px', 'textAlign': 'center'}))
+
+    # === Part 2: 今日实时模拟盘 ===
+    if unified_top5:
+        h = datetime.now().hour
+        in_night = h >= 21 or h < 3
+        in_day = 9 <= h < 15
+
+        paper = _load_sim_paper()
+        if not paper and unified_top5 and (in_night or in_day):
+            session = 'night' if in_night else 'day'
+            positions = []
+            for u in unified_top5[:5]:
+                positions.append({
+                    'product': u.get('prod', ''),
+                    'name': u.get('cn', u.get('name', '')),
+                    'call_sym': u.get('call_sym', ''),
+                    'put_sym': u.get('put_sym', ''),
+                    'call_k': u.get('call_k', 0),
+                    'put_k': u.get('put_k', 0),
+                    'entry_call': u.get('call_px', 0),
+                    'entry_put': u.get('put_px', 0),
+                    'entry_sum': u.get('psum', 0),
+                    'entry_time': datetime.now().strftime('%H:%M'),
+                    'dte': u.get('dte', 30),
+                    'tp': u.get('tp', 0.5),
+                    'sl': u.get('sl', 3.0),
+                    'status': 'holding',
+                })
+            paper = {
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'session': session,
+                'entry_ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'positions': positions,
+            }
+            _save_sim_paper(paper)
+
+        if paper and paper.get('positions'):
+            sim_children.append(html.Div([
+                html.Span('今日模拟盘', style={
+                    'color': '#FFD700', 'fontSize': '14px', 'fontWeight': 'bold'}),
+                html.Span(f"  {paper.get('session','?')}盘 · 进仓{paper.get('entry_ts','?')[11:16]}",
+                    style={'color': '#888', 'fontSize': '12px'}),
+            ], style={'padding': '10px 25px 5px', 'borderTop': '2px solid #FFD700'}))
+            sim_children.append(html.Div(id='sim-live-panel'))
+
+    if not sim_children:
+        return None
+    return html.Div(sim_children, style={'backgroundColor': '#0a0a1a'})
+
+
 def _get_session_context():
     """根据当前时间返回 (session_label, filter_night_only)
     session_label: 面板标题用的文字
@@ -3829,6 +4288,7 @@ def serve_layout():
     dcc.Interval(id='timer', interval=REFRESH_MS, n_intervals=0),
     dcc.Interval(id='account-timer', interval=2000, n_intervals=0),  # 持仓/CTP 2秒刷新
     dcc.Interval(id='load-timer', interval=2000, disabled=True),
+    dcc.Interval(id='sim-live-interval', interval=30000, n_intervals=0),  # 模拟盘30秒刷新
 
     # 回到顶部悬浮按钮
     html.Button('TOP', id='back-to-top-btn', n_clicks=0, style={
@@ -5401,25 +5861,45 @@ def render_charts(pairs, _):
         return spans
 
     def _ma10_badge(info):
-        """MA10 纠缠度简短徽章"""
+        """MA10 纠缠度简短徽章（区分 1m/5m，与 MA20 一致）"""
         mt10 = info.get('ma_tangle_10', {})
         combined = mt10.get('combined', 'warmup')
         s1 = mt10.get('state_1m', 'warmup')
         s5 = mt10.get('state_5m', 'warmup')
+        product = _extract_product(info.get('futures_sym', '') or '')
+        grade = _get_ma_grade(product) or '?'
         _SAFE = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
+        _TRANS_LABELS = {
+            'trans_touch': '首触MA',
+            'trans_cross': '反穿站稳',
+            'trans_oscillate': '穿梭',
+        }
         if combined == 'warmup':
-            return html.Span('  M10:预热', style={'color': '#666', 'fontSize': '10px', 'marginLeft': '4px'})
+            return html.Span(f'  [{grade}]M10:预热', style={'color': '#666', 'fontSize': '10px', 'marginLeft': '4px'})
         if combined == 'safe':
-            label = '纠缠'
             if s1.startswith('trans_') or s5.startswith('trans_'):
-                label = '趋→纠'
-            return html.Span(f'  M10:{label}', style={
+                t_parts = []
+                if s1.startswith('trans_'):
+                    t_parts.append(f'1m{_TRANS_LABELS.get(s1, "")}')
+                if s5.startswith('trans_'):
+                    t_parts.append(f'5m{_TRANS_LABELS.get(s5, "")}')
+                label = f'[{grade}]M10:趋→纠 {"+".join(t_parts)}'
+            else:
+                label = f'[{grade}]M10:纠缠'
+            return html.Span(f'  {label}', style={
                 'color': '#7B68EE', 'fontSize': '10px', 'marginLeft': '4px',
                 'backgroundColor': 'rgba(123,104,238,0.12)', 'padding': '1px 4px',
                 'borderRadius': '3px'})
-        arrow = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '') or \
-                {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
-        return html.Span(f'  M10:趋势{arrow}', style={
+        # warning: 分别显示 1m 和 5m 的趋势
+        parts = []
+        if s1 not in _SAFE:
+            a1 = {'trending_up': '↑', 'trending_down': '↓'}.get(s1, '')
+            parts.append(f'1m{a1}')
+        if s5 not in _SAFE:
+            a5 = {'trending_up': '↑', 'trending_down': '↓'}.get(s5, '')
+            parts.append(f'5m{a5}')
+        detail = '+'.join(parts) if parts else '趋势'
+        return html.Span(f'  [{grade}]M10:趋势 {detail}', style={
             'color': '#CD853F', 'fontSize': '10px', 'marginLeft': '4px',
             'backgroundColor': 'rgba(205,133,63,0.1)', 'padding': '1px 4px',
             'borderRadius': '3px'})
@@ -7272,10 +7752,146 @@ def toggle_plan(n_clicks):
                   'backgroundColor': '#1a0a0a' if n_critical else '#1a1a0a'})
         panel.children.append(alert_panel)
 
+    # === 模拟交易面板 ===
+    try:
+        _sim_top5 = unified[:5] if unified else []
+        sim_section = _build_sim_section(_sim_top5)
+        if sim_section:
+            panel.children.append(sim_section)
+    except Exception as _sim_err:
+        panel.children.append(html.Div(f'模拟交易加载异常: {_sim_err}',
+            style={'color': '#f44336', 'padding': '10px 25px', 'fontSize': '11px'}))
+
     return panel, {
         'display': 'block', 'backgroundColor': '#111827',
         'borderBottom': '3px solid #ff9800', 'marginBottom': '5px',
     }
+
+
+@app.callback(
+    Output('sim-live-panel', 'children'),
+    Input('sim-live-interval', 'n_intervals'),
+    prevent_initial_call=True,
+)
+def update_sim_live(n):
+    """每30秒更新模拟盘浮动盈亏"""
+    paper = _load_sim_paper()
+    if not paper or not paper.get('positions'):
+        return no_update
+
+    h = datetime.now().hour
+    if not (h >= 21 or h < 3 or 9 <= h < 15):
+        return no_update
+
+    db = get_db()
+    cur = db.cursor()
+    cutoff = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
+
+    th_s = {'color': '#666', 'padding': '4px 8px', 'textAlign': 'center',
+            'fontSize': '10px', 'borderBottom': '1px solid #333'}
+    hdr = html.Tr([
+        html.Th('品种', style=th_s), html.Th('期权对', style=th_s),
+        html.Th('进仓价', style=th_s), html.Th('当前价', style=th_s),
+        html.Th('浮盈', style=th_s), html.Th('浮盈%', style=th_s),
+        html.Th('状态', style=th_s),
+    ])
+
+    rows = []
+    total_pnl_pct = 0
+    n_holding = 0
+
+    for pos in paper['positions']:
+        call_sym = pos.get('call_sym', '')
+        put_sym = pos.get('put_sym', '')
+        entry_sum = pos.get('entry_sum', 0)
+
+        if pos.get('status') == 'closed':
+            exit_sum = pos.get('exit_sum', entry_sum)
+            pnl = entry_sum - exit_sum
+            pnl_pct = pnl / entry_sum * 100 if entry_sum > 0 else 0
+            total_pnl_pct += pnl_pct
+            pnl_c = '#00FF88' if pnl > 0 else ('#ff4444' if pnl < 0 else '#888')
+            td_s = {'padding': '4px 8px', 'textAlign': 'center', 'fontSize': '11px'}
+            rows.append(html.Tr([
+                html.Td(pos.get('name', ''), style={**td_s, 'color': '#888'}),
+                html.Td(f"C{pos.get('call_k',0):.0f}+P{pos.get('put_k',0):.0f}",
+                    style={**td_s, 'color': '#555', 'fontSize': '10px'}),
+                html.Td(f'{entry_sum:.0f}', style={**td_s, 'color': '#FFD700'}),
+                html.Td(f'{exit_sum:.0f}', style={**td_s, 'color': '#aaa'}),
+                html.Td(f'{pnl:+.1f}', style={**td_s, 'color': pnl_c, 'fontWeight': 'bold'}),
+                html.Td(f'{pnl_pct:+.1f}%', style={**td_s, 'color': pnl_c, 'fontWeight': 'bold'}),
+                html.Td(f"已平({pos.get('exit_reason','')})",
+                    style={**td_s, 'color': '#666', 'fontSize': '10px'}),
+            ], style={'borderBottom': '1px solid #1a1a3e', 'opacity': '0.6'}))
+            continue
+
+        cur.execute("""SELECT close_price FROM dbbardata
+            WHERE symbol=? AND datetime>=? ORDER BY datetime DESC LIMIT 1""",
+            (call_sym, cutoff))
+        c_row = cur.fetchone()
+        cur.execute("""SELECT close_price FROM dbbardata
+            WHERE symbol=? AND datetime>=? ORDER BY datetime DESC LIMIT 1""",
+            (put_sym, cutoff))
+        p_row = cur.fetchone()
+
+        c_px = c_row[0] if c_row and c_row[0] else pos.get('entry_call', 0)
+        p_px = p_row[0] if p_row and p_row[0] else pos.get('entry_put', 0)
+        current_sum = c_px + p_px
+        pnl = entry_sum - current_sum
+        pnl_pct = pnl / entry_sum * 100 if entry_sum > 0 else 0
+        total_pnl_pct += pnl_pct
+        n_holding += 1
+
+        dte = pos.get('dte', 30)
+        tp_coeff = pos.get('tp', 0.5)
+        sl_ratio = pos.get('sl', 3.0)
+        tp_threshold = entry_sum * tp_coeff / dte if dte > 0 else 0
+        status = '持仓中'
+        status_c = '#00BFFF'
+
+        if pnl >= tp_threshold:
+            status = '触发止盈'
+            status_c = '#00FF88'
+            pos['status'] = 'closed'
+            pos['exit_sum'] = current_sum
+            pos['exit_reason'] = '止盈'
+        elif sl_ratio < 900 and min(c_px, p_px) > 0 and max(c_px, p_px) / min(c_px, p_px) >= sl_ratio:
+            status = '触发止损'
+            status_c = '#ff4444'
+            pos['status'] = 'closed'
+            pos['exit_sum'] = current_sum
+            pos['exit_reason'] = '止损'
+
+        pnl_c = '#00FF88' if pnl > 0 else ('#ff4444' if pnl < 0 else '#888')
+        td_s = {'padding': '4px 8px', 'textAlign': 'center', 'fontSize': '11px'}
+        rows.append(html.Tr([
+            html.Td(pos.get('name', ''), style={**td_s, 'color': '#fff'}),
+            html.Td(f"C{pos.get('call_k',0):.0f}+P{pos.get('put_k',0):.0f}",
+                style={**td_s, 'color': '#888', 'fontSize': '10px'}),
+            html.Td(f'{entry_sum:.0f}', style={**td_s, 'color': '#FFD700'}),
+            html.Td(f'{current_sum:.0f}', style={**td_s, 'color': '#aaa'}),
+            html.Td(f'{pnl:+.1f}', style={**td_s, 'color': pnl_c, 'fontWeight': 'bold'}),
+            html.Td(f'{pnl_pct:+.1f}%', style={**td_s, 'color': pnl_c, 'fontWeight': 'bold'}),
+            html.Td(status, style={**td_s, 'color': status_c, 'fontWeight': 'bold'}),
+        ], style={'borderBottom': '1px solid #1a1a3e'}))
+
+    if any(pos.get('status') == 'closed' for pos in paper['positions']):
+        _save_sim_paper(paper)
+
+    total_c = '#00FF88' if total_pnl_pct > 0 else ('#ff4444' if total_pnl_pct < 0 else '#888')
+    td_s = {'padding': '4px 8px', 'textAlign': 'center', 'fontSize': '11px'}
+    rows.append(html.Tr([
+        html.Td('合计', style={**td_s, 'color': '#FFD700', 'fontWeight': 'bold'}),
+        html.Td(''), html.Td(''), html.Td(''),
+        html.Td('', style=td_s),
+        html.Td(f'{total_pnl_pct:+.1f}%', style={**td_s, 'color': total_c, 'fontWeight': 'bold', 'fontSize': '13px'}),
+        html.Td(f'{n_holding}持仓', style={**td_s, 'color': '#888'}),
+    ], style={'borderTop': '2px solid #333'}))
+
+    return html.Div(
+        html.Table([html.Thead(hdr), html.Tbody(rows)],
+            style={'width': '100%', 'borderCollapse': 'collapse'}),
+        style={'padding': '5px 15px'})
 
 
 @app.callback(
