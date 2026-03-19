@@ -1602,11 +1602,15 @@
       "category": "交易策略",
       "name": "趋势→纠缠转换瞬间卖出宽跨(时段内持仓)",
       "statement": "期货MA由趋势转为纠缠的转换瞬间, 若价格之和有轻度向上偏离(布林线lite: price_sum > 双中轨之和*(1+pct)), 则卖出宽跨. 持仓到当前时段收盘, 期间止盈止损. 核心逻辑: 转换点IV仍高但即将回落, 卖方享受IV回归+Theta双收益",
-      "confidence": 0.50,
-      "evidence_count": 0,
+      "confidence": 0.72,
+      "evidence_count": 3,
       "first_observed": "2026-03-19",
       "last_updated": "2026-03-19",
-      "data_points": [],
+      "data_points": [
+        "2026-03-19 M(豆粕): 最近5个合约, boll0%_tp5%: 209笔 mean+0.736% WR37.3% Sharpe0.212; boll5%_tp10%: 33笔 mean+1.687% WR18.2% Sharpe0.391(最优). 止损20.6%, 时段收盘65-78%",
+        "2026-03-19 OI(菜油): 最近5个合约, boll0%_tp5%: 143笔 mean+1.086% WR46.9% Sharpe0.275; boll2%_tp5%: 38笔 mean+1.268% WR50% Sharpe0.338(最优). 止损21-29%",
+        "2026-03-19 RM(菜粕): 最近5个合约, boll0%_tp5%: 97笔 mean+1.060% WR51.5% Sharpe0.211(最优). 止损仅2-5%. boll5%: 5笔 mean+7.63% WR100% (样本太小)"
+      ],
       "parameters": {
         "transition_detection": "B046 classify_new(): prev=trending → curr∈{entangled, trans_touch, trans_cross, trans_oscillate}",
         "boll_lite_pct_grid": [0.0, 0.02, 0.05],
@@ -1618,7 +1622,12 @@
         "session_rule": "日盘进仓→15:00前平仓; 夜盘进仓→夜盘收盘前平仓"
       },
       "backtest_script": "~/Scripts/B047_transition_session_backtest.py",
-      "note": "待回测验证。基于B046转换检测+布林线lite+时段持仓。与B046区别: B046固定持有30/60m, B047持有到时段收盘+止盈止损"
+      "backtest_results": {
+        "M_豆粕": {"best": "boll5%_tp10%", "n": 33, "mean": "+1.687%", "wr": "18.2%", "sharpe": 0.391},
+        "OI_菜油": {"best": "boll2%_tp5%", "n": 38, "mean": "+1.268%", "wr": "50.0%", "sharpe": 0.338},
+        "RM_菜粕": {"best": "boll0%_tp5%", "n": 97, "mean": "+1.060%", "wr": "51.5%", "sharpe": 0.211}
+      },
+      "note": "3品种验证: 转换时刻卖出宽跨持有到时段收盘整体盈利. boll_lite偏离越高→信号越少但PnL越高. tp5%较好(尽快兑现利润). 止损率15-22%(M/OI) vs 2-5%(RM). 大部分持仓到收盘(65-96%). 需全市场回测(远程服务器)验证更多品种和更长历史"
     },
     {
       "id": "ma_tangle_filter",
@@ -1626,7 +1635,7 @@
       "description": "1m+5m双时间框架, B045三维判定(穿越次数+偏向比例+40MA等距)替代旧LB10/T7. 纠缠状态入场卖OTM宽跨更安全，核心价值: ①消除尾部风险 ②Switch效应 ③40MA过滤假趋势 ④穿越次数捕捉震荡(解决旧定义几乎选不出纠缠的问题)",
       "confidence": 0.91,
       "evidence_count": 90,
-      "source": "B043,B044,B045,B046",
+      "source": "B043,B044,B045,B046,B047",
       "last_validated": "2026-03-18",
       "notes": "B043: 28/44(64%). B044: 40MA确认→30/44(68%). B045三维判定: 38/44(86.4%), 最优CT=3, 纠缠检出64.3%(vs旧定义几乎0%). 被降级交易平均比真趋势多赚0.2-0.3%. AG尾部保护59.3x. OTM比ATM更有效. B046: 转换3子类型(首触MA/反穿站稳/穿梭), 46品种全量, 30m安全池ΔPnL=+0.084%(76%正), 60m ΔPnL=+0.060%(63%正). 反穿站稳60m最强(+0.431%,83%品种正)",
       "parameters": {
