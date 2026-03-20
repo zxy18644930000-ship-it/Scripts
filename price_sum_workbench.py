@@ -2097,6 +2097,130 @@ _ma_prev_state = {}   # {futures_sym: {'state_1m': ..., 'state_5m': ...}} — B0
 _b047_opportunities = {}  # {futures_sym: {触发信息}} — 活跃的 B047 转换机会
 _B047_BOLL_LITE_PCT = 0.05  # 布林线 lite 偏离阈值（回测最优 boll5%）
 
+
+def _b047_db_ensure():
+    conn = sqlite3.connect(B047_DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS b047_opportunities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        futures_sym TEXT,
+        call_sym TEXT,
+        put_sym TEXT,
+        pair_key TEXT,
+        sum_now REAL,
+        boll_middle REAL,
+        deviation_pct REAL,
+        transition TEXT,
+        session TEXT,
+        session_end TEXT,
+        trigger_time TEXT
+    )''')
+    conn.commit()
+    return conn
+
+
+def _b047_rec_tuple(rec_db):
+    """INSERT 用的 12 元组，与表列顺序一致。"""
+    return (
+        rec_db.get('created_at', ''),
+        rec_db.get('futures_sym', ''),
+        rec_db.get('call_sym', ''),
+        rec_db.get('put_sym', ''),
+        rec_db.get('pair_key', ''),
+        rec_db.get('sum_now', 0),
+        rec_db.get('boll_middle', 0),
+        rec_db.get('deviation_pct', 0),
+        rec_db.get('transition', ''),
+        rec_db.get('session', ''),
+        rec_db.get('session_end', ''),
+        rec_db.get('trigger_time', ''),
+    )
+
+
+def _b047_db_insert(rec_db):
+    try:
+        conn = _b047_db_ensure()
+        conn.execute(
+            '''INSERT INTO b047_opportunities (
+                created_at, futures_sym, call_sym, put_sym, pair_key,
+                sum_now, boll_middle, deviation_pct, transition,
+                session, session_end, trigger_time
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+            _b047_rec_tuple(rec_db),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[B047] DB insert 失败: {e}')
+
+
+def _b047_backfill_missing_to_db(items):
+    """当前机会若在内存里但库里尚无该 pair_key（旧版插入失败等），补录一条。"""
+    if not items:
+        return
+    try:
+        conn = _b047_db_ensure()
+        for rec in items:
+            pk = rec.get('pair_key') or ''
+            if not pk:
+                continue
+            n = conn.execute(
+                'SELECT COUNT(*) FROM b047_opportunities WHERE pair_key=?',
+                (pk,),
+            ).fetchone()[0]
+            if n > 0:
+                continue
+            now = datetime.now()
+            rec_db = dict(rec)
+            rec_db['created_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(
+                '''INSERT INTO b047_opportunities (
+                    created_at, futures_sym, call_sym, put_sym, pair_key,
+                    sum_now, boll_middle, deviation_pct, transition,
+                    session, session_end, trigger_time
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                _b047_rec_tuple(rec_db),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[B047] 历史补录失败: {e}')
+
+
+def _load_b047_history(limit=80):
+    rows = []
+    try:
+        conn = _b047_db_ensure()
+        cur = conn.execute(
+            '''SELECT created_at, futures_sym, call_sym, put_sym, pair_key,
+                      sum_now, boll_middle, deviation_pct, transition,
+                      session, session_end, trigger_time
+               FROM b047_opportunities
+               ORDER BY datetime(created_at) DESC
+               LIMIT ?''',
+            (limit,),
+        )
+        for r in cur.fetchall():
+            rows.append({
+                'created_at': r[0] or '',
+                'futures_sym': r[1] or '',
+                'call_sym': r[2] or '',
+                'put_sym': r[3] or '',
+                'pair_key': r[4] or '',
+                'sum_now': r[5] or 0,
+                'boll_middle': r[6] or 0,
+                'deviation_pct': r[7] or 0,
+                'transition': r[8] or '',
+                'session': r[9] or '',
+                'session_end': r[10] or '',
+                'trigger_time': r[11] or '',
+            })
+        conn.close()
+    except Exception as e:
+        print(f'[B047] DB 读取历史失败: {e}')
+    return rows
+
+
 def _compute_ma_tangle_state(futures_sym, ma_period=None):
     """计算期货合约的 1m+5m 双时间框架 MA 纠缠度状态（B045三维判定）
     ma_period: 均线周期, 默认None=使用全局 _MA_PERIOD(20)"""
@@ -3014,6 +3138,11 @@ import os as _os
 _SIM_CACHE = {'ts': 0, 'result': None}
 _SIM_PAPER_FILE = _os.path.expanduser('~/state/sim_paper_trade.json')
 _SIM_HISTORY_FILE = _os.path.expanduser('~/state/sim_paper_history.json')
+# 今日计划预计算缓存（launchd 日盘/夜盘前写入，工作台优先读取）
+_PLAN_CACHE_DAY = _os.path.expanduser('~/state/today_plan_cache_day.json')
+_PLAN_CACHE_NIGHT = _os.path.expanduser('~/state/today_plan_cache_night.json')
+_PLAN_CACHE_VERSION = 1
+_PLAN_CACHE_MAX_AGE_SEC = 6 * 3600  # 6 小时内视为新鲜
 
 _NIGHT_CLOSE_HM = {
     'AU': (2, 25), 'AG': (2, 25), 'SC': (2, 25),
@@ -3604,6 +3733,63 @@ def _get_session_context():
     else:
         # 02:31 ~ 08:59 → 下一场是日盘
         return '日盘交易计划 (09:00开盘)', False
+
+
+def _get_session_context_override(force_night_session):
+    """供定时预计算固定时段语义。None=与 _get_session_context 相同。"""
+    if force_night_session is None:
+        return _get_session_context()
+    if force_night_session:
+        return '夜盘交易计划', True
+    return '日盘交易计划', False
+
+
+def _plan_cache_path(kind):
+    return _PLAN_CACHE_NIGHT if kind == 'night' else _PLAN_CACHE_DAY
+
+
+def _load_today_plan_cache(kind):
+    """读取预计算缓存。kind: 'day'|'night'。新鲜则返回 dict 含 payload，否则 None。"""
+    path = _plan_cache_path(kind)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception:
+        return None
+    if raw.get('version') != _PLAN_CACHE_VERSION:
+        return None
+    gen = raw.get('generated_at', '')
+    try:
+        gt = datetime.strptime(gen, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+    if (datetime.now() - gt).total_seconds() > _PLAN_CACHE_MAX_AGE_SEC:
+        return None
+    today = datetime.now().strftime('%Y-%m-%d')
+    pay = raw.get('payload') or {}
+    if pay.get('today_str') != today:
+        return None
+    return raw
+
+
+def _save_today_plan_cache(kind, payload):
+    """写入预计算缓存（供独立脚本与工作台共用）。"""
+    path = _plan_cache_path(kind)
+    raw = {
+        'version': _PLAN_CACHE_VERSION,
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'kind': kind,
+        'payload': payload,
+    }
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+
+    def _json_default(o):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        raise TypeError(type(o))
+
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2, default=_json_default)
 
 
 # VRP缓存（5分钟有效）
@@ -5584,8 +5770,10 @@ def render_charts(pairs, _):
     if not _v6_recommended_pairs and not _v6_preheat_started:
         _v6_preheat_started = True
         def _fill_v6():
+            global _v6_recommended_pairs
             try:
-                toggle_plan(1)
+                p = compute_today_plan_payload(None)
+                _v6_recommended_pairs = p['top_picks']
             except Exception:
                 pass
         threading.Thread(target=_fill_v6, daemon=True).start()
@@ -6813,7 +7001,8 @@ def toggle_b047_panel(n_clicks, opportunities):
                                    'cursor': 'pointer', 'fontSize': '13px', 'fontFamily': 'monospace'}))
         body = html.Div(rows, style={'maxHeight': '50vh', 'overflowY': 'auto'})
 
-    # 历史记录（从 DB 加载）
+    # 历史记录（从 DB 加载）；打开面板时把「当前」里缺库的补录进去（旧版插入曾失败）
+    _b047_backfill_missing_to_db(items)
     history = _load_b047_history(limit=80)
     hist_rows = []
     for i, rec in enumerate(history):
@@ -6832,12 +7021,25 @@ def toggle_b047_panel(n_clicks, opportunities):
                                'backgroundColor': 'rgba(255,105,180,0.04)', 'color': '#999',
                                'border': 'none', 'borderBottom': '1px solid #1a1a2e',
                                'cursor': 'pointer', 'fontSize': '12px', 'fontFamily': 'monospace'}))
-    hist_body = html.Div([
+    hist_hint = None
+    if not hist_rows:
+        hist_hint = html.Div(
+            '尚无持久化记录：仅在「某品种首次触发 B047」时写入数据库；条件较严（趋势→纠缠 + 价格之和高于中轨5% + 交易时段）。'
+            '若上方有当前机会但此处仍空，请再点一次「转换机会」刷新；仍无则尚未发生过可入库的触发。',
+            style={'color': '#666', 'fontSize': '11px', 'padding': '6px 20px 10px', 'lineHeight': '1.45',
+                   'borderBottom': '1px solid #2a2a4a'},
+        )
+    hist_children = [
         html.Div('历史记录（点击可定位到图表）', style={'color': '#666', 'fontSize': '12px',
                 'padding': '8px 20px', 'borderBottom': '1px solid #2a2a4a'}),
-        html.Div(hist_rows if hist_rows else [html.Div('暂无历史', style={'color': '#555', 'padding': '12px', 'fontSize': '12px'})],
-                 style={'maxHeight': '35vh', 'overflowY': 'auto'}),
-    ])
+    ]
+    if hist_hint:
+        hist_children.append(hist_hint)
+    hist_children.append(html.Div(
+        hist_rows if hist_rows else [html.Div('暂无历史', style={'color': '#555', 'padding': '12px', 'fontSize': '12px'})],
+        style={'maxHeight': '35vh', 'overflowY': 'auto'},
+    ))
+    hist_body = html.Div(hist_children)
 
     panel = html.Div([
         html.Div([
@@ -6905,17 +7107,8 @@ def toggle_vrp(n_clicks):
     }
 
 
-@app.callback(
-    Output('plan-panel', 'children'),
-    Output('plan-panel', 'style'),
-    Input('plan-btn', 'n_clicks'),
-    prevent_initial_call=True,
-)
-def toggle_plan(n_clicks):
-    """今日交易计划面板 — 8维度综合评分实时计算版"""
-    if not n_clicks or n_clicks % 2 == 0:
-        return no_update, {'display': 'none'}
-
+def compute_today_plan_payload(force_night_session=None):
+    """今日计划核心计算（可缓存/CLI 预计算）。force_night_session None=按当前时间；True/False=固定夜/日盘过滤。"""
     import math
     # 从CTP dashboard读取实际账户权益，未连接时回退50万
     _dash = _load_dashboard()
@@ -7172,7 +7365,7 @@ def toggle_plan(n_clicks):
     picks.sort(key=lambda x: x['composite'], reverse=True)
 
     # === 时段过滤：只显示当前可交易的品种+入场方式 ===
-    session_label, night_only = _get_session_context()
+    session_label, night_only = _get_session_context_override(force_night_session)
     all_picks_count = len(picks)
     if night_only:
         # 晚间：品种必须有夜盘 AND 入场方式必须是 night_*
@@ -7228,7 +7421,6 @@ def toggle_plan(n_clicks):
     if weekday == 4:
         factor_desc.append('周五效应')
 
-    plan_sections = []
     filter_note = f'  已过滤{filtered_count}个非当前时段品种' if filtered_count > 0 else ''
 
     # === 日内OTM宽跨卖出 — v6参数查表 (引用模块级 _V6_CONFIG) ===
@@ -7425,10 +7617,6 @@ def toggle_plan(n_clicks):
         _otm_remaining -= p['total_margin']
         _otm_total_margin += p['total_margin']
 
-    # 存入全局变量，供智能推荐使用
-    global _v6_recommended_pairs
-    _v6_recommended_pairs = top_picks
-
     # === 统一交易计划：合并8D评分 + 实际期权对 + 信念标签 ===
     # 8D分数查询表
     pick_lookup = {}
@@ -7476,7 +7664,40 @@ def toggle_plan(n_clicks):
 
     unified.sort(key=lambda x: x['composite_8d'], reverse=True)
 
-    # === 渲染统一交易计划表 ===
+    return {
+        'computed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'today_str': today_str,
+        'now_time': now_time,
+        'weekday': weekday,
+        'session_label': session_label,
+        'night_only': night_only,
+        'account': account,
+        '_acc_source': _acc_source,
+        'filtered_count': filtered_count,
+        'factor_desc': factor_desc,
+        'filter_note': filter_note,
+        'picks': picks,
+        'top_picks': top_picks,
+        'unified': unified,
+    }
+
+
+def render_plan_panel_from_payload(payload, from_cache=False):
+    """从 compute 结果或磁盘缓存渲染 Dash 面板。"""
+    today_str = payload['today_str']
+    now_time = payload['now_time']
+    weekday = payload['weekday']
+    session_label = payload['session_label']
+    night_only = payload['night_only']
+    account = payload['account']
+    _acc_source = payload['_acc_source']
+    filtered_count = payload['filtered_count']
+    factor_desc = payload['factor_desc']
+    filter_note = payload['filter_note']
+    picks = payload['picks']
+    unified = payload['unified']
+
+    plan_sections = []
     u_hdr = html.Tr([
         html.Th('#', style={'width': '22px', 'padding': '6px 3px'}),
         html.Th('品种', style={'width': '65px', 'padding': '6px 4px'}),
@@ -7578,6 +7799,7 @@ def toggle_plan(n_clicks):
         plan_sections.extend([
             html.Div([
                 html.Span(session_label, style={'color': '#ff9800', 'fontSize': '15px', 'fontWeight': 'bold'}),
+                html.Span(' [缓存]', style={'color': '#888', 'fontSize': '11px'}) if from_cache else None,
                 html.Span(f'  {today_str} {now_time}  账户{account/10000:.1f}万({_acc_source})',
                            style={'color': '#666', 'fontSize': '12px'}),
                 html.Span(filter_note, style={'color': '#4fc3f7', 'fontSize': '11px'}) if filter_note else None,
@@ -7884,6 +8106,34 @@ def toggle_plan(n_clicks):
         'display': 'block', 'backgroundColor': '#111827',
         'borderBottom': '3px solid #ff9800', 'marginBottom': '5px',
     }
+
+
+@app.callback(
+    Output('plan-panel', 'children'),
+    Output('plan-panel', 'style'),
+    Input('plan-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def toggle_plan(n_clicks):
+    """今日交易计划面板 — 8维度综合评分实时计算版"""
+    if not n_clicks or n_clicks % 2 == 0:
+        return no_update, {'display': 'none'}
+
+    _, night_only = _get_session_context()
+    kind = 'night' if night_only else 'day'
+    cached = _load_today_plan_cache(kind)
+    if cached:
+        payload = cached['payload']
+        from_cache = True
+    else:
+        payload = compute_today_plan_payload(None)
+        _save_today_plan_cache(kind, payload)
+        from_cache = False
+
+    global _v6_recommended_pairs
+    _v6_recommended_pairs = payload['top_picks']
+
+    return render_plan_panel_from_payload(payload, from_cache=from_cache)
 
 
 def _get_session_price(cur, symbol, cutoff):
@@ -8774,9 +9024,13 @@ if __name__ == '__main__':
     def _preheat_caches():
         import traceback, sys
         t0 = time.time()
+        def _warm_plan_v6():
+            global _v6_recommended_pairs
+            p = compute_today_plan_payload(None)
+            _v6_recommended_pairs = p['top_picks']
         for name, fn in [('auto_select_pairs', auto_select_pairs),
                           ('scan_vrp', scan_vrp),
-                          ('toggle_plan', lambda: toggle_plan(1))]:
+                          ('compute_today_plan', _warm_plan_v6)]:
             try:
                 fn()
                 print(f'[预热] {name} 完成 ({time.time()-t0:.1f}s)', flush=True)
