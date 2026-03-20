@@ -3013,6 +3013,7 @@ _NO_NIGHT_SESSION = {
 import os as _os
 _SIM_CACHE = {'ts': 0, 'result': None}
 _SIM_PAPER_FILE = _os.path.expanduser('~/state/sim_paper_trade.json')
+_SIM_HISTORY_FILE = _os.path.expanduser('~/state/sim_paper_history.json')
 
 _NIGHT_CLOSE_HM = {
     'AU': (2, 25), 'AG': (2, 25), 'SC': (2, 25),
@@ -3284,24 +3285,108 @@ def _run_historical_sim(top_n=5, max_days=8):
 
 
 def _load_sim_paper():
-    """读取今日模拟盘状态"""
+    """读取模拟盘状态（支持夜盘跨日：昨夜paper在次日日盘收盘前仍有效）。
+
+    CTP交易日: 夜盘21:00属于次日交易日。昨晚进仓的paper应持续到今天15:00。
+    """
     try:
         with open(_SIM_PAPER_FILE, 'r') as f:
-            import json
             data = json.load(f)
-            if data.get('date') == datetime.now().strftime('%Y-%m-%d'):
-                return data
+
+        paper_date = data.get('date', '')
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        if paper_date == today:
+            return data
+
+        # 夜盘paper跨日: 进仓后72小时内且日盘未收盘 → 仍有效
+        # 72h覆盖周五夜盘→周一日盘
+        if data.get('session') == 'night':
+            try:
+                entry_ts = datetime.strptime(data.get('entry_ts', ''), '%Y-%m-%d %H:%M:%S')
+                hours_since = (datetime.now() - entry_ts).total_seconds() / 3600
+                if hours_since < 72 and datetime.now().hour < 15:
+                    return data
+            except Exception:
+                pass
     except Exception:
         pass
     return None
 
 
+def _load_sim_paper_raw():
+    """无条件读取paper文件（不做日期过滤，用于归档）"""
+    try:
+        with open(_SIM_PAPER_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _save_sim_paper(data):
     """保存模拟盘状态"""
-    import json
     _os.makedirs(_os.path.dirname(_SIM_PAPER_FILE), exist_ok=True)
     with open(_SIM_PAPER_FILE, 'w') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _archive_sim_paper(paper):
+    """将已完成/过期的模拟盘归档到历史文件，用于累计统计"""
+    if not paper or not paper.get('positions'):
+        return
+
+    total_pnl_pct = 0
+    n_closed = 0
+    for pos in paper['positions']:
+        entry = pos.get('entry_sum', 0)
+        if entry > 0:
+            exit_sum = pos.get('exit_sum', entry) if pos.get('status') == 'closed' else entry
+            total_pnl_pct += (entry - exit_sum) / entry * 100
+            if pos.get('status') == 'closed':
+                n_closed += 1
+
+    record = {
+        'date': paper.get('date'),
+        'session': paper.get('session'),
+        'entry_ts': paper.get('entry_ts'),
+        'positions': paper['positions'],
+        'total_pnl_pct': round(total_pnl_pct, 2),
+        'closed_count': n_closed,
+        'total_count': len(paper['positions']),
+        'archived_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+    history = []
+    try:
+        with open(_SIM_HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+    except Exception:
+        pass
+
+    existing_ts = {h.get('entry_ts') for h in history}
+    if record['entry_ts'] not in existing_ts:
+        history.append(record)
+        _os.makedirs(_os.path.dirname(_SIM_HISTORY_FILE), exist_ok=True)
+        with open(_SIM_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        print(f'[sim-archive] 归档模拟盘 {record["date"]} {record["session"]}盘 '
+              f'PnL={record["total_pnl_pct"]:+.1f}% ({n_closed}/{record["total_count"]}已平)')
+
+
+def _load_sim_history_summary():
+    """加载历史模拟盘汇总统计"""
+    try:
+        with open(_SIM_HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+        if not history:
+            return None
+        total_pnl = sum(h.get('total_pnl_pct', 0) for h in history)
+        n_sessions = len(history)
+        wins = sum(1 for h in history if h.get('total_pnl_pct', 0) > 0)
+        return {'sessions': n_sessions, 'total_pnl': total_pnl,
+                'avg_pnl': total_pnl / n_sessions, 'win_rate': wins / n_sessions * 100}
+    except Exception:
+        return None
 
 
 _sim_preheat_started = False
@@ -3441,6 +3526,11 @@ def _build_sim_section(unified_top5):
 
         paper = _load_sim_paper()
         if not paper and unified_top5 and (in_night or in_day):
+            # 归档旧paper（如果存在），避免丢失历史数据
+            old_paper = _load_sim_paper_raw()
+            if old_paper and old_paper.get('positions'):
+                _archive_sim_paper(old_paper)
+
             session = 'night' if in_night else 'day'
             positions = []
             for u in unified_top5[:5]:
@@ -3469,13 +3559,27 @@ def _build_sim_section(unified_top5):
             _save_sim_paper(paper)
 
         if paper and paper.get('positions'):
+            # 判断是跨日夜盘还是当日盘
+            is_carryover = paper.get('date', '') != datetime.now().strftime('%Y-%m-%d')
+            label = '模拟盘(夜盘持续)' if is_carryover else '今日模拟盘'
             sim_children.append(html.Div([
-                html.Span('今日模拟盘', style={
+                html.Span(label, style={
                     'color': '#FFD700', 'fontSize': '14px', 'fontWeight': 'bold'}),
                 html.Span(f"  {paper.get('session','?')}盘 · 进仓{paper.get('entry_ts','?')[11:16]}",
                     style={'color': '#888', 'fontSize': '12px'}),
             ], style={'padding': '10px 25px 5px', 'borderTop': '2px solid #FFD700'}))
             sim_children.append(html.Div(id='sim-live-panel'))
+
+    # === Part 3: 历史模拟盘统计 ===
+    hist = _load_sim_history_summary()
+    if hist and hist['sessions'] >= 1:
+        pnl_c = '#00FF88' if hist['total_pnl'] >= 0 else '#ff4444'
+        sim_children.append(html.Div([
+            html.Span(f"历史统计: {hist['sessions']}场 · ", style={'color': '#888', 'fontSize': '11px'}),
+            html.Span(f"累计{hist['total_pnl']:+.1f}%", style={'color': pnl_c, 'fontSize': '11px', 'fontWeight': 'bold'}),
+            html.Span(f" · 均{hist['avg_pnl']:+.1f}%/场 · 胜率{hist['win_rate']:.0f}%",
+                style={'color': '#888', 'fontSize': '11px'}),
+        ], style={'padding': '4px 25px 8px', 'borderTop': '1px solid #333'}))
 
     if not sim_children:
         return None
