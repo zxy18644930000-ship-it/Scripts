@@ -3304,17 +3304,31 @@ def _save_sim_paper(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+_sim_preheat_started = False
+
 def _build_sim_section(unified_top5):
     """构建模拟交易面板（历史回测 + 今日模拟盘），返回 html.Div 或 None"""
+    import threading
     sim_children = []
 
-    # === Part 1: 历史回测 ===
-    try:
-        sim_result = _run_historical_sim(top_n=5, max_days=8)
-    except Exception as e:
-        sim_result = None
-        sim_children.append(html.Div(f'历史回测异常: {e}',
-            style={'color': '#f44336', 'padding': '10px'}))
+    # === Part 1: 历史回测（异步：首次显示"加载中"，后台填充缓存）===
+    global _sim_preheat_started
+    sim_result = _SIM_CACHE.get('result') if _SIM_CACHE.get('ts') and (
+        __import__('time').time() - _SIM_CACHE['ts'] < 300) else None
+
+    if sim_result is None:
+        if not _sim_preheat_started:
+            _sim_preheat_started = True
+            def _fill_sim():
+                try:
+                    _run_historical_sim(top_n=5, max_days=8)
+                except Exception:
+                    pass
+            threading.Thread(target=_fill_sim, daemon=True).start()
+        sim_children.append(html.Div(
+            '模拟交易回测正在后台计算（约15秒），再次点击「今日计划」即可查看结果...',
+            style={'color': '#FFD700', 'padding': '15px 25px', 'fontSize': '12px',
+                   'borderTop': '2px solid #00FF88', 'backgroundColor': '#0a1a2a'}))
 
     if sim_result and sim_result['trades']:
         trades = sim_result['trades']
@@ -7768,6 +7782,33 @@ def toggle_plan(n_clicks):
     }
 
 
+def _get_session_price(cur, symbol, cutoff):
+    """获取当前时段的最新期权价格，正确处理CTP夜盘日期排序问题。
+
+    CTP夜盘数据用交易日日期存储(昨晚22:59存为今天日期)，
+    ORDER BY datetime DESC 在日盘时段会取到昨夜旧价而非今天日盘最新价。
+    修正: 按当前时段过滤hour，确保取到正确时段的数据。
+    """
+    h = datetime.now().hour
+    if 8 <= h < 16:
+        session_filter = "AND substr(datetime,12,2) BETWEEN '08' AND '15'"
+    elif h >= 20 or h < 4:
+        session_filter = "AND (substr(datetime,12,2) >= '20' OR substr(datetime,12,2) < '04')"
+    else:
+        session_filter = ""
+    cur.execute(f"""SELECT close_price FROM dbbardata
+        WHERE symbol=? AND datetime>=? {session_filter}
+        ORDER BY datetime DESC LIMIT 1""", (symbol, cutoff))
+    row = cur.fetchone()
+    if row and row[0]:
+        return row[0]
+    cur.execute("""SELECT close_price FROM dbbardata
+        WHERE symbol=? AND datetime>=? ORDER BY datetime DESC LIMIT 1""",
+        (symbol, cutoff))
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
 @app.callback(
     Output('sim-live-panel', 'children'),
     Input('sim-live-interval', 'n_intervals'),
@@ -7801,8 +7842,8 @@ def update_sim_live(n):
     n_holding = 0
 
     for pos in paper['positions']:
-        call_sym = pos.get('call_sym', '')
-        put_sym = pos.get('put_sym', '')
+        call_sym = _resolve_symbol(pos.get('call_sym', ''), cur)
+        put_sym = _resolve_symbol(pos.get('put_sym', ''), cur)
         entry_sum = pos.get('entry_sum', 0)
 
         if pos.get('status') == 'closed':
@@ -7825,17 +7866,8 @@ def update_sim_live(n):
             ], style={'borderBottom': '1px solid #1a1a3e', 'opacity': '0.6'}))
             continue
 
-        cur.execute("""SELECT close_price FROM dbbardata
-            WHERE symbol=? AND datetime>=? ORDER BY datetime DESC LIMIT 1""",
-            (call_sym, cutoff))
-        c_row = cur.fetchone()
-        cur.execute("""SELECT close_price FROM dbbardata
-            WHERE symbol=? AND datetime>=? ORDER BY datetime DESC LIMIT 1""",
-            (put_sym, cutoff))
-        p_row = cur.fetchone()
-
-        c_px = c_row[0] if c_row and c_row[0] else pos.get('entry_call', 0)
-        p_px = p_row[0] if p_row and p_row[0] else pos.get('entry_put', 0)
+        c_px = _get_session_price(cur, call_sym, cutoff) or pos.get('entry_call', 0)
+        p_px = _get_session_price(cur, put_sym, cutoff) or pos.get('entry_put', 0)
         current_sum = c_px + p_px
         pnl = entry_sum - current_sum
         pnl_pct = pnl / entry_sum * 100 if entry_sum > 0 else 0
