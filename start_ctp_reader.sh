@@ -9,8 +9,9 @@
 #   3. 如果不在运行 → 自动拉起daemon
 #   4. 附带: 交易日历判断、磁盘空间监控、日志清理
 #
-# Cron触发时间 (即健康检查时间):
-#   20:55 (夜盘前) | 08:55 (早盘前) | 13:25 (午盘前)
+# Cron触发时间:
+#   开盘前: 20:55(夜盘) | 08:55(早盘) | 13:25(午盘)
+#   交易时段内: 每10分钟检查 (9-11时/13-15时/21-23时/0-2时次日)
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,8 +30,8 @@ HOLIDAYS_FILE="$SCRIPT_DIR/trading_holidays_2026.conf"
 NO_NIGHT_FILE="$SCRIPT_DIR/no_night_session.conf"
 
 # 磁盘监控阈值
-DISK_WARN_GB=20          # 剩余空间低于20GB时警告
-DISK_CRITICAL_GB=10      # 剩余空间低于10GB时紧急警告
+DISK_WARN_GB=5           # 剩余空间低于5GB时警告
+DISK_CRITICAL_GB=2       # 剩余空间低于2GB时紧急警告
 DB_WARN_MB=500           # 数据库超过500MB时提醒迁移
 
 # vnpy数据库路径
