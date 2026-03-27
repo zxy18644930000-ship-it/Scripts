@@ -2132,6 +2132,11 @@
       "date": "2026-03-12",
       "action": "新增B042-腿背离均值回归信号全市场验证",
       "details": "52品种回测,51个A(均值回归)胜/1个B胜(ad仅3天)"
+    },
+    {
+      "date": "2026-03-22",
+      "action": "Codex卡在正在思考的链路诊断",
+      "details": "本机下行93.627Mbps/上行22.894Mbps, 但Responsiveness低(2.954秒,20RPM), Idle Latency 287ms; 到api.openai.com的HTTP首包约0.91秒. 结论: 当前慢的主因是高延迟/差响应性, 不是带宽不足; 同时Codex Helper GPU/Renderer占用偏高, 会加重界面卡顿感"
     }
   ]
 }

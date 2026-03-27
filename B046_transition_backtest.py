@@ -247,16 +247,18 @@ def _compute_raw_features(close, ma_period, lookback):
     above_ratio_arr = np.full(n, np.nan)
     recent_consec_arr = np.zeros(n, dtype=np.int32)
     dev_growing_arr = np.zeros(n, dtype=np.bool_)
-    prior_streak_arr = np.zeros(n, dtype=np.int32)
-    prior_ended_arr = np.full(n, 999, dtype=np.int32)
-    tail_cx_arr = np.zeros(n, dtype=np.int32)
-    tail_opp_arr = np.zeros(n, dtype=np.int32)
+    longest_streak_arr = np.zeros(n, dtype=np.int32)
+    longest_ended_arr = np.full(n, 999, dtype=np.int32)
+    longest_sign_arr = np.zeros(n, dtype=np.int8)
+    post_cx_arr = np.zeros(n, dtype=np.int32)
+    post_opp_arr = np.zeros(n, dtype=np.int32)
 
     start = ma_period + lookback - 1
     if start >= n:
         return (crossings_arr, bias_arr, above_ratio_arr, ma,
                 recent_consec_arr, dev_growing_arr,
-                prior_streak_arr, prior_ended_arr, tail_cx_arr, tail_opp_arr)
+                longest_streak_arr, longest_ended_arr,
+                longest_sign_arr, post_cx_arr, post_opp_arr)
 
     for i in range(start, n):
         ws = sign[i - lookback + 1: i + 1]
@@ -293,33 +295,31 @@ def _compute_raw_features(close, ma_period, lookback):
                 dev_growing_arr[i] = slope > 0
 
         runs = []
-        k2 = lookback - 1
-        while k2 >= 0:
-            s2 = ws[k2]
-            if s2 == 0:
-                k2 -= 1
-                continue
-            re2 = k2
-            while k2 > 0 and ws[k2 - 1] == s2:
-                k2 -= 1
-            runs.append((re2 - k2 + 1, re2, s2))
-            k2 -= 1
-        for ri, (rlen, rend, rsign) in enumerate(runs):
-            if ri == 0:
-                continue
-            if rlen >= 4:
-                prior_streak_arr[i] = rlen
-                prior_ended_arr[i] = lookback - 1 - rend
-                ts = ws[rend + 1:]
-                if len(ts) > 1:
-                    td2 = np.diff(ts)
-                    tail_cx_arr[i] = int(np.count_nonzero(td2 != 0))
-                tail_opp_arr[i] = int(np.sum(ts == -rsign)) if len(ts) > 0 else 0
-                break
+        rsk = 0
+        for k2 in range(1, lookback):
+            if ws[k2] != ws[rsk] or ws[k2] == 0:
+                if ws[rsk] != 0:
+                    runs.append((rsk, k2 - rsk, int(ws[rsk])))
+                rsk = k2
+        if ws[rsk] != 0:
+            runs.append((rsk, lookback - rsk, int(ws[rsk])))
+
+        if runs:
+            best = max(runs, key=lambda r: r[1])
+            longest_streak_arr[i] = best[1]
+            lend = best[0] + best[1]
+            longest_ended_arr[i] = lookback - lend
+            longest_sign_arr[i] = best[2]
+            if lend < lookback:
+                post_sec = ws[lend:]
+                if len(post_sec) > 1:
+                    post_cx_arr[i] = int(np.count_nonzero(np.diff(post_sec) != 0))
+                post_opp_arr[i] = int(np.sum(post_sec == -best[2]))
 
     return (crossings_arr, bias_arr, above_ratio_arr, ma,
             recent_consec_arr, dev_growing_arr,
-            prior_streak_arr, prior_ended_arr, tail_cx_arr, tail_opp_arr)
+            longest_streak_arr, longest_ended_arr,
+            longest_sign_arr, post_cx_arr, post_opp_arr)
 
 
 def _compute_ma40_equidist(close, ma40, lookback):
@@ -367,20 +367,20 @@ def classify_old(cx, bi, ar, dr40, cb40):
     return 'entangled'
 
 
-def classify_new(cx, bi, ar, dr40, cb40, rc, dg, ps, psa, tcx, top,
+def classify_new(cx, bi, ar, dr40, cb40, rc, dg, ls, lsa, lss, pcx, pop,
                  consec_th, trans_win):
-    """新算法 B046: 三维判定 + 双向转换检测(细化3子模式)"""
+    """新算法 B046: 三维判定 + 双向转换检测(3子类型)"""
     if np.isnan(cx) or np.isnan(bi):
         return 'warmup'
     if rc >= consec_th and dg:
         return 'trending_up' if ar > 0.5 else 'trending_down'
-    if ps >= consec_th and psa <= trans_win:
-        if psa <= 2:
-            return 'transitioning'
-        if top >= 2:
-            return 'transitioning'
-        if tcx >= 2:
-            return 'transitioning'
+    if ls >= consec_th and 1 <= lsa <= trans_win:
+        if lsa <= 2:
+            return 'trans_touch'
+        if pcx <= 1 and pop >= 2:
+            return 'trans_cross'
+        if pcx >= 2:
+            return 'trans_oscillate'
     if int(cx) >= CROSS_THRESHOLD:
         return 'entangled'
     if bi >= BIAS_THRESHOLD:
@@ -403,9 +403,9 @@ def combine_old(s1, s5):
 def combine_new(s1, s5):
     if s1 == 'warmup' or s5 == 'warmup':
         return 'warmup'
-    safe_set = ('entangled', 'transitioning')
+    safe_set = ('entangled', 'trans_touch', 'trans_cross', 'trans_oscillate')
     if s1 in safe_set and s5 in safe_set:
-        has_trans = s1 == 'transitioning' or s5 == 'transitioning'
+        has_trans = s1.startswith('trans_') or s5.startswith('trans_')
         return 'transition_safe' if has_trans else 'both_entangled'
     if s1.startswith('trending') and s5.startswith('trending'):
         return 'both_trending'
@@ -464,7 +464,7 @@ def backtest_contract(fdf, options_indexed, product, contract_yymm):
     if len(fdf) < min_warmup:
         return []
 
-    cx_1m, bi_1m, ar_1m, ma20_1m, rc_1m, dg_1m, ps_1m, psa_1m, tcx_1m, top_1m = \
+    cx_1m, bi_1m, ar_1m, ma20_1m, rc_1m, dg_1m, ls_1m, lsa_1m, lss_1m, pcx_1m, pop_1m = \
         _compute_raw_features(close, MA_PERIOD, LOOKBACK_1M)
     ma40_1m = pd.Series(close).rolling(MA_PERIOD_40, min_periods=MA_PERIOD_40).mean().values
     dr40_1m, cb40_1m = _compute_ma40_equidist(close, ma40_1m, LOOKBACK_1M)
@@ -476,7 +476,7 @@ def backtest_contract(fdf, options_indexed, product, contract_yymm):
 
     has_5m = len(r5v) >= MA_PERIOD_40 + LOOKBACK_5M
     if has_5m:
-        cx_5mr, bi_5mr, ar_5mr, _, rc_5mr, dg_5mr, ps_5mr, psa_5mr, tcx_5mr, top_5mr = \
+        cx_5mr, bi_5mr, ar_5mr, _, rc_5mr, dg_5mr, ls_5mr, lsa_5mr, lss_5mr, pcx_5mr, pop_5mr = \
             _compute_raw_features(r5v, MA_PERIOD, LOOKBACK_5M)
         ma40_5m = pd.Series(r5v).rolling(MA_PERIOD_40, min_periods=MA_PERIOD_40).mean().values
         dr40_5mr, cb40_5mr = _compute_ma40_equidist(r5v, ma40_5m, LOOKBACK_5M)
@@ -492,10 +492,11 @@ def backtest_contract(fdf, options_indexed, product, contract_yymm):
         cb40_5m = _map5(cb40_5mr)
         rc_5m = _map5(rc_5mr)
         dg_5m = _map5(dg_5mr.astype(np.float64))
-        ps_5m = _map5(ps_5mr.astype(np.float64))
-        psa_5m = _map5(psa_5mr.astype(np.float64))
-        tcx_5m = _map5(tcx_5mr.astype(np.float64))
-        top_5m = _map5(top_5mr.astype(np.float64))
+        ls_5m = _map5(ls_5mr.astype(np.float64))
+        lsa_5m = _map5(lsa_5mr.astype(np.float64))
+        lss_5m = _map5(lss_5mr.astype(np.float64))
+        pcx_5m = _map5(pcx_5mr.astype(np.float64))
+        pop_5m = _map5(pop_5mr.astype(np.float64))
     else:
         n = len(fdf)
         cx_5m = np.full(n, np.nan)
@@ -505,10 +506,11 @@ def backtest_contract(fdf, options_indexed, product, contract_yymm):
         cb40_5m = np.full(n, np.nan)
         rc_5m = np.zeros(n)
         dg_5m = np.zeros(n)
-        ps_5m = np.zeros(n)
-        psa_5m = np.full(n, 999.0)
-        tcx_5m = np.zeros(n)
-        top_5m = np.zeros(n)
+        ls_5m = np.zeros(n)
+        lsa_5m = np.full(n, 999.0)
+        lss_5m = np.zeros(n)
+        pcx_5m = np.zeros(n)
+        pop_5m = np.zeros(n)
 
     gaps = fdf['datetime'].diff().dt.total_seconds() / 60
     fdf['session_id'] = (gaps > SESSION_GAP_MINUTES).cumsum()
@@ -582,14 +584,14 @@ def backtest_contract(fdf, options_indexed, product, contract_yymm):
         s1_new = classify_new(cx_1m[idx], bi_1m[idx], ar_1m[idx],
                               dr40_1m[idx], cb40_1m[idx],
                               int(rc_1m[idx]), bool(dg_1m[idx]),
-                              int(ps_1m[idx]), int(psa_1m[idx]),
-                              int(tcx_1m[idx]), int(top_1m[idx]),
+                              int(ls_1m[idx]), int(lsa_1m[idx]),
+                              int(lss_1m[idx]), int(pcx_1m[idx]), int(pop_1m[idx]),
                               CONSEC_1M, TRANSITION_WINDOW_1M)
         s5_new = classify_new(cx_5m[idx], bi_5m[idx], ar_5m[idx],
                               dr40_5m[idx], cb40_5m[idx],
                               int(rc_5m[idx]), bool(dg_5m[idx]),
-                              int(ps_5m[idx]), int(psa_5m[idx]),
-                              int(tcx_5m[idx]), int(top_5m[idx]),
+                              int(ls_5m[idx]), int(lsa_5m[idx]),
+                              int(lss_5m[idx]), int(pcx_5m[idx]), int(pop_5m[idx]),
                               CONSEC_5M, TRANSITION_WINDOW_5M)
         comb_new = combine_new(s1_new, s5_new)
 
@@ -761,6 +763,17 @@ def process_product(product):
                     if e['pnls'].get(hp) is not None and e['old_comb'] == 'both_entangled']
         new_safe = [e['pnls'][hp] for e in all_entries
                     if e['pnls'].get(hp) is not None and e['new_comb'] in ('both_entangled', 'transition_safe')]
+
+        sub_groups = defaultdict(list)
+        for e in all_entries:
+            pnl = e['pnls'].get(hp)
+            if pnl is None or e['new_comb'] != 'transition_safe':
+                continue
+            for s in (e['new_1m'], e['new_5m']):
+                if s.startswith('trans_'):
+                    sub_groups[s].append(pnl)
+                    break
+        hp_result['trans_subtypes'] = {k: _stat_group(v) for k, v in sub_groups.items() if _stat_group(v)}
         old_s = _stat_group(old_safe)
         new_s = _stat_group(new_safe)
         if old_s and new_s:
@@ -794,6 +807,14 @@ def process_product(product):
             print(f'    安全池: old={sp["old_safe_n"]}笔/{sp["old_safe_mean"]:+.3f}%/WR{sp["old_safe_wr"]:.1f}% '
                   f'→ new={sp["new_safe_n"]}笔/{sp["new_safe_mean"]:+.3f}%/WR{sp["new_safe_wr"]:.1f}% '
                   f'(+{sp["n_gain"]}笔, PnL{sp["mean_change"]:+.3f}%, WR{sp["wr_change"]:+.1f}%)')
+        subs = hr.get('trans_subtypes', {})
+        if subs:
+            sub_labels = {'trans_touch': '首触MA', 'trans_cross': '反穿站稳', 'trans_oscillate': '穿梭'}
+            for sk in ('trans_touch', 'trans_cross', 'trans_oscillate'):
+                ss = subs.get(sk)
+                if ss:
+                    print(f'      {sub_labels.get(sk, sk):<8s} n={ss["n"]:>5d} mean={ss["mean"]:>+7.3f}% '
+                          f'WR={ss["win_rate"]:>5.1f}% tail5={ss["tail5"]:>+7.3f}%')
 
     return result
 

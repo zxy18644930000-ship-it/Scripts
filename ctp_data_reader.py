@@ -171,9 +171,10 @@ class _VnpyDataAdapter:
         if snapshot_time is None:
             # 取最新时间
             cursor = conn.cursor()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cursor.execute(
-                "SELECT MAX(datetime) FROM dbbardata WHERE symbol LIKE ?",
-                [like_pattern]
+                "SELECT MAX(datetime) FROM dbbardata WHERE symbol LIKE ? AND datetime <= ?",
+                [like_pattern, now_str]
             )
             result = cursor.fetchone()
             if not result or not result[0]:

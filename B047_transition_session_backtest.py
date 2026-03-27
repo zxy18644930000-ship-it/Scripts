@@ -29,8 +29,8 @@ from itertools import product as iterproduct
 import numpy as np
 import pandas as pd
 
-# ============ MA 参数 (与B046一致) ============
-MA_PERIOD = 20
+# ============ MA 参数 (MA10替代MA20, 更贴近文华财经实际观察) ============
+MA_PERIOD = 10
 MA_PERIOD_40 = 40
 LOOKBACK_1M = 50
 LOOKBACK_5M = 20
@@ -39,8 +39,8 @@ BIAS_THRESHOLD = 0.8
 MA40_DIST_RATIO = 2.0
 MA40_COUNT_BIAS = 0.7
 
-CONSEC_1M = 12
-CONSEC_5M = 6
+CONSEC_1M = 8
+CONSEC_5M = 4
 TRANSITION_WINDOW_1M = 10
 TRANSITION_WINDOW_5M = 5
 

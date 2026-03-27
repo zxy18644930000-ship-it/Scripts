@@ -7,6 +7,7 @@ venv/
 *.egg
 
 # Logs
+logs
 logs/
 
 # Runtime files
@@ -50,6 +51,23 @@ alert_history.db
 alert_history.json
 trade_state.json
 data/
+b047_opportunities.db
+contribution_history.db
+
+# Generated experiment outputs
+B046_results/
+B047_results/
+divergence_results/
+ma_tangle_comparison/
+ma_tangle_direct_otm/
+ma_tangle_direct_results/
+ma_tangle_direct_results_v2/
+ma_tangle_otm_results/
+ma_tangle_results/
+ma_tangle_results_remote/
+
+# Local tooling artifacts
+licenses/
 
 # Backups
 *_backup_*.py
